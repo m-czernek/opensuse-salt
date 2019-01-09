@@ -25,6 +25,8 @@ import site
 import time
 import traceback
 
+from collections.abc import Mapping
+
 import salt.channel.client
 import salt.fileclient
 import salt.loader
@@ -3643,16 +3645,18 @@ class State:
         """
         for chunk in high:
             state = high[chunk]
+            if not isinstance(state, Mapping):
+                continue
             for state_ref in state:
                 needs_default = True
+                if not isinstance(state[state_ref], list):
+                    continue
                 for argset in state[state_ref]:
                     if isinstance(argset, str):
                         needs_default = False
                         break
                 if needs_default:
-                    order = state[state_ref].pop(-1)
-                    state[state_ref].append("__call__")
-                    state[state_ref].append(order)
+                    state[state_ref].insert(-1, "__call__")
 
     def call_high(self, high, orchestration_jid=None):
         """
