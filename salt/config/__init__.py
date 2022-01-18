@@ -1003,6 +1003,9 @@ VALID_OPTS = immutabletypes.freeze(
         "maintenance_interval": int,
         # Fileserver process restart interval
         "fileserver_interval": int,
+        # Use Adler32 hashing algorithm for server_id (default False until Sodium, "adler32" after)
+        # Possible values are: False, adler32, crc32
+        "server_id_use_crc": (bool, str),
         "request_channel_timeout": int,
         "request_channel_tries": int,
         # RSA encryption for minion
@@ -1324,6 +1327,7 @@ DEFAULT_MINION_OPTS = immutabletypes.freeze(
         "global_state_conditions": None,
         "reactor_niceness": None,
         "fips_mode": False,
+        "server_id_use_crc": False,
         "features": {},
         "encryption_algorithm": "OAEP-SHA1",
         "signing_algorithm": "PKCS1v15-SHA1",
