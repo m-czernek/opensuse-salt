@@ -13,6 +13,9 @@ import salt.utils.files
 import salt.utils.gitfs
 import salt.utils.path
 import salt.utils.platform
+import tests.support.paths
+from salt.exceptions import FileserverConfigError
+from tests.support.helpers import patched_environ
 from tests.support.mixins import AdaptedConfigurationTestCaseMixin
 from tests.support.unit import TestCase
 
@@ -172,3 +175,16 @@ class TestGitBase(TestCase, AdaptedConfigurationTestCaseMixin):
             self.assertRaises(TimeoutError, provider.clear_lock)
         finally:
             provider._master_lock.release()
+
+    def test_checkout_with_home_env_unset(self):
+        remote = os.path.join(tests.support.paths.TMP, "pygit2-repo")
+        cache = os.path.join(tests.support.paths.TMP, "pygit2-repo-cache")
+        self._prepare_remote_repository(remote)
+        provider = self._prepare_cache_repository(remote, cache)
+        provider.remotecallbacks = None
+        provider.credentials = None
+        with patched_environ(__cleanup__=["HOME"]):
+            self.assertTrue("HOME" not in os.environ)
+            provider.init_remote()
+            provider.fetch()
+            self.assertTrue("HOME" in os.environ)
