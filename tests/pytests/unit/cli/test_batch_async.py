@@ -177,6 +177,7 @@ def test_batch_fire_done_event(batch):
             },
             "salt/batch/1235/done",
         )
+        assert batch.active == {"bar", "foo"}
 
 
 def test_batch_close_safe(batch):
