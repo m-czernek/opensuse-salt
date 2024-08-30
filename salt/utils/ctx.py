@@ -1,14 +1,30 @@
-import threading
+import contextlib
+
+try:
+    # Try the stdlib C extension first
+    import _contextvars as contextvars
+except ImportError:
+    # Py<3.7
+    import contextvars
+
+DEFAULT_CTX_VAR = "request_ctxvar"
+request_ctxvar = contextvars.ContextVar(DEFAULT_CTX_VAR)
 
 
-class ClassProperty(property):
+@contextlib.contextmanager
+def request_context(data):
     """
-    Use a classmethod as a property
-    http://stackoverflow.com/a/1383402/1258307
+    A context manager that sets and un-sets the loader context
     """
+    tok = request_ctxvar.set(data)
+    try:
+        yield
+    finally:
+        request_ctxvar.reset(tok)
 
-    def __get__(self, cls, owner):
-        return self.fget.__get__(None, owner)()  # pylint: disable=no-member
+
+def get_request_context():
+    return request_ctxvar.get({})
 
 
 class RequestContext:
