@@ -278,11 +278,15 @@ transaction.
 import logging
 import os.path
 import pathlib
+import shutil
 import sys
+import tarfile
+import tempfile
 
 import salt.client.ssh.state
 import salt.client.ssh.wrapper.state
 import salt.exceptions
+from salt.loader import _format_cached_grains
 import salt.utils.args
 from salt.modules.state import _check_queue, _prior_running_states, _wait, running
 
@@ -349,6 +353,7 @@ def _pkg_params(pkg, pkgs, args):
 
 def _cmd(cmd, retcode=False):
     """Utility function to run commands."""
+    log.debug(f"Executing: {cmd}")
     result = __salt__["cmd.run_all"](cmd)
     if retcode:
         return result["retcode"]
@@ -913,6 +918,42 @@ def pending_transaction():
 
     return any(snapshot.endswith("+") for snapshot in snapshots)
 
+def pkg(pkg_path, pkg_sum, hash_type, test=None, **kwargs):
+    """
+    Execute a packaged state run, the packaged state run will exist in a
+    tarball available locally. This packaged state
+    can be generated using salt-ssh.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' state.pkg /tmp/salt_state.tgz 760a9353810e36f6d81416366fc426dc md5
+    """
+    thin_dir = _pkg_deploy_self(pkg_path)
+    shared_pkg_path = os.path.join(thin_dir, "salt_state.tgz")
+    return call("state.pkg", shared_pkg_path, pkg_sum, hash_type, test=None, local=True, salt_call_cmd=["/usr/bin/python3", f"{thin_dir}/salt-call"], **kwargs)
+
+
+def _pkg_deploy_self(pkg_path):
+    # Cache dir shared between tu and non-tu env
+    deploy_dir = "/var/cache/salt/minion"
+    thin_path = __utils__["thin.gen_thin"](
+        deploy_dir,
+        extra_mods=__salt__["config.option"]("thin_extra_mods", ""),
+        so_mods=__salt__["config.option"]("thin_so_mods", ""),
+    )
+    thin_dest_path = tempfile.mkdtemp(dir=deploy_dir)
+    shared_pkg_path = os.path.join(thin_dest_path, "salt_state.tgz")
+    stdout = __salt__["cmd.run"](["tar", "xzf", thin_path, "-C", thin_dest_path])
+    if stdout:
+        __utils__["files.rm_rf"](thin_dest_path)
+        raise ValueError(stdout)
+    __salt__["file.copy"](pkg_path, shared_pkg_path)
+
+    log.debug(f"Created {thin_dest_path}")
+    return thin_dest_path
+
 
 def call(function, *args, **kwargs):
     """Executes a Salt function inside a transaction.
@@ -928,6 +969,10 @@ def call(function, *args, **kwargs):
         (i.e there is a new snaphot in the system), a new reboot will
         be scheduled (default False)
 
+    salt_call_cmd
+        The salt-call interpreter and binary to be executed,
+        e.g. ["python3", "/tmp/salt-call"]. By default, salt-call from path is used.
+
     CLI Example:
 
     .. code-block:: bash
@@ -942,20 +987,26 @@ def call(function, *args, **kwargs):
         raise salt.exceptions.CommandExecutionError("Missing function parameter")
 
     activate_transaction = kwargs.pop("activate_transaction", False)
+    local = kwargs.pop("local", False)
+    explicit_salt_cmd = kwargs.pop("salt_call_cmd", None)
 
     try:
         # Set default salt-call command
-        salt_call_cmd = "salt-call"
+        if explicit_salt_cmd:
+            salt_call_cmd = explicit_salt_cmd
+        else:
+            salt_call_cmd = ["salt-call"]
         python_exec_dir = os.path.dirname(sys.executable)
         if "venv-salt-minion" in pathlib.Path(python_exec_dir).parts:
             # If the module is executed with the Salt Bundle,
             # use salt-call from the Salt Bundle
-            salt_call_cmd = os.path.join(python_exec_dir, "salt-call")
+            salt_call_cmd = [os.path.join(python_exec_dir, "salt-call")]
 
         safe_kwargs = salt.utils.args.clean_kwargs(**kwargs)
         salt_argv = (
             [
-                salt_call_cmd,
+                *salt_call_cmd,
+                "--local" if local else "",
                 "--out",
                 "json",
                 "-l",
