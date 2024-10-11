@@ -278,15 +278,12 @@ transaction.
 import logging
 import os.path
 import pathlib
-import shutil
 import sys
-import tarfile
 import tempfile
 
 import salt.client.ssh.state
 import salt.client.ssh.wrapper.state
 import salt.exceptions
-from salt.loader import _format_cached_grains
 import salt.utils.args
 from salt.modules.state import _check_queue, _prior_running_states, _wait, running
 
@@ -353,7 +350,7 @@ def _pkg_params(pkg, pkgs, args):
 
 def _cmd(cmd, retcode=False):
     """Utility function to run commands."""
-    log.debug(f"Executing: {cmd}")
+    log.debug("Executing: %s", cmd)
     result = __salt__["cmd.run_all"](cmd)
     if retcode:
         return result["retcode"]
@@ -935,7 +932,7 @@ def pkg(pkg_path, pkg_sum, hash_type, test=None, **kwargs):
     salt_call_cmd = ["/usr/bin/python3", f"{deploy_dir}/salt-call"]
     if _is_venv_bundle():
         salt_call_cmd = [f"{deploy_dir}/bin/salt-call"]
-    return call("state.pkg", shared_pkg_path, pkg_sum, hash_type, test=test, local=True, salt_call_cmd=salt_call_cmd, **kwargs)
+    return call("state.pkg", shared_pkg_path, pkg_sum, hash_type, test=test, local=True, salt_call_cmd=salt_call_cmd, tmp_deploy_dir=deploy_dir, **kwargs)
 
 def _has_shebang(file_path):
     """Check if the file starts with a shebang."""
@@ -976,7 +973,7 @@ def _pkg_deploy_self(pkg_path):
     shared_pkg_path = os.path.join(deploy_dest_path, "salt_state.tgz")
     __salt__["file.copy"](pkg_path, shared_pkg_path)
 
-    log.debug(f"Created {deploy_dest_path}")
+    log.debug("Created %s", deploy_dest_path)
     return deploy_dest_path
 
 
@@ -1003,6 +1000,10 @@ def call(function, *args, **kwargs):
         The salt-call interpreter and binary to be executed,
         e.g. ["python3", "/tmp/salt-call"]. By default, salt-call from path is used.
 
+    tmp_deploy_dir
+        The temporary Salt directory used by salt-ssh. If provided,
+        the directory will be deleted before returning the execution result.
+
     CLI Example:
 
     .. code-block:: bash
@@ -1019,6 +1020,7 @@ def call(function, *args, **kwargs):
     activate_transaction = kwargs.pop("activate_transaction", False)
     local = kwargs.pop("local", False)
     explicit_salt_cmd = kwargs.pop("salt_call_cmd", None)
+    tmp_deploy_dir = kwargs.pop("tmp_deploy_dir", None)
 
     try:
         # Set default salt-call command
@@ -1068,6 +1070,11 @@ def call(function, *args, **kwargs):
         except ValueError:
             return {"result": False, "retcode": 1, "comment": ret_stdout}
     finally:
+        if tmp_deploy_dir:
+            try:
+                __utils__["files.rm_rf"](tmp_deploy_dir)
+            except OSError:
+                log.warning("Could not remove %s", tmp_deploy_dir)
         # Check if reboot is needed
         if activate_transaction and pending_transaction():
             reboot()
