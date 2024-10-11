@@ -930,29 +930,59 @@ def pkg(pkg_path, pkg_sum, hash_type, test=None, **kwargs):
 
         salt '*' state.pkg /tmp/salt_state.tgz 760a9353810e36f6d81416366fc426dc md5
     """
-    thin_dir = _pkg_deploy_self(pkg_path)
+    deploy_dir = _pkg_deploy_self(pkg_path)
     shared_pkg_path = os.path.join(thin_dir, "salt_state.tgz")
-    return call("state.pkg", shared_pkg_path, pkg_sum, hash_type, test=None, local=True, salt_call_cmd=["/usr/bin/python3", f"{thin_dir}/salt-call"], **kwargs)
+    salt_call_cmd = ["/usr/bin/python3", f"{deploy_dir}/salt-call"]
+    if _is_venv_bundle():
+        salt_call_cmd = [f"{deploy_dir}/bin/salt-call"]
+    return call("state.pkg", shared_pkg_path, pkg_sum, hash_type, test=test, local=True, salt_call_cmd=salt_call_cmd, **kwargs)
+
+def _has_shebang(file_path):
+    """Check if the file starts with a shebang."""
+    try:
+        with open(file_path, 'r', encoding="UTF-8") as f:
+            first_line = f.readline().strip()
+            return first_line.startswith('#!')
+    except:
+        return False
 
 
 def _pkg_deploy_self(pkg_path):
-    # Cache dir shared between tu and non-tu env
+    # Cache dir is shared between TU and non-TU env
     deploy_dir = "/var/cache/salt/minion"
-    thin_path = __utils__["thin.gen_thin"](
-        deploy_dir,
-        extra_mods=__salt__["config.option"]("thin_extra_mods", ""),
-        so_mods=__salt__["config.option"]("thin_so_mods", ""),
-    )
-    thin_dest_path = tempfile.mkdtemp(dir=deploy_dir)
-    shared_pkg_path = os.path.join(thin_dest_path, "salt_state.tgz")
-    stdout = __salt__["cmd.run"](["tar", "xzf", thin_path, "-C", thin_dest_path])
-    if stdout:
-        __utils__["files.rm_rf"](thin_dest_path)
-        raise ValueError(stdout)
+    deploy_dest_path = tempfile.mkdtemp(dir=deploy_dir)
+
+    if _is_venv_bundle():
+        # copy self to new location
+        bundle_path = pathlib.Path(sys.executable).parent.parent
+        __salt__["file.copy"](bundle_path, deploy_dest_path, recurse=True, remove_existing=True)
+        # Fix shebang in 'bin' to point to new temp location
+        files = __salt__["file.find"](os.path.join(deploy_dest_path, "bin"), type='f')
+        for file in files:
+            # the bin/python file is an execution wrapper in venv bundle
+            if _has_shebang(file) or file.endswith("python"):
+                __salt__["file.replace"](file, str(bundle_path), deploy_dest_path)
+    else:
+        thin_path = __utils__["thin.gen_thin"](
+            deploy_dir,
+            extra_mods=__salt__["config.option"]("thin_extra_mods", ""),
+            so_mods=__salt__["config.option"]("thin_so_mods", ""),
+        )
+        stdout = __salt__["cmd.run"](["tar", "xzf", thin_path, "-C", deploy_dest_path])
+        if stdout:
+            __utils__["files.rm_rf"](deploy_dest_path)
+            raise ValueError(stdout)
+
+    shared_pkg_path = os.path.join(deploy_dest_path, "salt_state.tgz")
     __salt__["file.copy"](pkg_path, shared_pkg_path)
 
-    log.debug(f"Created {thin_dest_path}")
-    return thin_dest_path
+    log.debug(f"Created {deploy_dest_path}")
+    return deploy_dest_path
+
+
+def _is_venv_bundle():
+    python_exec_dir = os.path.dirname(sys.executable)
+    return "venv-salt-minion" in pathlib.Path(python_exec_dir).parts
 
 
 def call(function, *args, **kwargs):
@@ -996,10 +1026,10 @@ def call(function, *args, **kwargs):
             salt_call_cmd = explicit_salt_cmd
         else:
             salt_call_cmd = ["salt-call"]
-        python_exec_dir = os.path.dirname(sys.executable)
-        if "venv-salt-minion" in pathlib.Path(python_exec_dir).parts:
+        if _is_venv_bundle() and not explicit_salt_cmd:
             # If the module is executed with the Salt Bundle,
             # use salt-call from the Salt Bundle
+            python_exec_dir = os.path.dirname(sys.executable)
             salt_call_cmd = [os.path.join(python_exec_dir, "salt-call")]
 
         safe_kwargs = salt.utils.args.clean_kwargs(**kwargs)
