@@ -3,7 +3,6 @@ name: Changelogs
 on:
   pull_request:
     types: [opened, edited, synchronize, reopened, closed]
-    # Only execute on the main branches (feature branches are excluded)
     branches:
       - openSUSE/release/*
 
@@ -27,13 +26,13 @@ jobs:
     - id: files
       uses: Ana06/get-changed-files@25f79e676e7ea1868813e21465014798211fad8c #v2.3.0
       with:
-        filter: '*.changes'
+        filter: 'pkg/suse/changelogs/*.changes'
 
     - name: Verify .changes file modification
       if: "!contains(github.event.pull_request.body, '[x] No changelog needed')"
       run: |
         if [ -z "${{ steps.files.outputs.added_modified }}" ]; then
-          echo "error: No .changes files were modified in this PR."
+          echo "error: Missing pkg/suse/changelogs/*.changes files."
           exit 1
         fi
         echo "Found modified .changes files: ${{ steps.files.outputs.added_modified }}"
