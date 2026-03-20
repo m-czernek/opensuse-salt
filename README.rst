@@ -109,3 +109,4 @@ used by external modules.
 
 A complete list of attributions and dependencies can be found here:
 `salt/DEPENDENCIES.md <https://github.com/openSUSE/salt/blob/master/DEPENDENCIES.md>`_
+
