@@ -1,5 +1,3 @@
-
-
 .. image:: https://img.shields.io/github/license/saltstack/salt
    :alt: Salt Project License: Apache v2.0
    :target: https://github.com/openSUSE/salt/blob/master/LICENSE
