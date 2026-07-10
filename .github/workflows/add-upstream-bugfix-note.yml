@@ -197,7 +197,7 @@ jobs:
                 continue
               fi
 
-              if [[ "$EXISTING_NOTE" == *"$url"* ]]; then
+              if echo "$EXISTING_NOTE" | grep -qFw "$url"; then
                 echo "Note already contains $url for $SHA. Skipping."
               else
                 URLS_TO_ADD+=("$url")
