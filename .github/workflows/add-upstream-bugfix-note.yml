@@ -150,7 +150,9 @@ jobs:
               elif [[ ! "$url" =~ ^https:// ]]; then
                 url="https://$url"
               fi
-              URLS+=("$url")
+              if [[ " ${URLS[*]} " != *" ${url} "* ]]; then
+                URLS+=("$url")
+              fi
             fi
           done < <(echo "$BODY" | sed '/!ignore.*github\.com\/saltstack\/salt\//d' | grep -oE '(https?://)?github\.com/saltstack/salt/(pull/[0-9]+|commit/[a-f0-9]+)' || true)
 
