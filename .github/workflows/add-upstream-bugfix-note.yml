@@ -72,8 +72,9 @@ jobs:
                 exit 1
               fi
             fi
-
-            URLS+=("$url")
+            if [[ " ${URLS[*]} " != *" ${url} "* ]]; then
+                URLS+=("$url")
+            fi
           done
 
           SHA="${{ github.event.inputs.commit_sha }}"
