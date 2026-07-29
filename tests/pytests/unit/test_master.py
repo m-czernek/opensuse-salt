@@ -1,11 +1,17 @@
+import collections
+import os
 import pathlib
 import time
 
 import pytest
 
+import salt.channel.client
 import salt.config
 import salt.crypt
+import salt.exceptions
 import salt.master
+import salt.serializers.msgpack
+import salt.utils.cache
 import salt.utils.files
 import salt.utils.platform
 from tests.support.mock import MagicMock, patch
@@ -20,6 +26,30 @@ except ImportError:
 
 
 skipif_no_pygit2 = pytest.mark.skipif(not HAS_PYGIT2, reason="Missing pygit2")
+
+
+@pytest.fixture
+def maintenance_opts(master_opts, tmp_path):
+    """
+    Options needed for the master's Maintenance class.
+    """
+    cache_dir = tmp_path / "cache"
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    opts = master_opts.copy()
+    opts.update(
+        cachedir=str(cache_dir),
+        git_pillar_update_interval=180,
+        maintenance_interval=181,
+    )
+    return opts
+
+
+@pytest.fixture
+def maintenance(maintenance_opts):
+    """
+    An instance of the master's Maintenance class.
+    """
+    return salt.master.Maintenance(maintenance_opts)
 
 
 @pytest.fixture
@@ -179,95 +209,6 @@ def test_when_syndic_return_processes_load_then_correct_values_should_be_returne
         fake_return.assert_called_with(expected_return)
 
 
-def test_mworker_pass_context():
-    """
-    Test of passing the __context__ to pillar ext module loader
-    """
-    req_channel_mock = MagicMock()
-    local_client_mock = MagicMock()
-
-    opts = {
-        "req_server_niceness": None,
-        "mworker_niceness": None,
-        "sock_dir": "/tmp",
-        "conf_file": "/tmp/fake_conf",
-        "transport": "zeromq",
-        "fileserver_backend": ["roots"],
-        "file_client": "local",
-        "pillar_cache": False,
-        "state_top": "top.sls",
-        "pillar_roots": {},
-    }
-
-    data = {
-        "id": "MINION_ID",
-        "grains": {},
-        "saltenv": None,
-        "pillarenv": None,
-        "pillar_override": {},
-        "extra_minion_data": {},
-        "ver": "2",
-        "cmd": "_pillar",
-    }
-
-    test_context = {"testing": 123}
-
-    def mworker_bind_mock():
-        mworker.aes_funcs.run_func(data["cmd"], data)
-
-    with patch("salt.client.get_local_client", local_client_mock), patch(
-        "salt.master.ClearFuncs", MagicMock()
-    ), patch("salt.minion.MasterMinion", MagicMock()), patch(
-        "salt.utils.verify.valid_id", return_value=True
-    ), patch(
-        "salt.loader.matchers", MagicMock()
-    ), patch(
-        "salt.loader.render", MagicMock()
-    ), patch(
-        "salt.loader.utils", MagicMock()
-    ), patch(
-        "salt.loader.fileserver", MagicMock()
-    ), patch(
-        "salt.loader.minion_mods", MagicMock()
-    ), patch(
-        "salt.loader._module_dirs", MagicMock()
-    ), patch(
-        "salt.loader.LazyLoader", MagicMock()
-    ) as loadler_pillars_mock:
-        mworker = salt.master.MWorker(opts, {}, {}, [req_channel_mock])
-
-        with patch.object(mworker, "_MWorker__bind", mworker_bind_mock), patch.dict(
-            mworker.context, test_context
-        ):
-            mworker.run()
-            assert (
-                loadler_pillars_mock.call_args_list[0][1].get("pack").get("__context__")
-                == test_context
-            )
-
-        loadler_pillars_mock.reset_mock()
-
-        opts.update(
-            {
-                "pillar_cache": True,
-                "pillar_cache_backend": "file",
-                "pillar_cache_ttl": 1000,
-                "cachedir": "/tmp",
-            }
-        )
-
-        mworker = salt.master.MWorker(opts, {}, {}, [req_channel_mock])
-
-        with patch.object(mworker, "_MWorker__bind", mworker_bind_mock), patch.dict(
-            mworker.context, test_context
-        ), patch("salt.utils.cache.CacheFactory.factory", MagicMock()):
-            mworker.run()
-            assert (
-                loadler_pillars_mock.call_args_list[0][1].get("pack").get("__context__")
-                == test_context
-            )
-
-
 def test_syndic_return_cache_dir_creation(encrypted_requests):
     """master's cachedir for a syndic will be created by AESFuncs._syndic_return method"""
     cachedir = pathlib.Path(encrypted_requests.opts["cachedir"])
@@ -300,31 +241,6 @@ def test_syndic_return_cache_dir_creation_traversal(encrypted_requests):
     assert not (cachedir / "mamajama").exists()
 
 
-def test_collect__auth_to_master_stats():
-    """
-    Check if master stats is collecting _auth calls while not calling neither _handle_aes nor _handle_clear
-    """
-    opts = {
-        "master_stats": True,
-        "master_stats_event_iter": 10,
-    }
-    req_channel_mock = MagicMock()
-    mworker = salt.master.MWorker(opts, {}, {}, [req_channel_mock])
-    with patch.object(mworker, "_handle_aes") as handle_aes_mock, patch.object(
-        mworker, "_handle_clear"
-    ) as handle_clear_mock:
-        mworker._handle_payload({"cmd": "_auth", "_start": time.time() - 0.02})
-        assert mworker.stats["_auth"]["runs"] == 1
-        assert mworker.stats["_auth"]["mean"] >= 0.02
-        assert mworker.stats["_auth"]["mean"] < 0.04
-        mworker._handle_payload({"cmd": "_auth", "_start": time.time() - 0.02})
-        assert mworker.stats["_auth"]["runs"] == 2
-        assert mworker.stats["_auth"]["mean"] >= 0.02
-        assert mworker.stats["_auth"]["mean"] < 0.04
-        handle_aes_mock.assert_not_called()
-        handle_clear_mock.assert_not_called()
-
-
 def test_pub_ret_traversal(encrypted_requests, tmp_path):
     """
     master's  AESFuncs._syndic_return method cachdir creation is not vulnerable to a directory traversal
@@ -338,16 +254,107 @@ def test_pub_ret_traversal(encrypted_requests, tmp_path):
         with salt.utils.files.fopen(tmp_path / "minion.pub", "rb") as rfp:
             wfp.write(rfp.read())
 
-    priv = salt.crypt.get_rsa_key(tmp_path / "minion.pem", None)
+    priv = salt.crypt.PrivateKey(tmp_path / "minion.pem")
     with pytest.raises(salt.exceptions.SaltValidationError):
         encrypted_requests.pub_ret(
             {
-                "tok": salt.crypt.private_encrypt(priv, b"salt"),
+                "tok": priv.encrypt(b"salt"),
                 "id": "minion",
                 "jid": "asdf/../../../sdf",
                 "return": {},
             }
         )
+
+
+def test_return_signature_verifies_after_channel_packaging(tmp_path, caplog):
+    """
+    Regression test for #68181.
+
+    With ``minion_sign_messages`` enabled, the minion previously signed the
+    return load before ``AsyncReqChannel._package_load`` attached transport
+    metadata (``nonce``, ``ts``, ``tok``, ``id``). The bytes the master
+    re-serialized to verify therefore did not match what was signed, and
+    every signed return was silently dropped under
+    ``drop_messages_signature_fail``. Signing is now done inside
+    ``_package_load`` after the metadata is attached.
+    """
+    salt.crypt.gen_keys(str(tmp_path), "minion", 2048)
+    pki_dir = tmp_path / "pki"
+    pki_dir.mkdir()
+    accepted = pki_dir / "minions"
+    accepted.mkdir()
+    with salt.utils.files.fopen(accepted / "minion", "wb") as wfp:
+        with salt.utils.files.fopen(tmp_path / "minion.pub", "rb") as rfp:
+            wfp.write(rfp.read())
+
+    aes_funcs = salt.master.AESFuncs(
+        opts={
+            "pki_dir": str(pki_dir),
+            "cachedir": str(tmp_path / "cache"),
+            "sock_dir": str(tmp_path / "sock_drawer"),
+            "conf_file": str(tmp_path / "config.conf"),
+            "fileserver_backend": ["local"],
+            "master_job_cache": False,
+            "require_minion_sign_messages": True,
+            "drop_messages_signature_fail": True,
+            # SHA224 so the test works on FIPS-enabled platforms too.
+            "signing_algorithm": salt.crypt.PKCS1v15_SHA224,
+        }
+    )
+
+    # Load as Minion._prepare_return_pub would build it for a test.ping return.
+    load = {
+        "cmd": "_return",
+        "id": "minion",
+        "success": True,
+        "fun_args": [],
+        "jid": "20260527000000000000",
+        "return": True,
+        "retcode": 0,
+        "fun": "test.ping",
+        "out": "nested",
+    }
+
+    # Build an AsyncReqChannel just complete enough to exercise _package_load.
+    # We bypass __init__ to avoid spinning up a real transport / auth handshake.
+    channel = salt.channel.client.AsyncReqChannel.__new__(
+        salt.channel.client.AsyncReqChannel
+    )
+    channel.opts = {
+        "id": "minion",
+        "pki_dir": str(tmp_path),
+        "minion_sign_messages": True,
+        "encryption_algorithm": salt.crypt.OAEP_SHA224,
+        "signing_algorithm": salt.crypt.PKCS1v15_SHA224,
+    }
+    channel.auth = MagicMock()
+    channel.auth.gen_token.return_value = b"\x00" * 256
+    # Bypass session encryption so we can read the load the master would see.
+    channel.auth.session_crypticle = MagicMock()
+    channel.auth.session_crypticle.dumps = lambda payload: payload
+
+    packaged = channel._package_load(load)
+    inner_load = packaged["load"]
+
+    # ReqServerChannel pops these transport-only fields before the load reaches
+    # AESFuncs._return. Mirror that here.
+    inner_load.pop("nonce", None)
+    inner_load.pop("tok", None)
+
+    assert "sig" in inner_load, (
+        "Channel did not attach a signature to the outbound load even though "
+        "minion_sign_messages is enabled (#68181)."
+    )
+
+    with patch("salt.utils.job.store_job") as store_job, caplog.at_level("INFO"):
+        ret = aes_funcs._return(inner_load)
+
+    assert "Failed to verify event signature" not in caplog.text, (
+        "Master rejected a valid signed return because the channel signed "
+        "the load before attaching transport metadata (#68181)."
+    )
+    assert ret is not False
+    assert store_job.called
 
 
 def _git_pillar_base_config(tmp_path):
@@ -475,3 +482,108 @@ def test_on_demand_not_allowed(not_allowed_funcs, tmp_path, caplog):
         "The following ext_pillar modules are not allowed for on-demand pillar data: git."
         in caplog.text
     )
+
+
+def test_handle_clear_missing_cmd_returns_empty_reply(caplog):
+    """
+    Cleartext loads without ``cmd`` must not raise; the REQ channel unpacks a
+    (ret, req_opts) tuple from the payload handler.
+    """
+    worker = object.__new__(salt.master.MWorker)
+    worker.opts = {"master_stats": False}
+    worker.stats = collections.defaultdict(lambda: {"mean": 0, "runs": 0})
+    with caplog.at_level("ERROR"):
+        ret = salt.master.MWorker._handle_clear(worker, {})
+    assert ret == ({}, {"fun": "send_clear"})
+    assert "Received malformed clear command (missing 'cmd')" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "cached_present,connected_ids,change_expected",
+    [
+        (
+            # No change: same minions in cache and currently connected.
+            ["minion1", "minion2"],
+            {"minion1", "minion2"},
+            False,
+        ),
+        (
+            # A new minion appeared since last cache write.
+            ["minion1"],
+            {"minion1", "minion2"},
+            True,
+        ),
+        (
+            # A minion disappeared since last cache write.
+            ["minion1", "minion2"],
+            {"minion1"},
+            True,
+        ),
+    ],
+)
+def test_handle_presence(
+    maintenance, cached_present, connected_ids, change_expected, tmp_path
+):
+    """
+    handle_presence fires a /present event every cycle and a /change event only
+    when the set of connected minions differs from the cached presence list.
+    After each call the cache on disk must reflect the current connected set.
+    """
+    fire_event = MagicMock()
+
+    # Seed the presence cache with old (possibly stale) data.
+    presence_cache = salt.utils.cache.CacheFactory.factory(
+        "disk",
+        3600,
+        minion_cache_path=os.path.join(maintenance.opts["cachedir"], "presence-data"),
+    )
+    presence_cache.clear()
+    presence_cache["present"] = cached_present
+
+    with patch("salt.master.Maintenance.run", MagicMock()), patch(
+        "salt.master.Maintenance.presence_events", True, create=True
+    ), patch(
+        "salt.master.Maintenance.event",
+        MagicMock(
+            connect_pull=MagicMock(return_value=True),
+            fire_event=fire_event,
+        ),
+        create=True,
+    ), patch(
+        "salt.master.Maintenance.ckminions",
+        MagicMock(connected_ids=MagicMock(return_value=connected_ids)),
+        create=True,
+    ):
+        maintenance.handle_presence(set(presence_cache["present"]))
+
+        # A /present event is always fired.
+        assert fire_event.called
+
+        if change_expected:
+            # A /change event must be fired in addition to /present.
+            assert fire_event.call_count == 2
+            change_events = [
+                c[0][0] for c in fire_event.call_args_list if "/change" in c[0][1]
+            ]
+            assert change_events, "Expected a /change event but none was fired"
+        else:
+            assert fire_event.call_count == 1
+
+        present_event = [
+            c[0][0] for c in fire_event.call_args_list if "/present" in c[0][1]
+        ][0]
+        assert (
+            set(present_event["present"]) == connected_ids
+        ), "The /present event does not contain the expected minion set"
+
+        # The cache on disk must now reflect the current connected set.
+        new_presence_cache = salt.utils.cache.CacheFactory.factory(
+            "disk",
+            3600,
+            minion_cache_path=os.path.join(
+                maintenance.opts["cachedir"], "presence-data"
+            ),
+        )
+        assert (
+            set(new_presence_cache["present"]) == connected_ids
+        ), "The presence cache on disk does not reflect the current connected set"

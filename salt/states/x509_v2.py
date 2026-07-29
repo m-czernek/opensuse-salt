@@ -82,7 +82,7 @@ the certificate to the mine, where it can be easily retrieved by other minions.
         - keysize: 4096
         - backup: true
         - require:
-          - file: /etc/pki
+          - file: /etc/pki/issued_certs
 
     Create self-signed CA certificate:
       x509.certificate_managed:
@@ -180,16 +180,16 @@ according to the www policy.
         - require:
           - x509: /etc/pki/www.key
 """
+
 import base64
 import copy
-import datetime
 import logging
 import os.path
+from datetime import datetime, timedelta, timezone
 
 import salt.utils.files
-import salt.utils.timeutil
+import salt.utils.platform
 from salt.exceptions import CommandExecutionError, SaltInvocationError
-from salt.features import features
 from salt.state import STATE_INTERNAL_KEYWORDS as _STATE_INTERNAL_KEYWORDS
 
 try:
@@ -212,7 +212,7 @@ __virtualname__ = "x509"
 def __virtual__():
     if not HAS_CRYPTOGRAPHY:
         return (False, "Could not load cryptography")
-    if not features.get("x509_v2"):
+    if not __opts__["features"].get("x509_v2"):
         return (
             False,
             "x509_v2 needs to be explicitly enabled by setting `x509_v2: true` "
@@ -228,8 +228,6 @@ def certificate_managed(
     signing_policy=None,
     encoding="pem",
     append_certs=None,
-    copypath=None,
-    prepend_cn=False,
     digest="sha256",
     signing_private_key=None,
     signing_private_key_passphrase=None,
@@ -252,7 +250,7 @@ def certificate_managed(
     Ensure an X.509 certificate is present as specified.
 
     This function accepts the same arguments as :py:func:`x509.create_certificate <salt.modules.x509_v2.create_certificate>`,
-    as well as most ones for `:py:func:`file.managed <salt.states.file.managed>`.
+    as well as most ones for :py:func:`file.managed <salt.states.file.managed>`.
 
     name
         The path the certificate should be present at.
@@ -298,37 +296,49 @@ def certificate_managed(
         The hashing algorithm to use for the signature. Valid values are:
         sha1, sha224, sha256, sha384, sha512, sha512_224, sha512_256, sha3_224,
         sha3_256, sha3_384, sha3_512. Defaults to ``sha256``.
-        This will be ignored for ``ed25519`` and ``ed448`` key types.
-
-    signing_private_key
-        The private key corresponding to the public key in ``signing_cert``. Required.
-
-    signing_private_key_passphrase
-        If ``signing_private_key`` is encrypted, the passphrase to decrypt it.
+        Ignored for ``ed25519`` and ``ed448`` key types.
 
     signing_cert
         The CA certificate to be used for signing the issued certificate.
 
-    public_key
-        The public key the certificate should be issued for. Other ways of passing
-        the required information are ``private_key`` and ``csr``. If neither are set,
-        the public key of the ``signing_private_key`` will be included, i.e.
-        a self-signed certificate is generated.
+        Leave empty to create a self-signed certificate.
+
+    signing_private_key
+        The private key to be used for signing the new certificate. Required.
+
+        Usually, this is the private key corresponding to the public key in ``signing_cert``.
+        When creating self-signed certificates (missing ``signing_cert``), derives
+        the new certificate's embedded public key from this private key.
+
+    signing_private_key_passphrase
+        If ``signing_private_key`` is encrypted, the passphrase to decrypt it.
 
     private_key
-        The private key corresponding to the public key the certificate should
-        be issued for. This is one way of specifying the public key that will
-        be included in the certificate, the other ones being ``public_key`` and ``csr``.
+        A **private key**, which is used to derive the public key the certificate
+        is issued for. If this is unset, checks ``public_key`` or ``csr`` to derive it.
+
+        Ignored when creating self-signed certificates (missing ``signing_cert``).
+
+        .. hint::
+            When ``encoding`` is ``pkcs12``, this private key is embedded into
+            the resulting container.
 
     private_key_passphrase
         If ``private_key`` is specified and encrypted, the passphrase to decrypt it.
 
-    csr
-        A certificate signing request to use as a base for generating the certificate.
-        The following information will be respected, depending on configuration:
+    public_key
+        A **public key**, which is used as the public key the certificate is issued for,
+        but only if ``private_key`` is **not** specified. If this is unset, checks ``csr`` to derive it.
 
-        * public key
-        * extensions, if not otherwise specified (arguments, signing_policy)
+        Ignored when creating self-signed certificates (missing ``signing_cert``).
+
+    csr
+        A **certificate signing request** to use as a base for generating the certificate:
+
+        - Extensions not otherwise specified (arguments, signing_policy) are copied.
+        - If ``private_key`` and ``public_key`` are both unspecified, copies the embedded
+          public key into the certificate. This step is skipped when creating self-signed
+          certificates (missing ``signing_cert``).
 
     subject
         The subject's distinguished name embedded in the certificate. This is one way of
@@ -435,9 +445,9 @@ def certificate_managed(
         file_managed_test = _file_managed(name, test=True, replace=False, **file_args)
         if file_managed_test["result"] is False:
             ret["result"] = False
-            ret[
-                "comment"
-            ] = "Problem while testing file.managed changes, see its output"
+            ret["comment"] = (
+                "Problem while testing file.managed changes, see its output"
+            )
             _add_sub_state_run(ret, file_managed_test)
             return ret
 
@@ -467,18 +477,10 @@ def certificate_managed(
                 ) = x509util.load_cert(
                     real_name, passphrase=pkcs12_passphrase, get_encoding=True
                 )
-            except SaltInvocationError as err:
-                if "Bad decrypt" in str(err):
-                    changes["pkcs12_passphrase"] = True
-                elif any(
-                    (
-                        "Could not deserialize binary data" in str(err),
-                        "Could not load PEM-encoded" in str(err),
-                    )
-                ):
-                    replace = True
-                else:
-                    raise
+            except x509util.InvalidPassword:
+                changes["pkcs12_passphrase"] = True
+            except x509util.CertDeserializationError:
+                replace = True
             else:
                 if encoding != current_encoding:
                     changes["encoding"] = encoding
@@ -488,11 +490,16 @@ def certificate_managed(
                     else None
                 ):
                     changes["pkcs12_friendlyname"] = pkcs12_friendlyname
+                try:
+                    curr_not_after = current.not_valid_after_utc
+                except AttributeError:
+                    # naive datetime object, release <42 (it's always UTC)
+                    curr_not_after = current.not_valid_after.replace(
+                        tzinfo=timezone.utc
+                    )
 
-                if (
-                    current.not_valid_after
-                    < salt.utils.timeutil.utcnow()
-                    + datetime.timedelta(days=days_remaining)
+                if curr_not_after < datetime.now(tz=timezone.utc) + timedelta(
+                    days=days_remaining
                 ):
                     changes["expiration"] = True
 
@@ -738,7 +745,7 @@ def crl_managed(
         The hashing algorithm to use for the signature. Valid values are:
         sha1, sha224, sha256, sha384, sha512, sha512_224, sha512_256, sha3_224,
         sha3_256, sha3_384, sha3_512. Defaults to ``sha256``.
-        This will be ignored for ``ed25519`` and ``ed448`` key types.
+        Ignored for ``ed25519`` and ``ed448`` key types.
 
     encoding
         Specify the encoding of the resulting certificate revocation list.
@@ -841,9 +848,9 @@ def crl_managed(
 
         if file_managed_test["result"] is False:
             ret["result"] = False
-            ret[
-                "comment"
-            ] = "Problem while testing file.managed changes, see its output"
+            ret["comment"] = (
+                "Problem while testing file.managed changes, see its output"
+            )
             _add_sub_state_run(ret, file_managed_test)
             return ret
 
@@ -868,16 +875,8 @@ def crl_managed(
                 current, current_encoding = x509util.load_crl(
                     real_name, get_encoding=True
                 )
-            except SaltInvocationError as err:
-                if any(
-                    (
-                        "Could not load PEM-encoded" in str(err),
-                        "Could not load DER-encoded" in str(err),
-                    )
-                ):
-                    replace = True
-                else:
-                    raise
+            except x509util.CRLDeserializationError:
+                replace = True
             else:
                 try:
                     if current.signature_hash_algorithm is not None and not isinstance(
@@ -897,10 +896,14 @@ def crl_managed(
 
                 if encoding != current_encoding:
                     changes["encoding"] = encoding
+                try:
+                    curr_next_update = current.next_update_utc
+                except AttributeError:
+                    # naive datetime object, release <42 (it's always UTC)
+                    curr_next_update = current.next_update.replace(tzinfo=timezone.utc)
                 if days_remaining and (
-                    current.next_update
-                    < salt.utils.timeutil.utcnow()
-                    + datetime.timedelta(days=days_remaining)
+                    curr_next_update
+                    < datetime.now(tz=timezone.utc) + timedelta(days=days_remaining)
                 ):
                     changes["expiration"] = True
 
@@ -1039,7 +1042,7 @@ def csr_managed(
         The hashing algorithm to use for the signature. Valid values are:
         sha1, sha224, sha256, sha384, sha512, sha512_224, sha512_256, sha3_224,
         sha3_256, sha3_384, sha3_512. Defaults to ``sha256``.
-        This will be ignored for ``ed25519`` and ``ed448`` key types.
+        Ignored for ``ed25519`` and ``ed448`` key types.
 
     encoding
         Specify the encoding of the resulting certificate revocation list.
@@ -1080,9 +1083,9 @@ def csr_managed(
 
         if file_managed_test["result"] is False:
             ret["result"] = False
-            ret[
-                "comment"
-            ] = "Problem while testing file.managed changes, see its output"
+            ret["comment"] = (
+                "Problem while testing file.managed changes, see its output"
+            )
             _add_sub_state_run(ret, file_managed_test)
             return ret
 
@@ -1107,16 +1110,8 @@ def csr_managed(
                 current, current_encoding = x509util.load_csr(
                     real_name, get_encoding=True
                 )
-            except SaltInvocationError as err:
-                if any(
-                    (
-                        "Could not load PEM-encoded" in str(err),
-                        "Could not load DER-encoded" in str(err),
-                    )
-                ):
-                    replace = True
-                else:
-                    raise
+            except x509util.CSRDeserializationError:
+                replace = True
             except cx509.InvalidVersion:
                 # by default, the previous x509 modules generated CSR with
                 # invalid versions, which leads to an exception in cryptography >= v38
@@ -1275,7 +1270,7 @@ def private_key_managed(
     keysize
         For ``rsa``, specifies the bitlength of the private key (2048, 3072, 4096).
         For ``ec``, specifies the NIST curve to use (256, 384, 521).
-        Irrelevant for Edwards-curve schemes (`ed25519``, ``ed448``).
+        Irrelevant for Edwards-curve schemes (``ed25519``, ``ed448``).
         Defaults to 2048 for RSA and 256 for EC.
 
     passphrase
@@ -1351,7 +1346,7 @@ def private_key_managed(
     if extra_args:
         raise SaltInvocationError(f"Unrecognized keyword arguments: {list(extra_args)}")
 
-    if not file_args.get("mode"):
+    if not file_args.get("mode") and not salt.utils.platform.is_windows():
         # ensure secure defaults
         file_args["mode"] = "0400"
 
@@ -1364,9 +1359,9 @@ def private_key_managed(
 
         if file_managed_test["result"] is False:
             ret["result"] = False
-            ret[
-                "comment"
-            ] = "Problem while testing file.managed changes, see its output"
+            ret["comment"] = (
+                "Problem while testing file.managed changes, see its output"
+            )
             _add_sub_state_run(ret, file_managed_test)
             return ret
 
@@ -1393,42 +1388,33 @@ def private_key_managed(
                 current, current_encoding, _ = x509util.load_privkey(
                     real_name, passphrase=passphrase, get_encoding=True
                 )
-            except SaltInvocationError as err:
-                if "Bad decrypt" in str(err):
-                    if not overwrite:
-                        raise CommandExecutionError(
-                            "The provided passphrase cannot decrypt the private key. "
-                            "Pass overwrite: true to force regeneration"
-                        ) from err
-                    changes["passphrase"] = True
-                elif any(
-                    (
-                        "Could not deserialize binary data" in str(err),
-                        "Could not load DER-encoded" in str(err),
-                        "Could not load PEM-encoded" in str(err),
-                    )
-                ):
-                    if not overwrite:
-                        raise CommandExecutionError(
-                            "The existing file does not seem to be a private key "
-                            "formatted as DER, PEM or embedded in PKCS12. "
-                            "Pass overwrite: true to force regeneration"
-                        ) from err
-                    replace = True
-                elif "Private key is unencrypted" in str(err):
-                    changes["passphrase"] = True
-                    current, current_encoding, _ = x509util.load_privkey(
-                        real_name, passphrase=None, get_encoding=True
-                    )
-                elif "Private key is encrypted" in str(err) and not passphrase:
-                    if not overwrite:
-                        raise CommandExecutionError(
-                            "The existing file is encrypted. Pass overwrite: true "
-                            "to force regeneration without passphrase"
-                        ) from err
-                    changes["passphrase"] = True
-                else:
-                    raise
+            except x509util.SuperfluousPassword:
+                changes["passphrase"] = True
+                current, current_encoding, _ = x509util.load_privkey(
+                    real_name, passphrase=None, get_encoding=True
+                )
+            except x509util.InvalidPassword as err:
+                if not overwrite:
+                    raise CommandExecutionError(
+                        "The provided passphrase cannot decrypt the private key. "
+                        "Pass overwrite: true to force regeneration"
+                    ) from err
+                changes["passphrase"] = True
+            except x509util.MissingPassword as err:
+                if not overwrite:
+                    raise CommandExecutionError(
+                        "The existing file is encrypted. Pass overwrite: true "
+                        "to force regeneration without passphrase"
+                    ) from err
+                changes["passphrase"] = True
+            except x509util.PrivDeserializationError as err:
+                if not overwrite:
+                    raise CommandExecutionError(
+                        "The existing file does not seem to be a private key "
+                        "formatted as DER, PEM or embedded in PKCS12. "
+                        "Pass overwrite: true to force regeneration"
+                    ) from err
+                replace = True
         if current:
             key_type = x509util.get_key_type(current)
             check_keysize = keysize
@@ -1451,7 +1437,7 @@ def private_key_managed(
                 and algo in ("rsa", "ec")
                 and current.key_size != check_keysize
             ):
-                changes["keysize"] = keysize
+                changes["keysize"] = check_keysize
             if encoding != current_encoding:
                 changes["encoding"] = encoding
         elif file_exists and new:
@@ -1579,16 +1565,22 @@ def _file_managed(name, test=None, **kwargs):
         raise SaltInvocationError("test param can only be None or True")
     # work around https://github.com/saltstack/salt/issues/62590
     test = test or __opts__["test"]
-    res = __salt__["state.single"]("file.managed", name, test=test, **kwargs)
+    res = __salt__["state.single"](
+        "file.managed", name, test=test, concurrent=True, **kwargs
+    )
+    if not isinstance(res, dict):
+        raise CommandExecutionError(
+            f"Failed running file.managed in x509_v2 state: {res}"
+        )
     return res[next(iter(res))]
 
 
 def _check_file_ret(fret, ret, current):
     if fret["result"] is False:
         ret["result"] = False
-        ret[
-            "comment"
-        ] = f"Could not {'create' if not current else 'update'} file, see file.managed output"
+        ret["comment"] = (
+            f"Could not {'create' if not current else 'update'} file, see file.managed output"
+        )
         ret["changes"] = {}
         return False
     return True
@@ -1598,10 +1590,12 @@ def _build_cert(
     ca_server=None, signing_policy=None, signing_private_key=None, **kwargs
 ):
     final_kwargs = copy.deepcopy(kwargs)
+    final_kwargs["signing_private_key"] = signing_private_key
     x509util.merge_signing_policy(
         __salt__["x509.get_signing_policy"](signing_policy, ca_server=ca_server),
         final_kwargs,
     )
+    signing_private_key = final_kwargs.pop("signing_private_key")
 
     builder, _, private_key_loaded, signing_cert = x509util.build_crt(
         signing_private_key,

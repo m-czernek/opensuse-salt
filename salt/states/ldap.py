@@ -11,8 +11,8 @@ their attributes.
 import copy
 import inspect
 import logging
+from collections import OrderedDict
 
-from salt.utils.odict import OrderedDict
 from salt.utils.oset import OrderedSet
 from salt.utils.stringutils import to_bytes
 
@@ -320,6 +320,7 @@ def managed(name, entries, connect_spec=None, attrlist=None):
                 o = old.get(dn, {})
                 n = new.get(dn, {})
 
+                op = None
                 try:
                     # perform the operation
                     if o:

@@ -1,7 +1,12 @@
 import pytest
 
 from salt.cloud import Cloud
+from salt.exceptions import SaltCloudSystemExit
 from tests.support.mock import MagicMock, patch
+
+pytestmark = [
+    pytest.mark.timeout_unless_on_windows(120),
+]
 
 
 @pytest.fixture
@@ -123,3 +128,26 @@ def test_vm_config_merger():
     }
     vm = Cloud.vm_config("test_vm", main, provider, profile, {})
     assert expected == vm
+
+
+@pytest.mark.skip_on_fips_enabled_platform
+def test_cloud_run_profile_create_returns_boolean(master_config):
+
+    master_config["profiles"] = {"test_profile": {"provider": "test_provider:saltify"}}
+    master_config["providers"] = {
+        "test_provider": {
+            "saltify": {"profiles": {"provider": "test_provider:saltify"}}
+        }
+    }
+    master_config["show_deploy_args"] = False
+
+    cloud = Cloud(master_config)
+    with patch.object(cloud, "create", return_value=True):
+        ret = cloud.run_profile("test_profile", ["test_vm"])
+        assert ret == {"test_vm": True}
+
+    cloud = Cloud(master_config)
+    with patch.object(cloud, "create", return_value=False):
+        with pytest.raises(SaltCloudSystemExit):
+            ret = cloud.run_profile("test_profile", ["test_vm"])
+            assert ret == {"test_vm": False}

@@ -11,7 +11,8 @@ import shlex
 import time
 import uuid
 import warnings
-from collections.abc import Hashable
+from collections import OrderedDict
+from collections.abc import Hashable, Mapping, Sequence
 from functools import wraps
 from xml.dom import minidom
 from xml.etree.ElementTree import Element, SubElement, tostring
@@ -31,7 +32,6 @@ import salt.utils.url
 import salt.utils.yaml
 from salt.exceptions import TemplateError
 from salt.utils.decorators.jinja import jinja_filter, jinja_global, jinja_test
-from salt.utils.odict import OrderedDict
 from salt.utils.versions import Version
 
 try:
@@ -75,7 +75,12 @@ class SaltCacheLoader(BaseLoader):
             else:
                 self.searchpath = opts["pillar_roots"][saltenv]
         else:
-            self.searchpath = [os.path.join(opts["cachedir"], "files", saltenv)]
+            # In salt-ssh context, _caller_cachedir is the master's cachedir
+            # while cachedir points to the thin minion's remote path.
+            # The fileclient caches files to the master's cachedir, so we
+            # must use _caller_cachedir as the Jinja search path when present.
+            effective_cachedir = opts.get("_caller_cachedir", opts["cachedir"])
+            self.searchpath = [os.path.join(effective_cachedir, "files", saltenv)]
         log.debug("Jinja search path: %s", self.searchpath)
         self.cached = []
         self._file_client = _file_client
@@ -127,7 +132,7 @@ class SaltCacheLoader(BaseLoader):
         the importing file.
 
         """
-        # FIXME: somewhere do seprataor replacement: '\\' => '/'
+        # FIXME: somewhere do separator replacement: '\\' => '/'
         _template = template
         if template.split("/", 1)[0] in ("..", "."):
             is_relative = True
@@ -136,7 +141,6 @@ class SaltCacheLoader(BaseLoader):
         # checks for relative '..' paths that step-out of file_roots
         if is_relative:
             # Starts with a relative path indicator
-
             if not environment or "tpldir" not in environment.globals:
                 log.warning(
                     'Relative path "%s" cannot be resolved without an environment',
@@ -220,6 +224,37 @@ class SaltCacheLoader(BaseLoader):
         self.destroy()
 
 
+def _yaml_safe_repr(value):
+    """
+    Return a YAML-safe repr for a string value.
+
+    Python's ``repr()`` of a string containing a newline produces ``'foo\\nbar'``
+    where ``\\n`` is the two-character backslash-n escape sequence. When such a
+    repr is embedded into a YAML state file via Jinja interpolation (e.g.
+    ``{{ some_dict }}``), the YAML parser sees the literal ``\\n`` and not an
+    actual newline, breaking multi-line scalars loaded via ``import_yaml``.
+
+    For strings containing characters that would be escaped by ``repr()`` in a
+    way YAML wouldn't round-trip (newlines, tabs, etc.), emit a YAML
+    double-quoted scalar instead. Otherwise fall back to ``repr()`` for
+    backward compatibility.
+
+    See https://github.com/saltstack/salt/issues/30690
+    """
+    if isinstance(value, str) and any(c in value for c in "\n\r\t"):
+        # safe_dump always emits a trailing newline; strip it. default_style='"'
+        # forces a double-quoted scalar which encodes newlines as the YAML \n
+        # escape sequence that the YAML parser will decode back to a real
+        # newline.
+        return (
+            salt.utils.yaml.safe_dump(value, default_style='"', default_flow_style=True)
+            .rstrip("\n")
+            .rstrip("...")
+            .rstrip("\n")
+        )
+    return repr(value)
+
+
 class PrintableDict(OrderedDict):
     """
     Ensures that dict str() and repr() are YAML friendly.
@@ -239,10 +274,9 @@ class PrintableDict(OrderedDict):
         output = []
         for key, value in self.items():
             if isinstance(value, str):
-                # keeps quotes around strings
-                # pylint: disable=repr-flag-used-in-string
-                output.append(f"{key!r}: {value!r}")
-                # pylint: enable=repr-flag-used-in-string
+                # keeps quotes around strings; use YAML-safe quoting for
+                # strings containing newlines (see issue #30690)
+                output.append(f"{key!r}: {_yaml_safe_repr(value)}")
             else:
                 # let default output
                 output.append(f"{key!r}: {value!s}")
@@ -252,10 +286,12 @@ class PrintableDict(OrderedDict):
         output = []
         for key, value in self.items():
             # Raw string formatter required here because this is a repr
-            # function.
-            # pylint: disable=repr-flag-used-in-string
-            output.append(f"{key!r}: {value!r}")
-            # pylint: enable=repr-flag-used-in-string
+            # function. Use YAML-safe quoting for strings containing newlines
+            # (see issue #30690).
+            if isinstance(value, str):
+                output.append(f"{key!r}: {_yaml_safe_repr(value)}")
+            else:
+                output.append(f"{key!r}: {value!r}")
         return "{" + ", ".join(output) + "}"
 
 
@@ -403,25 +439,6 @@ def indent(s, width=4, first=False, blank=False, indentfirst=None):
         rv = indention + rv
 
     return rv
-
-
-@jinja_filter("tojson")
-def tojson(val, indent=None, **options):
-    """
-    Implementation of tojson filter (only present in Jinja 2.9 and later).
-    Unlike the Jinja built-in filter, this allows arbitrary options to be
-    passed in to the underlying JSON library.
-    """
-    options.setdefault("ensure_ascii", True)
-    if indent is not None:
-        options["indent"] = indent
-    return (
-        salt.utils.json.dumps(val, **options)
-        .replace("<", "\\u003c")
-        .replace(">", "\\u003e")
-        .replace("&", "\\u0026")
-        .replace("'", "\\u0027")
-    )
 
 
 @jinja_filter("quote")
@@ -739,6 +756,74 @@ def show_full_context(ctx):
     )
 
 
+def __get_strict_undefined(value, ids):
+    if id(value) in ids:
+        return []
+    ids.add(id(value))
+    undefined = []
+    if isinstance(value, jinja2.StrictUndefined):
+        undefined.append(value)
+    elif isinstance(value, Mapping):
+        for key, item in value.items():
+            # StrictUndefined cant be a key in dict, but still check for other mapping types
+            undefined.extend(__get_strict_undefined(key, ids))
+            undefined.extend(__get_strict_undefined(item, ids))
+    elif isinstance(value, Sequence) and not isinstance(value, str):
+        for item in value:
+            undefined.extend(__get_strict_undefined(item, ids))
+    return undefined
+
+
+def _get_strict_undefined(value):
+    return tuple(__get_strict_undefined(value, set()))
+
+
+def _join_strict_undefined(undefined):
+    return jinja2.StrictUndefined("\n".join(u._undefined_message for u in undefined))
+
+
+def _handle_strict_undefined(function):
+    @wraps(function)
+    def __handle_strict_undefined(value, *args, **kwargs):
+        undefined = _get_strict_undefined(value)
+        if undefined:
+            return _join_strict_undefined(undefined)
+        return function(value, *args, **kwargs)
+
+    return __handle_strict_undefined
+
+
+def _handle_method_strict_undefined(function):
+    @wraps(function)
+    def __handle_method_strict_undefined(self, value, *args, **kwargs):
+        undefined = _get_strict_undefined(value)
+        if undefined:
+            return _join_strict_undefined(undefined)
+        return function(self, value, *args, **kwargs)
+
+    return __handle_method_strict_undefined
+
+
+@jinja_filter("tojson")
+@_handle_strict_undefined
+def tojson(val, indent=None, **options):
+    """
+    Implementation of tojson filter (only present in Jinja 2.9 and later).
+    Unlike the Jinja built-in filter, this allows arbitrary options to be
+    passed in to the underlying JSON library.
+    """
+    options.setdefault("ensure_ascii", True)
+    if indent is not None:
+        options["indent"] = indent
+    return (
+        salt.utils.json.dumps(val, **options)
+        .replace("<", "\\u003c")
+        .replace(">", "\\u003e")
+        .replace("&", "\\u0026")
+        .replace("'", "\\u0027")
+    )
+
+
 class SerializerExtension(Extension):
     '''
     Yaml and Json manipulation.
@@ -961,13 +1046,15 @@ class SerializerExtension(Extension):
                 "load_json": self.load_json,
                 "load_text": self.load_text,
                 "dict_to_sls_yaml_params": self.dict_to_sls_yaml_params,
-                "combinations": itertools.combinations,
-                "combinations_with_replacement": itertools.combinations_with_replacement,
-                "compress": itertools.compress,
-                "permutations": itertools.permutations,
-                "product": itertools.product,
-                "zip": zip,
-                "zip_longest": itertools.zip_longest,
+                "combinations": _handle_strict_undefined(itertools.combinations),
+                "combinations_with_replacement": _handle_strict_undefined(
+                    itertools.combinations_with_replacement
+                ),
+                "compress": _handle_strict_undefined(itertools.compress),
+                "permutations": _handle_strict_undefined(itertools.permutations),
+                "product": _handle_strict_undefined(itertools.product),
+                "zip": _handle_strict_undefined(zip),
+                "zip_longest": _handle_strict_undefined(itertools.zip_longest),
             }
         )
 
@@ -998,6 +1085,7 @@ class SerializerExtension(Extension):
 
         return explore(data)
 
+    @_handle_method_strict_undefined
     def format_json(self, value, sort_keys=True, indent=None):
         json_txt = salt.utils.json.dumps(
             value, sort_keys=sort_keys, indent=indent
@@ -1007,6 +1095,7 @@ class SerializerExtension(Extension):
         except UnicodeDecodeError:
             return Markup(salt.utils.stringutils.to_unicode(json_txt))
 
+    @_handle_method_strict_undefined
     def format_yaml(self, value, flow_style=True):
         yaml_txt = salt.utils.yaml.safe_dump(
             value, default_flow_style=flow_style
@@ -1018,6 +1107,7 @@ class SerializerExtension(Extension):
         except UnicodeDecodeError:
             return Markup(salt.utils.stringutils.to_unicode(yaml_txt))
 
+    @_handle_method_strict_undefined
     def format_xml(self, value):
         """Render a formatted multi-line XML string from a complex Python
         data structure. Supports tag attributes and nested dicts/lists.
@@ -1074,9 +1164,11 @@ class SerializerExtension(Extension):
             ).toprettyxml(indent=" ")
         )
 
+    @_handle_method_strict_undefined
     def format_python(self, value):
         return Markup(pprint.pformat(value).strip())
 
+    @_handle_method_strict_undefined
     def load_yaml(self, value):
         if isinstance(value, TemplateModule):
             value = str(value)
@@ -1102,6 +1194,7 @@ class SerializerExtension(Extension):
         except AttributeError:
             raise TemplateRuntimeError(f"Unable to load yaml from {value}")
 
+    @_handle_method_strict_undefined
     def load_json(self, value):
         if isinstance(value, TemplateModule):
             value = str(value)
@@ -1110,6 +1203,7 @@ class SerializerExtension(Extension):
         except (ValueError, TypeError, AttributeError):
             raise TemplateRuntimeError(f"Unable to load json from {value}")
 
+    @_handle_method_strict_undefined
     def load_text(self, value):
         if isinstance(value, TemplateModule):
             value = str(value)
@@ -1236,6 +1330,7 @@ class SerializerExtension(Extension):
             parser, import_node.template, f"import_{converter}", body, lineno
         )
 
+    @_handle_method_strict_undefined
     def dict_to_sls_yaml_params(self, value, flow_style=False):
         """
         .. versionadded:: 3005

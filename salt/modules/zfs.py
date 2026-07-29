@@ -14,13 +14,13 @@ Module for running ZFS command
 """
 
 import logging
+from collections import OrderedDict
 
 import salt.modules.cmdmod
 import salt.utils.args
 import salt.utils.path
 import salt.utils.platform
 import salt.utils.versions
-from salt.utils.odict import OrderedDict
 
 __virtualname__ = "zfs"
 log = logging.getLogger(__name__)
@@ -1249,6 +1249,3 @@ def get(*dataset, **kwargs):
             del ds_data["property"]
 
     return ret
-
-
-# vim: tabstop=4 expandtab shiftwidth=4 softtabstop=4

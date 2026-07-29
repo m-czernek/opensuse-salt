@@ -1,3 +1,0 @@
-jobs-active:
-  - run:jobs.active:
-      info: List of all actively running jobs

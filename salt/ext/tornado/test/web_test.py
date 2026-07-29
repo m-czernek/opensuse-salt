@@ -21,7 +21,6 @@ import copy
 import datetime
 import email.utils
 import gzip
-import http
 from io import BytesIO
 import itertools
 import logging
@@ -29,12 +28,17 @@ import os
 import re
 import socket
 
-import salt.utils.timeutil
-
 if PY3:
     import urllib.parse as urllib_parse  # py3
 else:
     import urllib as urllib_parse  # py2
+
+if PY3:
+    import http.cookies as _stdlib_cookie
+else:
+    import Cookie as _stdlib_cookie
+
+CookieError = _stdlib_cookie.CookieError
 
 wsgi_safe_tests = []
 
@@ -209,7 +213,6 @@ class CookieTest(WebTestCase):
                                 path=u"/foo")
 
         class SetCookieSpecialCharHandler(RequestHandler):
-            # "Special" characters are allowed in cookie values, but trigger special quoting.
             def get(self):
                 self.set_cookie("equals", "a=b")
                 self.set_cookie("semicolon", "a;b")
@@ -217,15 +220,16 @@ class CookieTest(WebTestCase):
 
         class SetCookieForbiddenCharHandler(RequestHandler):
             def get(self):
-                # Control characters and semicolons raise errors in cookie names and attributes
-                # (but not values, which are tested in SetCookieSpecialCharHandler)
+                # Special characters are allowed in cookie values (see
+                # SetCookieSpecialCharHandler); this tests names/attributes.
                 for char in list(map(chr, range(0x20))) + [chr(0x7F), ";"]:
                     try:
                         self.set_cookie("foo" + char, "bar")
                         self.write(
-                            "Didn't get expected exception for char %r in name\n" % char
+                            "Didn't get expected exception for char %r in name\n"
+                            % (char,)
                         )
-                    except http.cookies.CookieError as e:
+                    except CookieError as e:
                         if "Invalid cookie attribute name" not in str(e):
                             self.write(
                                 "unexpected exception for char %r in name: %s\n"
@@ -236,9 +240,9 @@ class CookieTest(WebTestCase):
                         self.set_cookie("foo", "bar", domain="example" + char + ".com")
                         self.write(
                             "Didn't get expected exception for char %r in domain\n"
-                            % char
+                            % (char,)
                         )
-                    except http.cookies.CookieError as e:
+                    except CookieError as e:
                         if "Invalid cookie attribute domain" not in str(e):
                             self.write(
                                 "unexpected exception for char %r in domain: %s\n"
@@ -248,9 +252,10 @@ class CookieTest(WebTestCase):
                     try:
                         self.set_cookie("foo", "bar", path="/" + char)
                         self.write(
-                            "Didn't get expected exception for char %r in path\n" % char
+                            "Didn't get expected exception for char %r in path\n"
+                            % (char,)
                         )
-                    except http.cookies.CookieError as e:
+                    except CookieError as e:
                         if "Invalid cookie attribute path" not in str(e):
                             self.write(
                                 "unexpected exception for char %r in path: %s\n"
@@ -261,9 +266,9 @@ class CookieTest(WebTestCase):
                         self.set_cookie("foo", "bar", samesite="a" + char)
                         self.write(
                             "Didn't get expected exception for char %r in samesite\n"
-                            % char
+                            % (char,)
                         )
-                    except http.cookies.CookieError as e:
+                    except CookieError as e:
                         if "Invalid cookie attribute samesite" not in str(e):
                             self.write(
                                 "unexpected exception for char %r in samesite: %s\n"
@@ -374,7 +379,7 @@ class CookieTest(WebTestCase):
         match = re.match("foo=bar; expires=(?P<expires>.+); Path=/", header)
         self.assertIsNotNone(match)
 
-        expires = salt.utils.timeutil.utcnow() + datetime.timedelta(days=10)
+        expires = datetime.datetime.utcnow() + datetime.timedelta(days=10)
         header_expires = datetime.datetime(
             *email.utils.parsedate(match.groupdict()["expires"])[:6])
         self.assertTrue(abs(timedelta_to_seconds(expires - header_expires)) < 10)
@@ -868,7 +873,6 @@ js_embed()
         response = self.fetch("/header_injection")
         self.assertEqual(response.body, b"ok")
 
-    @unittest.skip("Test broken after CVE-2025-47287.path")
     def test_get_argument(self):
         response = self.fetch("/get_argument?foo=bar")
         self.assertEqual(response.body, b"bar")
@@ -1572,7 +1576,7 @@ class DateHeaderTest(SimpleHandlerTestCase):
         response = self.fetch('/')
         header_date = datetime.datetime(
             *email.utils.parsedate(response.headers['Date'])[:6])
-        self.assertTrue(header_date - salt.utils.timeutil.utcnow() <
+        self.assertTrue(header_date - datetime.datetime.utcnow() <
                         datetime.timedelta(seconds=2))
 
 

@@ -24,7 +24,7 @@ import salt.utils.stringutils
 
 # metadata server information
 IP = "169.254.169.254"
-HOST = "http://{}/".format(IP)
+HOST = f"http://{IP}/"
 
 
 def __virtual__():
@@ -49,14 +49,22 @@ def _search(prefix="latest/"):
     if "body" not in linedata:
         return ret
     body = salt.utils.stringutils.to_unicode(linedata["body"])
-    if (
-        linedata["headers"].get("Content-Type", "text/plain")
-        == "application/octet-stream"
-    ):
+    # Since 3006.3, salt.utils.http.query (tornado backend) returns ``body``
+    # on HTTPError but does not populate ``headers``. Treat a missing
+    # ``headers`` key as "no Content-Type information" rather than letting
+    # KeyError propagate and break the whole grain load (#65184).
+    response_headers = linedata.get("headers") or {}
+    if response_headers.get("Content-Type", "text/plain") == "application/octet-stream":
         return body
     for line in body.split("\n"):
         if line.endswith("/"):
             ret[line[:-1]] = _search(prefix=os.path.join(prefix, line))
+        elif line == "user-data":
+            # user-data is returned verbatim; do not fall through to the
+            # "=" splitter, which would corrupt user-data containing "="
+            # characters (e.g. cloud-init #cloud-config payloads).
+            retdata = http.query(os.path.join(HOST, prefix, line)).get("body", None)
+            ret[line] = retdata
         elif prefix == "latest/":
             # (gtmanfred) The first level should have a forward slash since
             # they have stuff underneath. This will not be doubled up though,

@@ -54,12 +54,10 @@ ESXCLI
 Currently, about a third of the functions used in the vSphere Execution Module require
 the ESXCLI package be installed on the machine running the Proxy Minion process.
 
-The ESXCLI package is also referred to as the VMware vSphere CLI, or vCLI. VMware
-provides vCLI package installation instructions for `vSphere 5.5`_ and
-`vSphere 6.0`_.
+The ESXCLI package is also referred to as the VMware vSphere CLI, or vCLI. See
+the `VMware vSphere documentation`_ for vCLI package installation instructions.
 
-.. _vSphere 5.5: http://pubs.vmware.com/vsphere-55/index.jsp#com.vmware.vcli.getstart.doc/cli_install.4.2.html
-.. _vSphere 6.0: http://pubs.vmware.com/vsphere-60/index.jsp#com.vmware.vcli.getstart.doc/cli_install.4.2.html
+.. _VMware vSphere documentation: https://techdocs.broadcom.com/us/en/vmware-cis/vcf/vcf-9-0-and-later/9-1/vsphere-supervisor-installation-and-configuration.html
 
 Once all of the required dependencies are in place and the vCLI package is
 installed, you can check to see if you can connect to your ESXi host or vCenter
@@ -226,7 +224,7 @@ def coredump_configured(name, enabled, dump_ip, host_vnic="vmk0", dump_port=6500
     current_config = __salt__[esxi_cmd]("get_coredump_network_config").get(host)
     error = current_config.get("Error")
     if error:
-        ret["comment"] = "Error: {}".format(error)
+        ret["comment"] = f"Error: {error}"
         return ret
 
     current_config = current_config.get("Coredump Config")
@@ -242,7 +240,7 @@ def coredump_configured(name, enabled, dump_ip, host_vnic="vmk0", dump_port=6500
             ).get(host)
             error = response.get("Error")
             if error:
-                ret["comment"] = "Error: {}".format(error)
+                ret["comment"] = f"Error: {error}"
                 return ret
 
             # Allow users to disable core dump, but then return since
@@ -295,7 +293,7 @@ def coredump_configured(name, enabled, dump_ip, host_vnic="vmk0", dump_port=6500
             msg = response.get("stderr")
             if not msg:
                 msg = response.get("stdout")
-            ret["comment"] = "Error: {}".format(msg)
+            ret["comment"] = f"Error: {msg}"
             return ret
 
     ret["result"] = True
@@ -354,7 +352,7 @@ def password_present(name, password):
             __salt__[esxi_cmd]("update_host_password", new_password=password)
         except CommandExecutionError as err:
             ret["result"] = False
-            ret["comment"] = "Error: {}".format(err)
+            ret["comment"] = f"Error: {err}"
             return ret
 
     return ret
@@ -427,7 +425,7 @@ def ntp_configured(
     ntp_running = __salt__[esxi_cmd]("get_service_running", service_name=ntpd).get(host)
     error = ntp_running.get("Error")
     if error:
-        ret["comment"] = "Error: {}".format(error)
+        ret["comment"] = f"Error: {error}"
         return ret
     ntp_running = ntp_running.get(ntpd)
 
@@ -440,7 +438,7 @@ def ntp_configured(
             ).get(host)
             error = response.get("Error")
             if error:
-                ret["comment"] = "Error: {}".format(error)
+                ret["comment"] = f"Error: {error}"
                 return ret
         # Set changes dictionary for ntp_servers
         ret["changes"].update({"ntp_servers": {"old": ntp_config, "new": ntp_servers}})
@@ -456,7 +454,7 @@ def ntp_configured(
                 )
                 error = response.get("Error")
                 if error:
-                    ret["comment"] = "Error: {}".format(error)
+                    ret["comment"] = f"Error: {error}"
                     return ret
             # Stop ntpd if service_running=False
             else:
@@ -465,7 +463,7 @@ def ntp_configured(
                 )
                 error = response.get("Error")
                 if error:
-                    ret["comment"] = "Error: {}".format(error)
+                    ret["comment"] = f"Error: {error}"
                     return ret
         ret["changes"].update(
             {"service_running": {"old": ntp_running, "new": service_running}}
@@ -478,7 +476,7 @@ def ntp_configured(
         ).get(host)
         error = current_service_policy.get("Error")
         if error:
-            ret["comment"] = "Error: {}".format(error)
+            ret["comment"] = f"Error: {error}"
             return ret
         current_service_policy = current_service_policy.get(ntpd)
 
@@ -492,7 +490,7 @@ def ntp_configured(
                 ).get(host)
                 error = response.get("Error")
                 if error:
-                    ret["comment"] = "Error: {}".format(error)
+                    ret["comment"] = f"Error: {error}"
                     return ret
             ret["changes"].update(
                 {
@@ -510,7 +508,7 @@ def ntp_configured(
             response = __salt__[esxi_cmd]("update_host_datetime").get(host)
             error = response.get("Error")
             if error:
-                ret["comment"] = "Error: {}".format(error)
+                ret["comment"] = f"Error: {error}"
                 return ret
         ret["changes"].update(
             {"update_datetime": {"old": "", "new": "Host datetime was updated."}}
@@ -525,7 +523,7 @@ def ntp_configured(
             )
             error = response.get("Error")
             if error:
-                ret["comment"] = "Error: {}".format(error)
+                ret["comment"] = f"Error: {error}"
                 return ret
         ret["changes"].update(
             {"service_restart": {"old": "", "new": "NTP Daemon Restarted."}}
@@ -587,14 +585,14 @@ def vmotion_configured(name, enabled, device="vmk0"):
                 response = __salt__[esxi_cmd]("vmotion_enable", device=device).get(host)
                 error = response.get("Error")
                 if error:
-                    ret["comment"] = "Error: {}".format(error)
+                    ret["comment"] = f"Error: {error}"
                     return ret
             # Disable VMotion if enabled=False
             else:
                 response = __salt__[esxi_cmd]("vmotion_disable").get(host)
                 error = response.get("Error")
                 if error:
-                    ret["comment"] = "Error: {}".format(error)
+                    ret["comment"] = f"Error: {error}"
                     return ret
         ret["changes"].update(
             {"enabled": {"old": current_vmotion_enabled, "new": enabled}}
@@ -647,7 +645,7 @@ def vsan_configured(name, enabled, add_disks_to_vsan=False):
     current_vsan_enabled = __salt__[esxi_cmd]("get_vsan_enabled").get(host)
     error = current_vsan_enabled.get("Error")
     if error:
-        ret["comment"] = "Error: {}".format(error)
+        ret["comment"] = f"Error: {error}"
         return ret
     current_vsan_enabled = current_vsan_enabled.get("VSAN Enabled")
 
@@ -660,14 +658,14 @@ def vsan_configured(name, enabled, add_disks_to_vsan=False):
                 response = __salt__[esxi_cmd]("vsan_enable").get(host)
                 error = response.get("Error")
                 if error:
-                    ret["comment"] = "Error: {}".format(error)
+                    ret["comment"] = f"Error: {error}"
                     return ret
             # Disable VSAN if enabled=False
             else:
                 response = __salt__[esxi_cmd]("vsan_disable").get(host)
                 error = response.get("Error")
                 if error:
-                    ret["comment"] = "Error: {}".format(error)
+                    ret["comment"] = f"Error: {error}"
                     return ret
         ret["changes"].update(
             {"enabled": {"old": current_vsan_enabled, "new": enabled}}
@@ -678,7 +676,7 @@ def vsan_configured(name, enabled, add_disks_to_vsan=False):
         current_eligible_disks = __salt__[esxi_cmd]("get_vsan_eligible_disks").get(host)
         error = current_eligible_disks.get("Error")
         if error:
-            ret["comment"] = "Error: {}".format(error)
+            ret["comment"] = f"Error: {error}"
             return ret
 
         disks = current_eligible_disks.get("Eligible")
@@ -688,7 +686,7 @@ def vsan_configured(name, enabled, add_disks_to_vsan=False):
                 response = __salt__[esxi_cmd]("vsan_add_disks").get(host)
                 error = response.get("Error")
                 if error:
-                    ret["comment"] = "Error: {}".format(error)
+                    ret["comment"] = f"Error: {error}"
                     return ret
 
             ret["changes"].update({"add_disks_to_vsan": {"old": "", "new": disks}})
@@ -779,7 +777,7 @@ def ssh_configured(
     ssh_running = __salt__[esxi_cmd]("get_service_running", service_name=ssh).get(host)
     error = ssh_running.get("Error")
     if error:
-        ret["comment"] = "Error: {}".format(error)
+        ret["comment"] = f"Error: {error}"
         return ret
     ssh_running = ssh_running.get(ssh)
 
@@ -792,14 +790,14 @@ def ssh_configured(
                 enable = __salt__[esxi_cmd]("service_start", service_name=ssh).get(host)
                 error = enable.get("Error")
                 if error:
-                    ret["comment"] = "Error: {}".format(error)
+                    ret["comment"] = f"Error: {error}"
                     return ret
             # Disable SSH if service_running=False
             else:
                 disable = __salt__[esxi_cmd]("service_stop", service_name=ssh).get(host)
                 error = disable.get("Error")
                 if error:
-                    ret["comment"] = "Error: {}".format(error)
+                    ret["comment"] = f"Error: {error}"
                     return ret
 
         ret["changes"].update(
@@ -815,7 +813,7 @@ def ssh_configured(
         )
         error = current_ssh_key.get("Error")
         if error:
-            ret["comment"] = "Error: {}".format(error)
+            ret["comment"] = f"Error: {error}"
             return ret
         current_ssh_key = current_ssh_key.get("key")
         if current_ssh_key:
@@ -854,7 +852,7 @@ def ssh_configured(
             )
             error = response.get("Error")
             if error:
-                ret["comment"] = "Error: {}".format(error)
+                ret["comment"] = f"Error: {error}"
                 return ret
         ret["changes"].update(
             {
@@ -872,7 +870,7 @@ def ssh_configured(
         ).get(host)
         error = current_service_policy.get("Error")
         if error:
-            ret["comment"] = "Error: {}".format(error)
+            ret["comment"] = f"Error: {error}"
             return ret
         current_service_policy = current_service_policy.get(ssh)
 
@@ -886,7 +884,7 @@ def ssh_configured(
                 ).get(host)
                 error = response.get("Error")
                 if error:
-                    ret["comment"] = "Error: {}".format(error)
+                    ret["comment"] = f"Error: {error}"
                     return ret
             ret["changes"].update(
                 {
@@ -904,7 +902,7 @@ def ssh_configured(
             response = __salt__[esxi_cmd]("service_restart", service_name=ssh).get(host)
             error = response.get("Error")
             if error:
-                ret["comment"] = "Error: {}".format(error)
+                ret["comment"] = f"Error: {error}"
                 return ret
         ret["changes"].update(
             {"service_restart": {"old": "", "new": "SSH service restarted."}}
@@ -1008,7 +1006,7 @@ def syslog_configured(
                             "There was an error resetting a syslog config '{}'."
                             "Please check debug logs.".format(val)
                         )
-                    ret["comment"] = "Error: {}".format(msg)
+                    ret["comment"] = f"Error: {msg}"
                     return ret
 
         ret["changes"].update(
@@ -1018,7 +1016,7 @@ def syslog_configured(
     current_firewall = __salt__[esxi_cmd]("get_firewall_status").get(host)
     error = current_firewall.get("Error")
     if error:
-        ret["comment"] = "Error: {}".format(error)
+        ret["comment"] = f"Error: {error}"
         return ret
 
     current_firewall = current_firewall.get("rulesets").get("syslog")
@@ -1033,7 +1031,7 @@ def syslog_configured(
             if enabled.get("retcode") != 0:
                 err = enabled.get("stderr")
                 out = enabled.get("stdout")
-                ret["comment"] = "Error: {}".format(err if err else out)
+                ret["comment"] = f"Error: {err if err else out}"
                 return ret
 
         ret["changes"].update({"firewall": {"old": current_firewall, "new": firewall}})
@@ -1045,7 +1043,7 @@ def syslog_configured(
         try:
             lookup_key = _lookup_syslog_config(key)
         except KeyError:
-            ret["comment"] = "'{}' is not a valid config variable.".format(key)
+            ret["comment"] = f"'{key}' is not a valid config variable."
             return ret
 
         current_val = current_syslog_config[lookup_key]
@@ -1158,7 +1156,7 @@ def diskgroups_configured(name, diskgroups, erase_disks=False):
         host_disks = __salt__["vsphere.list_disks"](service_instance=si)
         if not host_disks:
             raise VMwareObjectRetrievalError(
-                "No disks retrieved from host '{}'".format(hostname)
+                f"No disks retrieved from host '{hostname}'"
             )
         scsi_addr_to_disk_map = {d["scsi_address"]: d for d in host_disks}
         log.trace("scsi_addr_to_disk_map = %s", scsi_addr_to_disk_map)
@@ -1199,14 +1197,12 @@ def diskgroups_configured(name, diskgroups, erase_disks=False):
                 bad_scsi_addrs.append(scsi_addr)
                 continue
             capacity_disk_ids.append(scsi_addr_to_disk_map[scsi_addr]["id"])
-            capacity_disk_displays.append(
-                "{} (id:{})".format(scsi_addr, capacity_disk_ids[-1])
-            )
+            capacity_disk_displays.append(f"{scsi_addr} (id:{capacity_disk_ids[-1]})")
         if bad_scsi_addrs:
             comments.append(
                 "Error in diskgroup #{}: capacity disks with scsi addresses {} "
                 "were not found.".format(
-                    idx, ", ".join(["'{}'".format(a) for a in bad_scsi_addrs])
+                    idx, ", ".join([f"'{a}'" for a in bad_scsi_addrs])
                 )
             )
             log.error(comments[-1])
@@ -1227,9 +1223,7 @@ def diskgroups_configured(name, diskgroups, erase_disks=False):
                             name,
                             idx,
                             cache_disk_display,
-                            ", ".join(
-                                ["'{}'".format(a) for a in capacity_disk_displays]
-                            ),
+                            ", ".join([f"'{a}'" for a in capacity_disk_displays]),
                         )
                     )
                 else:
@@ -1244,9 +1238,7 @@ def diskgroups_configured(name, diskgroups, erase_disks=False):
                         "{}".format(
                             idx,
                             cache_disk_display,
-                            ", ".join(
-                                ["'{}'".format(a) for a in capacity_disk_displays]
-                            ),
+                            ", ".join([f"'{a}'" for a in capacity_disk_displays]),
                         )
                     )
                     log.info(comments[-1])
@@ -1259,7 +1251,7 @@ def diskgroups_configured(name, diskgroups, erase_disks=False):
                         name,
                         idx,
                         cache_disk_display,
-                        ", ".join(["'{}'".format(a) for a in capacity_disk_displays]),
+                        ", ".join([f"'{a}'" for a in capacity_disk_displays]),
                     )
                 )
                 log.info(comments[-1])
@@ -1273,12 +1265,12 @@ def diskgroups_configured(name, diskgroups, erase_disks=False):
                     service_instance=si,
                 )
             except VMwareSaltError as err:
-                comments.append("Error creating disk group #{}: {}.".format(idx, err))
+                comments.append(f"Error creating disk group #{idx}: {err}.")
                 log.error(comments[-1])
                 errors = True
                 continue
 
-            comments.append("Created disk group #'{}'.".format(idx))
+            comments.append(f"Created disk group #'{idx}'.")
             log.info(comments[-1])
             diskgroup_changes[str(idx)] = {
                 "new": {"cache": cache_disk_display, "capacity": capacity_disk_displays}
@@ -1311,9 +1303,7 @@ def diskgroups_configured(name, diskgroups, erase_disks=False):
                     d["scsi_address"] for d in host_disks if d["id"] == disk_id
                 ][0]
                 added_capacity_disk_ids.append(disk_id)
-                added_capacity_disk_displays.append(
-                    "{} (id:{})".format(disk_scsi_addr, disk_id)
-                )
+                added_capacity_disk_displays.append(f"{disk_scsi_addr} (id:{disk_id})")
         for disk_id in existing_diskgroup["capacity_disks"]:
             if disk_id not in capacity_disk_ids:
                 disk_scsi_addr = [
@@ -1321,7 +1311,7 @@ def diskgroups_configured(name, diskgroups, erase_disks=False):
                 ][0]
                 removed_capacity_disk_ids.append(disk_id)
                 removed_capacity_disk_displays.append(
-                    "{} (id:{})".format(disk_scsi_addr, disk_id)
+                    f"{disk_scsi_addr} (id:{disk_id})"
                 )
 
         log.debug(
@@ -1339,9 +1329,7 @@ def diskgroups_configured(name, diskgroups, erase_disks=False):
                 "Error removing capacity disk(s) {} from disk group #{}; "
                 "operation is not supported."
                 "".format(
-                    ", ".join(
-                        ["'{}'".format(id) for id in removed_capacity_disk_displays]
-                    ),
+                    ", ".join([f"'{id}'" for id in removed_capacity_disk_displays]),
                     idx,
                 )
             )
@@ -1354,7 +1342,7 @@ def diskgroups_configured(name, diskgroups, erase_disks=False):
 
             # Building a string representation of the capacity disks
             # that need to be added
-            s = ", ".join(["'{}'".format(id) for id in added_capacity_disk_displays])
+            s = ", ".join([f"'{id}'" for id in added_capacity_disk_displays])
             if __opts__["test"]:
                 comments.append(
                     "State {} will add capacity disk(s) {} to disk group #{}.".format(
@@ -1381,7 +1369,7 @@ def diskgroups_configured(name, diskgroups, erase_disks=False):
                 errors = True
                 continue
 
-            com = "Added capacity disk(s) {} to disk group #{}".format(s, idx)
+            com = f"Added capacity disk(s) {s} to disk group #{idx}"
             log.info(com)
             comments.append(com)
             diskgroup_changes[str(idx)] = {
@@ -1398,7 +1386,7 @@ def diskgroups_configured(name, diskgroups, erase_disks=False):
             continue
 
         # No capacity needs to be added
-        s = "Disk group #{} is correctly configured. Nothing to be done.".format(idx)
+        s = f"Disk group #{idx} is correctly configured. Nothing to be done."
         log.info(s)
         comments.append(s)
     __salt__["vsphere.disconnect"](si)
@@ -1407,11 +1395,11 @@ def diskgroups_configured(name, diskgroups, erase_disks=False):
     result = (
         True
         if not (changes or errors)
-        else None  # no changes/errors
-        if __opts__["test"]
-        else False  # running in test mode
-        if errors
-        else True
+        else (
+            None  # no changes/errors
+            if __opts__["test"]
+            else False if errors else True  # running in test mode
+        )
     )  # found errors; defaults to True
     ret.update(
         {"result": result, "comment": "\n".join(comments), "changes": diskgroup_changes}
@@ -1662,7 +1650,7 @@ def host_cache_configured(
                         backing_disk["id"],
                         ", ".join(
                             [
-                                "'{}'".format(disk)
+                                f"'{disk}'"
                                 for disk in existing_datastores[0]["backing_disk_ids"]
                             ]
                         ),
@@ -1710,8 +1698,8 @@ def host_cache_configured(
                 changes.update(
                     {
                         "swap_size": {
-                            "old": "{}GiB".format(existing_swap_size_MiB / 1024),
-                            "new": "{}GiB".format(swap_size_MiB / 1024),
+                            "old": f"{existing_swap_size_MiB / 1024}GiB",
+                            "new": f"{swap_size_MiB / 1024}GiB",
                         }
                     }
                 )
@@ -1746,7 +1734,7 @@ def host_cache_configured(
                     swap_size_MiB=swap_size_MiB,
                     service_instance=si,
                 )
-                comments.append("Host cache configured on host '{}'.".format(hostname))
+                comments.append(f"Host cache configured on host '{hostname}'.")
         else:
             comments.append(
                 "Host cache on host '{}' is already correctly "
@@ -1766,7 +1754,7 @@ def host_cache_configured(
         ret.update(
             {
                 "result": False if not __opts__["test"] else None,
-                "comment": "{}.".format(err),
+                "comment": f"{err}.",
             }
         )
         return ret

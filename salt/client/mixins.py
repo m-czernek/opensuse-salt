@@ -14,6 +14,7 @@ from collections.abc import Mapping, MutableMapping
 import salt._logging
 import salt.channel.client
 import salt.exceptions
+import salt.ext.tornado.stack_context
 import salt.minion
 import salt.output
 import salt.utils.args
@@ -28,12 +29,6 @@ import salt.utils.process
 import salt.utils.state
 import salt.utils.user
 import salt.utils.versions
-
-from salt import USE_VENDORED_TORNADO
-if USE_VENDORED_TORNADO:
-    from salt.ext.tornado.stack_context import StackContext
-else:
-    from contextlib import nullcontext as StackContext
 
 log = logging.getLogger(__name__)
 
@@ -278,7 +273,7 @@ class SyncClientMixin(ClientStateMixin):
             return True
 
         try:
-            return self.opts["{}_returns".format(class_name)]
+            return self.opts[f"{class_name}_returns"]
         except KeyError:
             # No such option, assume this isn't one we care about gating and
             # just return True.
@@ -305,7 +300,7 @@ class SyncClientMixin(ClientStateMixin):
         tag = low.get("__tag__", salt.utils.event.tagify(jid, prefix=self.tag_prefix))
 
         data = {
-            "fun": "{}.{}".format(self.client, fun),
+            "fun": f"{self.client}.{fun}",
             "jid": jid,
             "user": low.get("__user__", "UNKNOWN"),
         }
@@ -384,19 +379,21 @@ class SyncClientMixin(ClientStateMixin):
                 data["fun_args"] = list(args) + ([kwargs] if kwargs else [])
                 func_globals["__jid_event__"].fire_event(data, "new")
 
-                with StackContext(self.functions.context_dict.clone):
+                # Initialize a context for executing the method.
+                with salt.ext.tornado.stack_context.StackContext(
+                    self.functions.context_dict.clone
+                ):
                     func = self.functions[fun]
                     try:
                         data["return"] = func(*args, **kwargs)
                     except TypeError as exc:
-                        data[
-                            "return"
-                        ] = "\nPassed invalid arguments: {}\n\nUsage:\n{}".format(
-                            exc, func.__doc__
+                        data["return"] = (
+                            "\nPassed invalid arguments: {}\n\nUsage:\n{}".format(
+                                exc, func.__doc__
+                            )
                         )
                     try:
                         data["success"] = self.context.get("retcode", 0) == 0
-
                     except AttributeError:
                         # Assume a True result if no context attribute
                         data["success"] = True
@@ -405,7 +402,6 @@ class SyncClientMixin(ClientStateMixin):
                         data["success"] = salt.utils.state.check_result(
                             data["return"]["data"]
                         )
-
             except (Exception, SystemExit) as ex:  # pylint: disable=broad-except
                 if isinstance(ex, salt.exceptions.NotImplemented):
                     data["return"] = str(ex)
@@ -416,6 +412,7 @@ class SyncClientMixin(ClientStateMixin):
                         traceback.format_exc(),
                     )
                 data["success"] = False
+                data["retcode"] = 1
 
             if self.store_job:
                 try:
@@ -516,7 +513,17 @@ class AsyncClientMixin(ClientStateMixin):
 
     @classmethod
     def _proc_function(
-        cls, *, instance, opts, fun, low, user, tag, jid, daemonize=True
+        cls,
+        *,
+        instance,
+        opts,
+        fun,
+        low,
+        user,
+        tag,
+        jid,
+        daemonize=True,
+        full_return=False,
     ):
         """
         Run this method in a multiprocess target to execute the function
@@ -541,7 +548,7 @@ class AsyncClientMixin(ClientStateMixin):
         low["__user__"] = user
         low["__tag__"] = tag
 
-        return instance.low(fun, low)
+        return instance.low(fun, low, full_return=full_return)
 
     def cmd_async(self, low):
         """

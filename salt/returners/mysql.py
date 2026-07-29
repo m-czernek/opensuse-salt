@@ -17,7 +17,6 @@ config. These are the defaults:
     mysql.pass: 'salt'
     mysql.db: 'salt'
     mysql.port: 3306
-    mysql.unix_socket: '/tmp/mysql.sock'
 
 SSL is optional. The defaults are set to None. If you do not want to use SSL,
 either exclude these options or set them to None.
@@ -43,7 +42,6 @@ optional. The following ssl options are simply for illustration purposes:
     alternative.mysql.ssl_ca: '/etc/pki/mysql/certs/localhost.pem'
     alternative.mysql.ssl_cert: '/etc/pki/mysql/certs/localhost.crt'
     alternative.mysql.ssl_key: '/etc/pki/mysql/certs/localhost.key'
-    alternative.mysql.unix_socket: '/tmp/mysql.sock'
 
 Should you wish the returner data to be cleaned out every so often, set
 `keep_jobs_seconds` to the number of hours for the jobs to live in the
@@ -150,10 +148,6 @@ import salt.utils.data
 import salt.utils.job
 import salt.utils.json
 
-# Let's not allow PyLint complain about string substitution
-# pylint: disable=W1321,E1321
-
-
 try:
     # Trying to import MySQLdb
     import MySQLdb
@@ -199,7 +193,6 @@ def _get_options(ret=None):
         "ssl_ca": None,
         "ssl_cert": None,
         "ssl_key": None,
-        "unix_socket": "/tmp/mysql.sock",
     }
 
     attrs = {
@@ -211,15 +204,33 @@ def _get_options(ret=None):
         "ssl_ca": "ssl_ca",
         "ssl_cert": "ssl_cert",
         "ssl_key": "ssl_key",
-        "unix_socket": "unix_socket",
     }
+
+    # Issue #32567: when ``__salt__`` has no ``config.option`` (e.g.
+    # salt-ssh, the scheduler), ``get_returner_options`` falls back to
+    # treating ``__opts__`` as the config and looks up bare attribute
+    # names in it. Top-level salt opts whose names collide with mysql
+    # attribute names -- notably ``user`` -- would mask the configured
+    # ``mysql.user``. Pass a scoped view of ``__opts__`` that only
+    # exposes mysql-prefixed keys so the lookup cannot collide.
+    scoped_opts = __opts__
+    if isinstance(__opts__, dict):
+        scoped_opts = {}
+        nested = __opts__.get(__virtualname__)
+        if isinstance(nested, dict):
+            for key, value in nested.items():
+                scoped_opts[f"{__virtualname__}.{key}"] = value
+        prefix = f"{__virtualname__}."
+        for key, value in __opts__.items():
+            if isinstance(key, str) and key.startswith(prefix):
+                scoped_opts[key] = value
 
     _options = salt.returners.get_returner_options(
         __virtualname__,
         ret,
         attrs,
         __salt__=__salt__,
-        __opts__=__opts__,
+        __opts__=scoped_opts,
         defaults=defaults,
     )
     # post processing
@@ -270,7 +281,6 @@ def _get_serv(ret=None, commit=False):
                 db=_options.get("db"),
                 port=_options.get("port"),
                 ssl=ssl_options,
-                unix_socket=_options.get("unix_socket"),
             )
 
             try:
@@ -279,7 +289,7 @@ def _get_serv(ret=None, commit=False):
                 pass
         except OperationalError as exc:
             raise salt.exceptions.SaltMasterError(
-                "MySQL returner could not connect to database: {exc}".format(exc=exc)
+                f"MySQL returner could not connect to database: {exc}"
             )
 
     cursor = conn.cursor()

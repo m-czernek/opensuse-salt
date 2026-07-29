@@ -1,6 +1,7 @@
 """
     Tests for salt.modules.boto3_route53
 """
+
 import random
 import string
 
@@ -24,6 +25,10 @@ except ImportError:
 # which was added in boto 2.8.0
 # https://github.com/boto/boto/commit/33ac26b416fbb48a60602542b4ce15dcc7029f12
 REQUIRED_BOTO3_VERSION = "1.2.1"
+
+pytestmark = [
+    pytest.mark.skip_on_fips_enabled_platform,
+]
 
 
 def __virtual__():
@@ -140,7 +145,7 @@ class Boto3Route53TestCase(TestCase, LoaderModuleMockMixin):
                     HostedZoneId="Z2P70J7EXAMPLE",
                     StartRecordName="blog.saltstack.furniture.",
                     StartRecordType="A",
-                    **CONN_PARAMETERS
+                    **CONN_PARAMETERS,
                 ),
                 [
                     {

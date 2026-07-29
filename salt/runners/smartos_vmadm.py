@@ -2,9 +2,10 @@
 Runner for SmartOS minions control vmadm
 """
 
+from collections import OrderedDict
+
 import salt.client
 from salt.exceptions import SaltClientError
-from salt.utils.odict import OrderedDict
 
 # Function aliases
 __func_alias__ = {"list_vms": "list"}
@@ -100,7 +101,7 @@ def _action(action="get", search=None, one=True, force=False):
         ## multiple allowed?
         if one and len(matched_vms) > 1:
             return {
-                "Error": "Matched {} vms, only one allowed!".format(len(matched_vms)),
+                "Error": f"Matched {len(matched_vms)} vms, only one allowed!",
                 "Matches": matched_vms,
             }
 
@@ -111,7 +112,7 @@ def _action(action="get", search=None, one=True, force=False):
                 vmadm_args = {"key": "uuid", "vm": vm}
                 try:
                     for vmadm_res in client.cmd_iter(
-                        vms[vm]["node"], "vmadm.{}".format(action), kwarg=vmadm_args
+                        vms[vm]["node"], f"vmadm.{action}", kwarg=vmadm_args
                     ):
                         if not vmadm_res:
                             continue
@@ -188,7 +189,7 @@ def nodes(verbose=False):
                 else:
                     ret.append(node)
         except SaltClientError as client_error:
-            return "{}".format(client_error)
+            return f"{client_error}"
 
         if not verbose:
             ret.sort()
@@ -256,7 +257,7 @@ def list_vms(search=None, verbose=False):
                     else:
                         ret.append(vm)
         except SaltClientError as client_error:
-            return "{}".format(client_error)
+            return f"{client_error}"
 
         if not verbose:
             ret = sorted(ret)
@@ -383,6 +384,3 @@ def is_running(search):
         salt-run vmadm.is_running search='alias=julia'
     """
     return _action("is_running", search, False)
-
-
-# vim: tabstop=4 expandtab shiftwidth=4 softtabstop=4

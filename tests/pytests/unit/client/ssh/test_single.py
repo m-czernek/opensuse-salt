@@ -1,3 +1,4 @@
+import importlib
 import logging
 import re
 from textwrap import dedent
@@ -5,6 +6,7 @@ from textwrap import dedent
 import pytest
 
 import salt.client.ssh.client
+import salt.client.ssh.shell as shell
 import salt.config
 import salt.roster
 import salt.utils.files
@@ -19,17 +21,26 @@ log = logging.getLogger(__name__)
 
 
 @pytest.fixture
-def opts(tmp_path):
-    return {
-        "argv": [
-            "ssh.set_auth_key",
-            "root",
-            "hobn+amNAXSBTiOXEqlBjGB...rsa root@master",
-        ],
-        "__role": "master",
-        "cachedir": str(tmp_path),
-        "extension_modules": str(tmp_path / "extmods"),
-    }
+def opts(master_opts):
+    master_opts["argv"] = [
+        "ssh.set_auth_key",
+        "root",
+        "hobn+amNAXSBTiOXEqlBjGB...rsa root@master",
+    ]
+    return master_opts
+
+
+@pytest.fixture()
+def mock_bin_paths():
+    with patch("salt.utils.path.which") as mock_which:
+        mock_which.side_effect = lambda x: {
+            "ssh-keygen": "ssh-keygen",
+            "ssh": "ssh",
+            "scp": "scp",
+        }.get(x, None)
+        importlib.reload(shell)
+        yield
+    importlib.reload(shell)
 
 
 @pytest.fixture
@@ -49,7 +60,186 @@ def target():
     }
 
 
-def test_single_opts(opts, target):
+def test_run_wfunc_does_not_overwrite_master_fsclient_cachedir(opts, target, tmp_path):
+    """
+    Regression test for #68458 (part 1 of 2).
+
+    ``Single.run_wfunc`` runs on the master and the master-side
+    ``FunctionWrapper`` carries a master ``FSClient``. The fileclient's
+    ``opts['cachedir']`` must not be reassigned to the per-minion
+    ``cachedir`` returned by ``test.opts_pkg`` (which is rooted under
+    the on-target ``thin_dir``); doing so makes the master cache state
+    fileserver artifacts under the minion's thin_dir path on the master
+    filesystem (e.g. ``/var/tmp/.root_XXXXX_salt/running_data/var/cache/salt``).
+    """
+    master_cachedir = str(tmp_path / "master_cache")
+    minion_thin_cachedir = "/var/tmp/.root_92f580_salt/running_data/var/cache/salt"
+
+    opts["cachedir"] = master_cachedir
+    opts["thin_dir"] = "/var/tmp/.root_92f580_salt"
+    opts["file_roots"] = {"base": [str(tmp_path / "srv")]}
+    opts["pillar_roots"] = {"base": [str(tmp_path / "pillar")]}
+    opts["ext_pillar"] = []
+    opts["extension_modules"] = str(tmp_path / "extmods")
+    opts["module_dirs"] = []
+    opts["_ssh_version"] = (0, 0, 0)
+    opts["master_tops"] = {}
+    opts["argv"] = ["test.ping"]
+
+    fsclient = MagicMock()
+    fsclient.opts = {"cachedir": master_cachedir}
+
+    single = ssh.Single(
+        opts,
+        opts["argv"],
+        "localhost",
+        mods={},
+        fsclient=fsclient,
+        thin=str(tmp_path / "thin.tgz"),
+        mine=False,
+        **target,
+    )
+    single.context = {"master_opts": opts}
+
+    # Simulated minion opts package returned by salt-thin: cachedir points
+    # at the on-target thin_dir-relative cache, not the master cache.
+    minion_opts_pkg = {
+        "cachedir": minion_thin_cachedir,
+        "grains": {},
+    }
+
+    pre_wrapper = MagicMock()
+    pre_wrapper.__getitem__ = MagicMock(
+        return_value=MagicMock(return_value=minion_opts_pkg)
+    )
+
+    seen = {}
+    wrapper = MagicMock()
+    wrapper.fsclient = fsclient
+
+    def _make_wrapper(*args, **kwargs):
+        if "pre_wrapper" not in seen:
+            seen["pre_wrapper"] = True
+            return pre_wrapper
+        return wrapper
+
+    pillar_mock = MagicMock()
+    pillar_mock.compile_pillar.return_value = {}
+
+    with patch(
+        "salt.client.ssh.wrapper.FunctionWrapper", side_effect=_make_wrapper
+    ), patch("salt.pillar.Pillar", return_value=pillar_mock), patch(
+        "salt.loader.ssh_wrapper",
+        return_value={"test.ping": MagicMock(return_value=True)},
+    ):
+        single.run_wfunc()
+
+    assert fsclient.opts["cachedir"] == master_cachedir, (
+        "Single.run_wfunc must not overwrite the master FSClient cachedir "
+        "with the minion's thin_dir cachedir; see GitHub issue #68458."
+    )
+
+
+def test_sshstate_anchors_opts_cachedir_to_master(opts, tmp_path):
+    """
+    Regression test for #68458 (part 2 of 2).
+
+    ``SSHState`` runs on the master while ``opts`` is the per-minion
+    opts package whose ``cachedir`` is a thin_dir-relative path on the
+    target. ``SSHState`` must align ``opts['cachedir']`` with the
+    master-side fileclient's ``cachedir`` before invoking the parent
+    ``State.__init__`` so that the state's internal fileclient and the
+    jinja loader search path (``opts['cachedir']/files/<saltenv>``)
+    resolve under the configured master ``cachedir`` instead of under
+    the minion's thin_dir.
+    """
+    import salt.client.ssh.state as ssh_state
+
+    master_cachedir = str(tmp_path / "master_cache")
+    minion_thin_cachedir = "/var/tmp/.root_92f580_salt/running_data/var/cache/salt"
+
+    opts["cachedir"] = minion_thin_cachedir
+    opts["grains"] = {}
+    opts["pillar"] = {}
+    opts["id"] = "saltsshtest"
+    opts["file_client"] = "local"
+
+    master_fsclient = MagicMock()
+    master_fsclient.opts = {"cachedir": master_cachedir}
+
+    wrapper = MagicMock()
+    wrapper.fsclient = master_fsclient
+
+    with patch.object(ssh_state.SSHState, "load_modules"):
+        state = ssh_state.SSHState(
+            opts,
+            wrapper=wrapper,
+            initial_pillar={"_initial": True},
+        )
+
+    assert state.opts["cachedir"] == master_cachedir, (
+        "SSHState must anchor opts['cachedir'] under the master "
+        "FunctionWrapper's fsclient cachedir so the state fileclient "
+        "and jinja loader cache under the configured master cachedir "
+        "rather than the minion's thin_dir path on the master "
+        "filesystem; see GitHub issue #68458."
+    )
+
+
+def test_sshhighstate_anchors_opts_cachedir_to_master(opts, tmp_path):
+    """
+    Regression test for #68458 — ``SSHHighState`` mirror of the
+    ``SSHState`` invariant. The highstate runs on the master and uses
+    the master-side fileclient passed in via ``fsclient``; the state
+    ``cachedir`` must be anchored to that fileclient's cachedir so
+    fileserver caching and jinja template resolution don't write under
+    the minion's thin_dir path on the master.
+    """
+    import salt.client.ssh.state as ssh_state
+
+    master_cachedir = str(tmp_path / "master_cache")
+    minion_thin_cachedir = "/var/tmp/.root_92f580_salt/running_data/var/cache/salt"
+
+    opts["cachedir"] = minion_thin_cachedir
+    opts["grains"] = {}
+    opts["pillar"] = {}
+    opts["id"] = "saltsshtest"
+    opts["file_client"] = "local"
+    opts["state_top"] = "salt://top.sls"
+    opts["nodegroups"] = {}
+    opts["renderer"] = "yaml"
+    opts["failhard"] = False
+
+    master_fsclient = MagicMock()
+    master_fsclient.opts = {"cachedir": master_cachedir}
+    master_fsclient.master_opts.return_value = {
+        "renderer": "yaml",
+        "state_top": "salt://top.sls",
+        "failhard": False,
+        "file_roots": opts.get("file_roots", {"base": []}),
+    }
+
+    wrapper = MagicMock()
+    wrapper.fsclient = master_fsclient
+
+    with patch.object(ssh_state.SSHState, "load_modules"), patch(
+        "salt.loader.matchers"
+    ), patch("salt.loader.tops"):
+        hs = ssh_state.SSHHighState(
+            opts,
+            None,
+            wrapper=wrapper,
+            fsclient=master_fsclient,
+            initial_pillar={"_initial": True},
+        )
+
+    assert hs.opts["cachedir"] == master_cachedir, (
+        "SSHHighState must anchor opts['cachedir'] under the master "
+        "fileclient's cachedir; see GitHub issue #68458."
+    )
+
+
+def test_single_opts(opts, target, mock_bin_paths):
     """Sanity check for ssh.Single options"""
 
     single = ssh.Single(
@@ -60,61 +250,6 @@ def test_single_opts(opts, target):
         fsclient=None,
         thin=salt.utils.thin.thin_path(opts["cachedir"]),
         mine=False,
-        **target,
-    )
-
-    assert single.shell._ssh_opts() == ""
-    expected_cmd = (
-        "ssh login1 "
-        "-o KbdInteractiveAuthentication=no -o "
-        "PasswordAuthentication=yes -o ConnectTimeout=65 -o ServerAliveInterval=60 "
-        "-o ServerAliveCountMax=3 -o Port=22 "
-        "-o IdentityFile=/etc/salt/pki/master/ssh/salt-ssh.rsa "
-        "-o User=root  date +%s"
-    )
-    assert single.shell._cmd_str("date +%s") == expected_cmd
-
-
-def test_single_opts_custom_keepalive_options(opts, target):
-    """Sanity check for ssh.Single options with custom keepalive"""
-
-    single = ssh.Single(
-        opts,
-        opts["argv"],
-        "localhost",
-        mods={},
-        fsclient=None,
-        thin=salt.utils.thin.thin_path(opts["cachedir"]),
-        mine=False,
-        keepalive_interval=15,
-        keepalive_count_max=5,
-        **target,
-    )
-
-    assert single.shell._ssh_opts() == ""
-    expected_cmd = (
-        "ssh login1 "
-        "-o KbdInteractiveAuthentication=no -o "
-        "PasswordAuthentication=yes -o ConnectTimeout=65 -o ServerAliveInterval=15 "
-        "-o ServerAliveCountMax=5 -o Port=22 "
-        "-o IdentityFile=/etc/salt/pki/master/ssh/salt-ssh.rsa "
-        "-o User=root  date +%s"
-    )
-    assert single.shell._cmd_str("date +%s") == expected_cmd
-
-
-def test_single_opts_disable_keepalive(opts, target):
-    """Sanity check for ssh.Single options with custom keepalive"""
-
-    single = ssh.Single(
-        opts,
-        opts["argv"],
-        "localhost",
-        mods={},
-        fsclient=None,
-        thin=salt.utils.thin.thin_path(opts["cachedir"]),
-        mine=False,
-        keepalive=False,
         **target,
     )
 
@@ -357,8 +492,8 @@ def test_execute_script(opts, target, tmp_path):
         assert ret == exp_ret
         assert mock_cmd.call_count == 2
         assert [
-            call("/bin/sh '{}'".format(script)),
-            call("rm '{}'".format(script)),
+            call(f"/bin/sh '{script}'"),
+            call(f"rm '{script}'"),
         ] == mock_cmd.call_args_list
 
 
@@ -429,7 +564,7 @@ def test_shim_cmd_copy_fails(opts, target, caplog):
         mock_cmd.assert_not_called()
 
 
-def test_run_ssh_pre_flight_no_connect(opts, target, tmp_path, caplog):
+def test_run_ssh_pre_flight_no_connect(opts, target, tmp_path, caplog, mock_bin_paths):
     """
     test Single.run_ssh_pre_flight when you
     cannot connect to the target
@@ -466,6 +601,10 @@ def test_run_ssh_pre_flight_no_connect(opts, target, tmp_path, caplog):
     with caplog.at_level(logging.TRACE):
         with patch_send, patch_exec_cmd, patch_tmp:
             ret = single.run_ssh_pre_flight()
+
+    # Flush the logging handler just to be sure
+    caplog.handler.flush()
+
     assert "Copying the pre flight script" in caplog.text
     assert "Could not copy the pre flight script to target" in caplog.text
     assert ret == ret_send
@@ -519,7 +658,7 @@ def test_run_ssh_pre_flight_permission_denied(opts, target, tmp_path):
     mock_exec_cmd.assert_not_called()
 
 
-def test_run_ssh_pre_flight_connect(opts, target, tmp_path, caplog):
+def test_run_ssh_pre_flight_connect(opts, target, tmp_path, caplog, mock_bin_paths):
     """
     test Single.run_ssh_pre_flight when you
     can connect to the target
@@ -557,6 +696,9 @@ def test_run_ssh_pre_flight_connect(opts, target, tmp_path, caplog):
     with caplog.at_level(logging.TRACE):
         with patch_send, patch_exec_cmd, patch_tmp:
             ret = single.run_ssh_pre_flight()
+
+    # Flush the logging handler just to be sure
+    caplog.handler.flush()
 
     assert "Executing the pre flight script on target" in caplog.text
     assert ret == ret_exec_cmd
@@ -871,21 +1013,3 @@ def test_ssh_single__cmd_str_sudo_passwd_user(opts):
     )
 
     assert expected in cmd
-
-
-def test_check_thin_dir_with_backslash_user(opts):
-    """
-    Test `thin_dir` path generation for the user with backslash in the name
-    """
-    single = ssh.Single(
-        opts,
-        opts["argv"],
-        "host.example.org",
-        "host.example.org",
-        user="exampledomain\\user",
-        mods={},
-        fsclient=None,
-        mine=False,
-    )
-    assert single.thin_dir == single.opts["thin_dir"]
-    assert ".exampledomain_user_" in single.thin_dir

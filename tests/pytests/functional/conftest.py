@@ -1,5 +1,6 @@
 import logging
 import shutil
+import sys
 
 import pytest
 from saltfactories.utils.functional import Loaders
@@ -68,8 +69,20 @@ def minion_opts(
                     str(state_tree_prod),
                 ],
             },
+            "lazy_loader_strict_matching": True,
         }
     )
+
+    if sys.platform.startswith("win"):
+        # We need to set up winrepo on Windows
+        minion_config_overrides.update(
+            {
+                "winrepo_source_dir": "salt://winrepo_ng",
+                "winrepo_dir_ng": str(state_tree / "winrepo_ng"),
+                "winrepo_dir": str(state_tree / "winrepo"),
+            }
+        )
+
     factory = salt_factories.salt_minion_daemon(
         minion_id,
         defaults=minion_config_defaults or None,
@@ -127,7 +140,7 @@ def master_opts(
 
 @pytest.fixture(scope="module")
 def loaders(minion_opts):
-    return Loaders(minion_opts, loaded_base_name="{}.loaded".format(__name__))
+    return Loaders(minion_opts, loaded_base_name=f"{__name__}.loaded")
 
 
 @pytest.fixture(autouse=True)

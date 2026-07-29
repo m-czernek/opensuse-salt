@@ -7,6 +7,7 @@ import salt.defaults.exitcodes
 pytestmark = [
     pytest.mark.core_test,
     pytest.mark.windows_whitelisted,
+    pytest.mark.timeout_unless_on_windows(120),
 ]
 
 
@@ -85,7 +86,7 @@ def test_list(salt_cli, salt_minion, salt_sub_minion):
     assert salt_minion.id in ret.stdout
     assert salt_sub_minion.id not in ret.stdout
     ret = salt_cli.run(
-        "-L", "test.ping", minion_tgt="{},{}".format(salt_minion.id, salt_sub_minion.id)
+        "-L", "test.ping", minion_tgt=f"{salt_minion.id},{salt_sub_minion.id}"
     )
     assert ret.returncode == 0
     assert salt_minion.id in ret.data
@@ -124,16 +125,14 @@ def test_compound_pcre_grain_and_grain(salt_cli, salt_minion, salt_sub_minion):
 
 
 def test_compound_list_and_pcre_minion(salt_cli, salt_minion, salt_sub_minion):
-    match = "L@{} and E@.*".format(salt_sub_minion.id)
+    match = f"L@{salt_sub_minion.id} and E@.*"
     ret = salt_cli.run("-C", "test.ping", minion_tgt=match)
     assert salt_sub_minion.id in ret.data
     assert salt_minion.id not in ret.data
 
 
 def test_compound_not_sub_minion(salt_cli, salt_minion, salt_sub_minion):
-    ret = salt_cli.run(
-        "-C", "test.ping", minion_tgt="not {}".format(salt_sub_minion.id)
-    )
+    ret = salt_cli.run("-C", "test.ping", minion_tgt=f"not {salt_sub_minion.id}")
     assert ret.returncode == 0
     assert salt_minion.id in ret.data
     assert salt_sub_minion.id not in ret.data
@@ -183,7 +182,7 @@ def test_compound_nodegroup(salt_cli, salt_minion, salt_sub_minion):
     assert ret.returncode == 0
     assert salt_minion.id in ret.data
     assert salt_sub_minion.id in ret.data
-    target = "N@multiline_nodegroup not {}".format(salt_sub_minion.id)
+    target = f"N@multiline_nodegroup not {salt_sub_minion.id}"
     ret = salt_cli.run("-C", "test.ping", minion_tgt=target)
     assert ret.returncode == 0
     assert salt_minion.id in ret.data
@@ -269,7 +268,7 @@ def test_regex(salt_cli, salt_minion, salt_sub_minion):
     """
     test salt regex matcher
     """
-    ret = salt_cli.run("-E", "test.ping", minion_tgt="^{}$".format(salt_minion.id))
+    ret = salt_cli.run("-E", "test.ping", minion_tgt=f"^{salt_minion.id}$")
     assert ret.returncode == 0
     assert salt_minion.id in ret.data
     assert salt_sub_minion.id not in ret.data
@@ -362,12 +361,12 @@ def test_grains_targeting_minion_id_running(salt_cli, salt_minion, salt_sub_mini
     """
     Tests return of each running test minion targeting with minion id grain
     """
-    ret = salt_cli.run("-G", "test.ping", minion_tgt="id:{}".format(salt_minion.id))
+    ret = salt_cli.run("-G", "test.ping", minion_tgt=f"id:{salt_minion.id}")
     assert ret.returncode == 0
     assert salt_minion.id in ret.data
     assert ret.data[salt_minion.id] is True
 
-    ret = salt_cli.run("-G", "test.ping", minion_tgt="id:{}".format(salt_sub_minion.id))
+    ret = salt_cli.run("-G", "test.ping", minion_tgt=f"id:{salt_sub_minion.id}")
     assert ret.returncode == 0
     assert salt_sub_minion.id in ret.data
     assert ret.data[salt_sub_minion.id] is True
@@ -382,10 +381,14 @@ def _check_skip(grains):
 @pytest.mark.skip_initial_gh_actions_failure(skip=_check_skip)
 def test_grains_targeting_minion_id_disconnected(salt_master, salt_minion, salt_cli):
     """
-    Tests return of minion using grains targeting on a disconnected minion.
-    """
-    expected_output = "Minion did not return. [No response]"
+    Tests grains targeting against a disconnected minion (#68976).
 
+    A minion whose key has been accepted but which has never returned grain
+    data to the master must not match any grain expression, because the
+    master has no grain data to evaluate against. The CLI should report
+    "No return received" (exit code 2) instead of silently including the
+    disconnected minion in the "expected returners" wait set.
+    """
     # Create a minion key, but do not start the "fake" minion. This mimics a
     # disconnected minion.
     disconnected_minion_id = "disconnected"
@@ -400,12 +403,13 @@ def test_grains_targeting_minion_id_disconnected(salt_master, salt_minion, salt_
             "--log-level=debug",
             "-G",
             "test.ping",
-            minion_tgt="id:{}".format(disconnected_minion_id),
-            _timeout=15,
+            minion_tgt=f"id:{disconnected_minion_id}",
+            _timeout=30,
         )
-        assert ret.returncode == 1
-        assert disconnected_minion_id in ret.data
-        assert expected_output in ret.data[disconnected_minion_id]
+        # No minion returned, so the CLI emits "No return received" and exits 2.
+        assert ret.returncode == 2
+        assert ret.data == {}
+        assert "No return received" in ret.stderr
 
 
 def test_regrain(salt_cli, salt_minion, salt_sub_minion):
@@ -432,9 +436,7 @@ def test_pillar(salt_cli, salt_minion, salt_sub_minion, pillar_tree):
     assert salt_minion.id in ret.data
     assert salt_sub_minion.id in ret.data
     # First-level pillar (string value, only in sub_minion)
-    ret = salt_cli.run(
-        "-I", "test.ping", minion_tgt="sub:{}".format(salt_sub_minion.id)
-    )
+    ret = salt_cli.run("-I", "test.ping", minion_tgt=f"sub:{salt_sub_minion.id}")
     assert ret.returncode == 0
     assert salt_sub_minion.id in ret.data
     assert salt_minion.id not in ret.data
@@ -506,7 +508,9 @@ def test_salt_documentation(salt_cli, salt_minion):
     """
     Test to see if we're supporting --doc
     """
-    ret = salt_cli.run("-d", "test", minion_tgt=salt_minion.id)
+    # Setting an explicity long timeout otherwise this test may fail when the
+    # system is under load.
+    ret = salt_cli.run("-d", "test", minion_tgt=salt_minion.id, _timeout=90)
     assert ret.returncode == 0
     assert "test.ping" in ret.data
 

@@ -2,10 +2,9 @@
 Send events from webhook api
 """
 
-import tornado.httpserver
-import tornado.ioloop
-import tornado.web
-
+import salt.ext.tornado.httpserver
+import salt.ext.tornado.ioloop
+import salt.ext.tornado.web
 import salt.utils.event
 
 
@@ -65,7 +64,7 @@ def start(address=None, port=5000, ssl_crt=None, ssl_key=None):
             __salt__["event.send"](tag, msg)
 
     class WebHook(
-        tornado.web.RequestHandler
+        salt.ext.tornado.web.RequestHandler
     ):  # pylint: disable=abstract-method
         def post(self, tag):  # pylint: disable=arguments-differ
             body = self.request.body
@@ -76,13 +75,13 @@ def start(address=None, port=5000, ssl_crt=None, ssl_key=None):
             }
             fire("salt/engines/hook/" + tag, payload)
 
-    application = tornado.web.Application([(r"/(.*)", WebHook)])
+    application = salt.ext.tornado.web.Application([(r"/(.*)", WebHook)])
     ssl_options = None
     if all([ssl_crt, ssl_key]):
         ssl_options = {"certfile": ssl_crt, "keyfile": ssl_key}
-    io_loop = tornado.ioloop.IOLoop(make_current=False)
+    io_loop = salt.ext.tornado.ioloop.IOLoop(make_current=False)
     io_loop.make_current()
-    http_server = tornado.httpserver.HTTPServer(
+    http_server = salt.ext.tornado.httpserver.HTTPServer(
         application, ssl_options=ssl_options
     )
     http_server.listen(port, address=address)

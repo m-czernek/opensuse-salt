@@ -2,28 +2,56 @@
 Simple Smoke Tests for Connected SSH minions
 """
 
-import os
+import subprocess
 
+import packaging.version
 import pytest
 from saltfactories.utils.functional import StateResult
+
+import salt.utils.platform
+import salt.utils.versions
 
 pytestmark = [
     pytest.mark.slow_test,
     pytest.mark.skip_on_windows(reason="salt-ssh not available on Windows"),
 ]
 
-INSIDE_CONTAINER = os.getenv("HOSTNAME", "") == "salt-test-container"
+
+def _check_systemctl():
+    if not hasattr(_check_systemctl, "memo"):
+        if not salt.utils.platform.is_linux():
+            _check_systemctl.memo = False
+        else:
+            proc = subprocess.run(["systemctl"], capture_output=True, check=False)
+            _check_systemctl.memo = (
+                b"Failed to get D-Bus connection: No such file or directory"
+                in proc.stderr
+            )
+    return _check_systemctl.memo
 
 
-@pytest.mark.skipif(INSIDE_CONTAINER, reason="No systemd in container.")
+def _check_python():
+    try:
+        proc = subprocess.run(
+            ["/usr/bin/python3", "--version"], capture_output=True, check=False
+        )
+    except FileNotFoundError:
+        return True
+    return packaging.version.Version(
+        proc.stdout.decode().strip().split()[1]
+    ) <= packaging.version.Version("3.10")
+
+
 @pytest.mark.skip_if_not_root
+@pytest.mark.skipif(_check_systemctl(), reason="systemctl degraded")
+@pytest.mark.skipif(_check_python(), reason="System python less than 3.10")
 def test_service(salt_ssh_cli, grains):
     service = "cron"
     os_family = grains["os_family"]
     os_release = grains["osrelease"]
     if os_family == "RedHat":
         service = "crond"
-    elif os_family in ["Suse", "Arch"]:
+    elif os_family == "Arch":
         service = "sshd"
     elif os_family == "MacOS":
         service = "org.ntp.ntpd"
@@ -57,7 +85,7 @@ def _state_tree(salt_master, tmp_path):
     {}/testfile:
       file:
         - managed
-        - source: salt://testfile
+        - contents: "This is a test file"
         - makedirs: true
     """.format(
         tmp_path

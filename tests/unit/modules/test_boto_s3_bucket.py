@@ -22,6 +22,10 @@ try:
 except ImportError:
     HAS_BOTO = False
 
+pytestmark = [
+    pytest.mark.skip_on_fips_enabled_platform,
+]
+
 # pylint: enable=import-error,no-name-in-module,unused-import
 
 # the boto_s3_bucket module relies on the connect_to_region() method
@@ -439,7 +443,7 @@ class BotoS3BucketTestCase(BotoS3BucketTestCaseBase, BotoS3BucketTestCaseMixin):
             TargetBucket="arn:::::",
             TargetPrefix="asdf",
             TargetGrants="[]",
-            **conn_parameters
+            **conn_parameters,
         )
 
         self.assertTrue(result["updated"])
@@ -456,7 +460,7 @@ class BotoS3BucketTestCase(BotoS3BucketTestCaseBase, BotoS3BucketTestCaseMixin):
             TargetBucket="arn:::::",
             TargetPrefix="asdf",
             TargetGrants="[]",
-            **conn_parameters
+            **conn_parameters,
         )
         self.assertEqual(
             result.get("error", {}).get("message"),

@@ -15,7 +15,6 @@ import salt.loader
 import salt.minion
 import salt.roster
 import salt.state
-import salt.utils.data
 import salt.utils.files
 import salt.utils.json
 import salt.utils.path
@@ -32,10 +31,27 @@ class SSHState(salt.state.State):
     Create a State object which wraps the SSH functions for state operations
     """
 
-    def __init__(self, opts, pillar=None, wrapper=None, context=None):
+    def __init__(
+        self,
+        opts,
+        pillar_override=None,
+        wrapper=None,
+        context=None,
+        initial_pillar=None,
+    ):
         self.wrapper = wrapper
         self.context = context
-        super().__init__(opts, pillar)
+        # ``opts`` is the per-minion opts package returned by
+        # ``test.opts_pkg`` running inside salt-thin on the target. Its
+        # ``cachedir`` is rooted under the on-target ``thin_dir`` (e.g.
+        # ``/var/tmp/.root_XXXXX_salt/running_data/var/cache/salt``).
+        # The state runs on the master, so the state fileclient and the
+        # jinja loader search path
+        # (``opts['cachedir']/files/<saltenv>``) need to be anchored
+        # under the configured master ``cachedir`` instead. See #68458.
+        if wrapper is not None and getattr(wrapper, "fsclient", None) is not None:
+            opts["cachedir"] = wrapper.fsclient.opts["cachedir"]
+        super().__init__(opts, pillar_override, initial_pillar=initial_pillar)
 
     def load_modules(self, data=None, proxy=None):
         """
@@ -49,6 +65,28 @@ class SSHState(salt.state.State):
             self.opts, locals_, self.utils, self.serializers
         )
         self.rend = salt.loader.render(self.opts, self.functions)
+
+    def _gather_pillar(self):
+        """
+        The opts used during pillar rendering should contain the master
+        opts in the root namespace. self.opts is the modified minion opts,
+        containing the original master opts in __master_opts__.
+        """
+        _opts = self.opts
+        popts = {}
+        # Pillar compilation needs the master opts primarily,
+        # same as during regular operation.
+        popts.update(_opts)
+        popts.update(_opts.get("__master_opts__", {}))
+        # But, salt.state.State takes the parameters for get_pillar from
+        # the opts, so we need to ensure they are correct for the minion.
+        popts["id"] = _opts["id"]
+        popts["saltenv"] = _opts["saltenv"]
+        popts["pillarenv"] = _opts.get("pillarenv")
+        self.opts = popts
+        pillar = super()._gather_pillar()
+        self.opts = _opts
+        return pillar
 
     def check_refresh(self, data, ret):
         """
@@ -70,10 +108,33 @@ class SSHHighState(salt.state.BaseHighState):
 
     stack = []
 
-    def __init__(self, opts, pillar=None, wrapper=None, fsclient=None, context=None):
+    def __init__(
+        self,
+        opts,
+        pillar_override=None,
+        wrapper=None,
+        fsclient=None,
+        context=None,
+        initial_pillar=None,
+    ):
         self.client = fsclient
+        # ``opts`` is the per-minion opts package; its ``cachedir`` is a
+        # thin_dir-relative path on the target. The highstate runs on the
+        # master, so anchor ``opts['cachedir']`` under the master
+        # ``cachedir`` (taken from the master-side fileclient) so master
+        # fileserver caching and jinja template resolution don't write to
+        # the minion's thin_dir path on the master filesystem. See
+        # #68458.
+        if fsclient is not None and getattr(fsclient, "opts", None) is not None:
+            opts["cachedir"] = fsclient.opts["cachedir"]
         salt.state.BaseHighState.__init__(self, opts)
-        self.state = SSHState(opts, pillar, wrapper, context=context)
+        self.state = SSHState(
+            opts,
+            pillar_override,
+            wrapper,
+            context=context,
+            initial_pillar=initial_pillar,
+        )
         self.matchers = salt.loader.matchers(self.opts)
         self.tops = salt.loader.tops(self.opts)
 
@@ -204,7 +265,6 @@ def prep_trans_tar(
         salt.utils.json.dump(chunks, fp_)
     if pillar:
         with salt.utils.files.fopen(pillarfn, "w+") as fp_:
-            pillar = salt.utils.data.decode_dict(pillar)
             salt.utils.json.dump(pillar, fp_)
     if roster_grains:
         with salt.utils.files.fopen(roster_grainsfn, "w+") as fp_:

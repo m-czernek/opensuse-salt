@@ -55,7 +55,7 @@ def _prepare_connection(**kwargs):
     paramiko_kwargs, scp_kwargs = _select_kwargs(**kwargs)
     ssh = paramiko.SSHClient()
     if paramiko_kwargs.pop("auto_add_policy", False):
-        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())  # nosec
     ssh.connect(**paramiko_kwargs)
     scp_client = scp.SCPClient(ssh.get_transport(), **scp_kwargs)
     return scp_client
@@ -145,7 +145,7 @@ def put(
     recursive=False,
     preserve_times=False,
     saltenv="base",
-    **kwargs
+    **kwargs,
 ):
     """
     Transfer files and directories to remote host.

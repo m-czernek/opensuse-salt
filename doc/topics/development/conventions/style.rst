@@ -21,7 +21,7 @@ Linting
 Most Salt style conventions are codified in Salt's ``.pylintrc`` file.
 Salt's linting has two major dependencies: pylint_ and saltpylint_, the full lint
 requirements can be found under ``requirements/static/ci/lint.in`` and the pinned
-requirements at ``requirements/static/ci/py3.<minor-version>/lint.txt``, however,
+requirements at ``requirements/static/ci/py3.<minor-version>/lint.lock``, however,
 linting should be done using :ref:`nox <getting_set_up_for_tests>`, which is how
 pull requests are checked.
 
@@ -97,7 +97,7 @@ When adding a new function or state, where possible try to use a
         print(msg)
 
 If you are uncertain what version should be used, either consult a core
-developer in IRC or bring this up when opening your :ref:`pull request
+developer in the Community Discord or bring this up when opening your :ref:`pull request
 <installing-for-development>` and a core developer will let you know what
 version to add. Typically this will be the next element in the `periodic table
 <https://en.wikipedia.org/wiki/List_of_chemical_elements>`_.

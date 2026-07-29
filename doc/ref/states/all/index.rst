@@ -283,7 +283,6 @@ state modules
     rvm
     salt_proxy
     saltmod
-    saltsupport
     saltutil
     schedule
     selinux

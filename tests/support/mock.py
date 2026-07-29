@@ -11,6 +11,7 @@
     Note: mock >= 2.0.0 required since unittest.mock does not have
     MagicMock.assert_called in Python < 3.6.
 """
+
 # pylint: disable=unused-import,function-redefined,blacklisted-module,blacklisted-external-module
 
 
@@ -18,32 +19,37 @@ import copy
 import errno
 import fnmatch
 import sys
-import importlib
 
-current_version = (sys.version_info.major, sys.version_info.minor)
+# By these days, we should blowup if mock is not available
+import mock  # pylint: disable=blacklisted-external-import
 
-# Prefer unittest.mock for Python versions that are sufficient
-if current_version >= (3,8):
-    mock = importlib.import_module('unittest.mock')
-else:
-    mock = importlib.import_module('mock')
-
-ANY = mock.ANY
-DEFAULT = mock.DEFAULT
-FILTER_DIR = mock.FILTER_DIR
-MagicMock = mock.MagicMock
-Mock = mock.Mock
-NonCallableMagicMock = mock.NonCallableMagicMock
-NonCallableMock = mock.NonCallableMock
-PropertyMock = mock.PropertyMock
-call = mock.call
-create_autospec = mock.create_autospec
-patch = mock.patch
-sentinel = mock.sentinel
+# pylint: disable=no-name-in-module,no-member
+from mock import (
+    ANY,
+    DEFAULT,
+    FILTER_DIR,
+    AsyncMock,
+    MagicMock,
+    Mock,
+    NonCallableMagicMock,
+    NonCallableMock,
+    PropertyMock,
+    __version__,
+    call,
+    create_autospec,
+    patch,
+    sentinel,
+)
 
 import salt.utils.stringutils
 
 # pylint: disable=no-name-in-module,no-member
+
+
+__mock_version = tuple(
+    int(part) for part in mock.__version__.split(".") if part.isdigit()
+)  # pylint: disable=no-member
+
 
 class MockFH:
     def __init__(self, filename, read_data, *args, **kwargs):
@@ -65,7 +71,7 @@ class MockFH:
         self.write = Mock(side_effect=self._write)
         self.writelines = Mock(side_effect=self._writelines)
         self.close = Mock()
-        self.seek = Mock()
+        self.seek = Mock(side_effect=self._seek)
         self.__loc = 0
         self.__read_data_ok = False
 
@@ -198,7 +204,7 @@ class MockFH:
                 )
             elif not self.binary_mode and content_type is not str:
                 raise TypeError(
-                    "write() argument must be str, not {}".format(content_type.__name__)
+                    f"write() argument must be str, not {content_type.__name__}"
                 )
 
     def _writelines(self, lines):
@@ -212,6 +218,14 @@ class MockFH:
 
     def __exit__(self, exc_type, exc_val, exc_tb):  # pylint: disable=unused-argument
         pass
+
+    # For some reason this gets called with additional args on Windows when
+    # running the following test:
+    # tests/pytests/unit/beacons/test_log_beacon.py::test_log_match
+    # Let's just absorb them with *args
+    def _seek(self, pos=0, *args):
+        self.__loc = pos
+        self.read_data_iter = self._iterate_read_data(self.read_data)
 
 
 class MockCall:
@@ -229,7 +243,7 @@ class MockCall:
                 ret = ret[:-2]
         else:
             for key, val in self.kwargs.items():
-                ret += "{}={}".format(salt.utils.stringutils.to_str(key), repr(val))
+                ret += f"{salt.utils.stringutils.to_str(key)}={repr(val)}"
         ret += ")"
         return ret
 

@@ -13,86 +13,7 @@ import salt.exceptions
 import salt.output
 import salt.utils.stringutils
 
-# pylint: disable=import-error,no-name-in-module,redefined-builtin
-
 log = logging.getLogger(__name__)
-
-
-def get_bnum(opts, minions, quiet):
-    """
-    Return the active number of minions to maintain
-    """
-    partition = lambda x: float(x) / 100.0 * len(minions)
-    try:
-        if isinstance(opts["batch"], str) and "%" in opts["batch"]:
-            res = partition(float(opts["batch"].strip("%")))
-            if res < 1:
-                return int(math.ceil(res))
-            else:
-                return int(res)
-        else:
-            return int(opts["batch"])
-    except ValueError:
-        if not quiet:
-            salt.utils.stringutils.print_cli(
-                "Invalid batch data sent: {}\nData must be in the "
-                "form of %10, 10% or 3".format(opts["batch"])
-            )
-
-
-def batch_get_opts(
-    tgt, fun, batch, parent_opts, arg=(), tgt_type="glob", ret="", kwarg=None, **kwargs
-):
-    # We need to re-import salt.utils.args here
-    # even though it has already been imported.
-    # when cmd_batch is called via the NetAPI
-    # the module is unavailable.
-    import salt.utils.args
-
-    arg = salt.utils.args.condition_input(arg, kwarg)
-    opts = {
-        "tgt": tgt,
-        "fun": fun,
-        "arg": arg,
-        "tgt_type": tgt_type,
-        "ret": ret,
-        "batch": batch,
-        "failhard": kwargs.get("failhard", parent_opts.get("failhard", False)),
-        "raw": kwargs.get("raw", False),
-    }
-
-    if "timeout" in kwargs:
-        opts["timeout"] = kwargs["timeout"]
-    if "gather_job_timeout" in kwargs:
-        opts["gather_job_timeout"] = kwargs["gather_job_timeout"]
-    if "batch_wait" in kwargs:
-        opts["batch_wait"] = int(kwargs["batch_wait"])
-
-    for key, val in parent_opts.items():
-        if key not in opts:
-            opts[key] = val
-
-    opts["batch_presence_ping_timeout"] = kwargs.get(
-        "batch_presence_ping_timeout", opts["timeout"]
-    )
-    opts["batch_presence_ping_gather_job_timeout"] = kwargs.get(
-        "batch_presence_ping_gather_job_timeout", opts["gather_job_timeout"]
-    )
-
-    return opts
-
-
-def batch_get_eauth(kwargs):
-    eauth = {}
-    if "eauth" in kwargs:
-        eauth["eauth"] = kwargs.pop("eauth")
-    if "username" in kwargs:
-        eauth["username"] = kwargs.pop("username")
-    if "password" in kwargs:
-        eauth["password"] = kwargs.pop("password")
-    if "token" in kwargs:
-        eauth["token"] = kwargs.pop("token")
-    return eauth
 
 
 class Batch:
@@ -118,7 +39,6 @@ class Batch:
         self.pub_kwargs = eauth if eauth else {}
         self.quiet = quiet
         self.options = _parser
-        self.minions = set()
         # Passing listen True to local client will prevent it from purging
         # cahced events while iterating over the batches.
         self.local = salt.client.get_local_client(opts["conf_file"], listen=True)
@@ -131,7 +51,7 @@ class Batch:
             self.opts["tgt"],
             "test.ping",
             [],
-            self.opts.get("batch_presence_ping_timeout", self.opts["timeout"]),
+            self.opts["timeout"],
         ]
 
         selected_target_option = self.opts.get("selected_target_option", None)
@@ -142,12 +62,7 @@ class Batch:
 
         self.pub_kwargs["yield_pub_data"] = True
         ping_gen = self.local.cmd_iter(
-            *args,
-            gather_job_timeout=self.opts.get(
-                "batch_presence_ping_gather_job_timeout",
-                self.opts["gather_job_timeout"],
-            ),
-            **self.pub_kwargs
+            *args, gather_job_timeout=self.opts["gather_job_timeout"], **self.pub_kwargs
         )
 
         # Broadcast to targets
@@ -168,11 +83,39 @@ class Batch:
                         )
                     break
                 if m is not None:
-                    fret.add(m)
+                    if "failed" in ret[m] and ret[m]["failed"] is True:
+                        log.debug(
+                            "minion '%s' failed test.ping - will be returned as a down minion",
+                            m,
+                        )
+                    else:
+                        fret.add(m)
+
         return (list(fret), ping_gen, nret.difference(fret))
 
     def get_bnum(self):
-        return get_bnum(self.opts, self.minions, self.quiet)
+        """
+        Return the active number of minions to maintain
+        """
+
+        def partition(x):
+            return float(x) / 100.0 * len(self.minions)
+
+        try:
+            if isinstance(self.opts["batch"], str) and "%" in self.opts["batch"]:
+                res = partition(float(self.opts["batch"].strip("%")))
+                if res < 1:
+                    return int(math.ceil(res))
+                else:
+                    return int(res)
+            else:
+                return int(self.opts["batch"])
+        except ValueError:
+            if not self.quiet:
+                salt.utils.stringutils.print_cli(
+                    "Invalid batch data sent: {}\nData must be in the "
+                    "form of %10, 10% or 3".format(self.opts["batch"])
+                )
 
     def __update_wait(self, wait):
         now = datetime.now()
@@ -255,7 +198,7 @@ class Batch:
             if next_:
                 if not self.quiet:
                     salt.utils.stringutils.print_cli(
-                        "\nExecuting run on {}\n".format(sorted(next_))
+                        f"\nExecuting run on {sorted(next_)}\n"
                     )
                 # create a new iterator for this batch of minions
                 return_value = self.opts.get("return", self.opts.get("ret", ""))
@@ -356,11 +299,12 @@ class Batch:
                         # We already know some minions didn't respond to the ping, so inform
                         # inform user attempt to run a job failed
                         salt.utils.stringutils.print_cli(
-                            "Minion '%s' failed to respond to job sent", minion
+                            f"Minion '{minion}' failed to respond to job sent"
                         )
 
                     if self.opts.get("failhard"):
                         failhard = True
+                    ret[minion] = data
                 else:
                     # If we are executing multiple modules with the same cmd,
                     # We use the highest retcode.

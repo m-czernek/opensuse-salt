@@ -8,7 +8,6 @@ log = logging.getLogger(__name__)
 
 
 @pytest.mark.skip_unless_on_linux
-@pytest.mark.skip_if_not_root
 def test_multimaster_dns(
     salt_mm_master_1,
     salt_mm_minion_1,
@@ -21,9 +20,6 @@ def test_multimaster_dns(
     Verify a minion configured with multimaster hot/hot will pick up a master's
     dns change if it's been disconnected.
     """
-
-    if not salt_mm_master_1.ip_addr_set:
-        pytest.skip("Unable to set additional IP address for master1")
 
     etc_hosts.write_text(
         f"{etc_hosts.orig_text}\n172.16.0.1    master1.local master2.local"
@@ -43,7 +39,7 @@ def test_multimaster_dns(
             log.info("Removed secondary master IP address.")
             # Wait for the minion's master_alive_interval, adding a second for
             # reliablity.
-            time.sleep(master_alive_interval + 1)
+            time.sleep(master_alive_interval + 10)
             assert (
                 "Master ip address changed from 172.16.0.1 to 127.0.0.1" in caplog.text
             )

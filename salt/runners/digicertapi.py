@@ -34,6 +34,7 @@ This API currently only supports RSA key types.  Support for other key types wil
 if interest warrants.
 
 """
+
 import logging
 import os
 import re
@@ -42,7 +43,6 @@ import tempfile
 from collections.abc import Sequence
 
 import salt.cache
-import salt.syspaths as syspaths
 import salt.utils.files
 import salt.utils.http
 import salt.utils.json
@@ -112,7 +112,7 @@ def _paginate(url, topkey, *args, **kwargs):
     aggregate_ret = ret["dict"][topkey]
     url = args[0]
     for p in range(2, numpages):
-        param_url = url + "?offset={}".format(lim * (p - 1))
+        param_url = url + f"?offset={lim * (p - 1)}"
         next_ret = salt.utils.http.query(param_url, kwargs)
         aggregate_ret[topkey].extend(next_ret["dict"][topkey])
 
@@ -131,9 +131,9 @@ def list_domains(container_id=None):
         salt-run digicert.list_domains
     """
     if container_id:
-        url = "{}/domain?{}".format(_base_url(), container_id)
+        url = f"{_base_url()}/domain?{container_id}"
     else:
-        url = "{}/domain".format(_base_url())
+        url = f"{_base_url()}/domain"
 
     orgs = _paginate(
         url,
@@ -160,9 +160,9 @@ def list_requests(status=None):
         salt-run digicert.list_requests pending
     """
     if status:
-        url = "{}/request?status={}".format(_base_url(), status)
+        url = f"{_base_url()}/request?status={status}"
     else:
-        url = "{}/request".format(_base_url())
+        url = f"{_base_url()}/request"
 
     reqs = _paginate(
         url,
@@ -188,7 +188,7 @@ def list_orders(status=None):
 
         salt-run digicert.list_orders
     """
-    url = "{}/order/certificate".format(_base_url())
+    url = f"{_base_url()}/order/certificate"
 
     reqs = _paginate(
         url,
@@ -238,7 +238,7 @@ def get_certificate(
 
     if order_id:
         order_cert = salt.utils.http.query(
-            "{}/order/certificate/{}".format(_base_url(), order_id),
+            f"{_base_url()}/order/certificate/{order_id}",
             method="GET",
             raise_error=False,
             decode=True,
@@ -336,7 +336,7 @@ def get_certificate(
 
     if common_name:
         bank = "digicert/domains"
-        cache = salt.cache.Cache(__opts__, syspaths.CACHE_DIR)
+        cache = salt.cache.Cache(__opts__, __opts__.get("cachedir"))
         try:
             data = cache.fetch(bank, common_name)
         except TypeError:
@@ -372,7 +372,7 @@ def list_organizations(container_id=None, include_validation=True):
     """
 
     orgs = _paginate(
-        "{}/organization".format(_base_url()),
+        f"{_base_url()}/organization",
         "organizations",
         method="GET",
         decode=True,
@@ -495,7 +495,7 @@ def order_certificate(
     encoded_body = salt.utils.json.dumps(body)
 
     qdata = salt.utils.http.query(
-        "{}/order/certificate/ssl".format(_base_url()),
+        f"{_base_url()}/order/certificate/ssl",
         method="POST",
         data=encoded_body,
         decode=True,
@@ -505,7 +505,7 @@ def order_certificate(
     )
     if "errors" not in qdata["dict"]:
         bank = "digicert/domains"
-        cache = salt.cache.Cache(__opts__, syspaths.CACHE_DIR)
+        cache = salt.cache.Cache(__opts__, __opts__.get("cachedir"))
         data = cache.fetch(bank, common_name)
         if data is None:
             data = {}
@@ -546,7 +546,7 @@ def gen_key(minion_id, dns_name=None, password=None, key_len=2048):
             private_key = gen.exportKey("PEM", password)
         if dns_name is not None:
             bank = "digicert/domains"
-            cache = salt.cache.Cache(__opts__, syspaths.CACHE_DIR)
+            cache = salt.cache.Cache(__opts__, __opts__.get("cachedir"))
             try:
                 data = cache.fetch(bank, dns_name)
                 data["private_key"] = private_key
@@ -571,7 +571,7 @@ def get_org_details(organization_id):
     """
 
     qdata = salt.utils.http.query(
-        "{}/organization/{}".format(_base_url(), organization_id),
+        f"{_base_url()}/organization/{organization_id}",
         method="GET",
         decode=True,
         decode_type="json",
@@ -616,15 +616,15 @@ def gen_csr(
     os.chmod(tmpdir, 0o700)
 
     bank = "digicert/domains"
-    cache = salt.cache.Cache(__opts__, syspaths.CACHE_DIR)
+    cache = salt.cache.Cache(__opts__, __opts__.get("cachedir"))
     data = cache.fetch(bank, dns_name)
     if data is None:
         data = {}
     if "private_key" not in data:
         data["private_key"] = gen_key(minion_id, dns_name, password, key_len=key_len)
 
-    tmppriv = "{}/priv".format(tmpdir)
-    tmpcsr = "{}/csr".format(tmpdir)
+    tmppriv = f"{tmpdir}/priv"
+    tmpcsr = f"{tmpdir}/csr"
     with salt.utils.files.fopen(tmppriv, "w") as if_:
         if_.write(salt.utils.stringutils.to_str(data["private_key"]))
 
@@ -636,9 +636,9 @@ def gen_csr(
     )
 
     if ou_name:
-        subject = subject + "/OU={}".format(ou_name)
+        subject = subject + f"/OU={ou_name}"
 
-    subject = subject + "/CN={}".format(dns_name)
+    subject = subject + f"/CN={dns_name}"
 
     cmd = "openssl req -new -{} -key {} -out {} -subj '{}'".format(
         shatype, tmppriv, tmpcsr, subject
@@ -669,7 +669,7 @@ def _id_map(minion_id, dns_name):
     Maintain a relationship between a minion and a dns name
     """
     bank = "digicert/minions"
-    cache = salt.cache.Cache(__opts__, syspaths.CACHE_DIR)
+    cache = salt.cache.Cache(__opts__, __opts__.get("cachedir"))
     dns_names = cache.fetch(bank, minion_id)
     if not isinstance(dns_names, list):
         dns_names = []
@@ -689,7 +689,7 @@ def show_organization(domain):
         salt-run digicert.show_company example.com
     """
     data = salt.utils.http.query(
-        "{}/companies/domain/{}".format(_base_url(), domain),
+        f"{_base_url()}/companies/domain/{domain}",
         status=True,
         decode=True,
         decode_type="json",
@@ -712,7 +712,7 @@ def show_csrs():
         salt-run digicert.show_csrs
     """
     data = salt.utils.http.query(
-        "{}/certificaterequests".format(_base_url()),
+        f"{_base_url()}/certificaterequests",
         status=True,
         decode=True,
         decode_type="json",
@@ -734,7 +734,7 @@ def show_rsa(minion_id, dns_name):
 
         salt-run digicert.show_rsa myminion domain.example.com
     """
-    cache = salt.cache.Cache(__opts__, syspaths.CACHE_DIR)
+    cache = salt.cache.Cache(__opts__, __opts__.get("cachedir"))
     bank = "digicert/domains"
     data = cache.fetch(bank, dns_name)
     return data["private_key"]
@@ -750,7 +750,7 @@ def list_domain_cache():
 
         salt-run digicert.list_domain_cache
     """
-    cache = salt.cache.Cache(__opts__, syspaths.CACHE_DIR)
+    cache = salt.cache.Cache(__opts__, __opts__.get("cachedir"))
     return cache.list("digicert/domains")
 
 
@@ -764,7 +764,7 @@ def del_cached_domain(domains):
 
         salt-run digicert.del_cached_domain domain1.example.com,domain2.example.com
     """
-    cache = salt.cache.Cache(__opts__, syspaths.CACHE_DIR)
+    cache = salt.cache.Cache(__opts__, __opts__.get("cachedir"))
     if isinstance(domains, str):
         domains = domains.split(",")
     if not isinstance(domains, list):

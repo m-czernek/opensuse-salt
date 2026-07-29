@@ -14,13 +14,16 @@ from tests.support.unit import TestCase
 
 # pylint: disable=import-error,no-name-in-module
 try:
-    import boto
     import boto3
     from botocore.exceptions import ClientError
 
     HAS_BOTO = True
 except ImportError:
     HAS_BOTO = False
+
+pytestmark = [
+    pytest.mark.skip_on_fips_enabled_platform,
+]
 
 
 # pylint: enable=import-error,no-name-in-module

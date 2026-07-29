@@ -24,6 +24,10 @@ except ImportError:
 
 REQUIRED_BOTO3_VERSION = "1.2.1"
 
+pytestmark = [
+    pytest.mark.skip_on_fips_enabled_platform,
+]
+
 
 @pytest.mark.skipif(HAS_BOTO3 is False, reason="The boto module must be installed.")
 @pytest.mark.skipif(
@@ -109,7 +113,7 @@ class Boto3modTestCase(TestCase, LoaderModuleMockMixin):
             self.service,
             self.resource_name,
             resource_id=self.resource_id,
-            **self.conn_parameters
+            **self.conn_parameters,
         )
         self.assertEqual(
             boto3mod.cache_id(self.service, self.resource_name, **self.conn_parameters),

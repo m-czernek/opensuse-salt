@@ -40,11 +40,29 @@ def _group_changes(cur, wanted, remove=False):
     """
     Determine if the groups need to be changed
     """
-    old = set(cur)
-    new = set(wanted)
-    if (remove and old != new) or (not remove and not new.issubset(old)):
-        return True
-    return False
+    cur = set(cur)
+    wanted = set(wanted)
+
+    if cur == wanted or (not remove and wanted.issubset(cur)):
+        return False
+
+    all_grps = {name: __salt__["group.info"](name) for name in cur.union(wanted)}
+
+    if remove:
+        diff = wanted.symmetric_difference(cur)
+    else:
+        diff = wanted.difference(cur)
+
+    remain = list(diff)
+    for diff_grp in diff:
+        for grp, info in all_grps.items():
+            if grp == diff_grp:
+                continue
+            if all_grps[diff_grp]["gid"] == info["gid"]:
+                # dupe detected
+                remain.remove(diff_grp)
+
+    return bool(remain)
 
 
 def _changes(
@@ -100,6 +118,15 @@ def _changes(
 
     change = {}
     wanted_groups = sorted(set((groups or []) + (optional_groups or [])))
+    lusr_groups_gids = [
+        __salt__["file.group_to_gid"](gname) for gname in lusr["groups"]
+    ]
+    dupe_groups = {}
+    for idx, _gid in enumerate(lusr_groups_gids):
+        if lusr_groups_gids.count(_gid) > 1:
+            if _gid not in dupe_groups:
+                dupe_groups[_gid] = []
+            dupe_groups[_gid].append(lusr["groups"][idx])
     if not remove_groups or groups is None and not optional_groups:
         wanted_groups = sorted(set(wanted_groups + lusr["groups"]))
     if uid and lusr["uid"] != uid:
@@ -109,24 +136,44 @@ def _changes(
     default_grp = __salt__["file.gid_to_group"](gid if gid is not None else lusr["gid"])
     old_default_grp = __salt__["file.gid_to_group"](lusr["gid"])
     # Remove the default group from the list for comparison purposes.
-    if default_grp in lusr["groups"]:
-        lusr["groups"].remove(default_grp)
+    # Remove default group from wanted_groups, as this requirement is
+    # already met
+    if default_grp in lusr["groups"] or default_grp in wanted_groups:
+        if default_grp in salt.utils.data.flatten(dupe_groups.values()):
+            dupe_gid = __salt__["file.group_to_gid"](default_grp)
+            for gname in dupe_groups[dupe_gid]:
+                if gname in lusr["groups"]:
+                    lusr["groups"].remove(gname)
+                if gname in wanted_groups:
+                    wanted_groups.remove(gname)
+        else:
+            if default_grp in lusr["groups"]:
+                lusr["groups"].remove(default_grp)
+            if default_grp in wanted_groups:
+                wanted_groups.remove(default_grp)
     # If the group is being changed, make sure that the old primary group is
     # also removed from the list. Otherwise, if a user's gid is being changed
     # and their old primary group is reassigned as an additional group, Salt
     # will not properly detect the need for the change.
     if old_default_grp != default_grp and old_default_grp in lusr["groups"]:
-        lusr["groups"].remove(old_default_grp)
+        if old_default_grp in salt.utils.data.flatten(dupe_groups.values()):
+            dupe_gid = __salt__["file.group_to_gid"](old_default_grp)
+            for gname in dupe_groups[dupe_gid]:
+                lusr["groups"].remove(gname)
+        else:
+            lusr["groups"].remove(old_default_grp)
     # If there's a group by the same name as the user, remove it from the list
     # for comparison purposes.
     if name in lusr["groups"] and name not in wanted_groups:
-        lusr["groups"].remove(name)
-    # Remove default group from wanted_groups, as this requirement is
-    # already met
-    if default_grp in wanted_groups:
-        wanted_groups.remove(default_grp)
+        if name in salt.utils.data.flatten(dupe_groups.values()):
+            dupe_gid = __salt__["file.group_to_gid"](name)
+            for gname in dupe_groups[dupe_gid]:
+                lusr["groups"].remove(gname)
+        else:
+            lusr["groups"].remove(name)
     if _group_changes(lusr["groups"], wanted_groups, remove_groups):
-        change["groups"] = wanted_groups
+        if wanted_groups or remove_groups:
+            change["groups"] = wanted_groups
     if home and lusr["home"] != home:
         change["home"] = home
     if createhome:
@@ -164,6 +211,10 @@ def _changes(
         ):
             change["password_lock"] = password_lock
     elif "shadow.info" in __salt__ and salt.utils.platform.is_windows():
+        if password and not empty_password and enforce_password:
+            if "shadow.verify_password" in __salt__:
+                if not __salt__["shadow.verify_password"](name, password):
+                    change["passwd"] = password
         if (
             expire
             and expire != -1
@@ -247,6 +298,7 @@ def present(
     remove_groups=True,
     home=None,
     createhome=True,
+    persist_home=False,
     password=None,
     hash_password=False,
     enforce_password=True,
@@ -345,6 +397,10 @@ def present(
 
             Additionally, parent directories will *not* be created. The parent
             directory for ``home`` must already exist.
+
+    persist_home : False
+        If set to ``True`` and not on Windows or Darwin, move contents of the
+        home directory to the new location
 
     nologinit : False
         If set to ``True``, it will not add the user to lastlog and faillog
@@ -530,25 +586,36 @@ def present(
         "name": name,
         "changes": {},
         "result": True,
-        "comment": "User {} is present and up to date".format(name),
+        "comment": f"User {name} is present and up to date",
     }
 
     # the comma is used to separate field in GECOS, thus resulting into
     # salt adding the end of fullname each time this function is called
     for gecos_field in [fullname, roomnumber, workphone]:
         if isinstance(gecos_field, str) and "," in gecos_field:
-            ret["comment"] = "Unsupported char ',' in {}".format(gecos_field)
+            ret["comment"] = f"Unsupported char ',' in {gecos_field}"
             ret["result"] = False
             return ret
 
+    missing_groups = []
     if groups:
         missing_groups = [x for x in groups if not __salt__["group.info"](x)]
         if missing_groups:
-            ret["comment"] = "The following group(s) are not present: {}".format(
-                ",".join(missing_groups)
-            )
-            ret["result"] = False
-            return ret
+            if __opts__.get("test"):
+                # In test mode, a missing group is not necessarily an error:
+                # a `group.present` requisite may create it during the real
+                # run. Note the missing groups in the result, drop them from
+                # the membership check below (they cannot be diffed against
+                # the user's current groups since they do not yet exist),
+                # and let the rest of the function report whatever else
+                # would change. Issue #68110.
+                groups = [x for x in groups if x not in missing_groups]
+            else:
+                ret["comment"] = "The following group(s) are not present: {}".format(
+                    ",".join(missing_groups)
+                )
+                ret["result"] = False
+                return ret
 
     if optional_groups:
         present_optgroups = [x for x in optional_groups if __salt__["group.info"](x)]
@@ -629,7 +696,11 @@ def present(
                     val = "XXX-REDACTED-XXX"
                 elif key == "group" and not remove_groups:
                     key = "ensure groups"
-                ret["comment"] += "{}: {}\n".format(key, val)
+                ret["comment"] += f"{key}: {val}\n"
+            if missing_groups:
+                ret["comment"] += "groups (pending creation): {}\n".format(
+                    ",".join(missing_groups)
+                )
             return ret
         # The user is present
         if "shadow.info" in __salt__:
@@ -640,6 +711,7 @@ def present(
 
         # Make changes
 
+        _passwd_changed = "passwd" in changes and not empty_password
         if "passwd" in changes:
             del changes["passwd"]
             if not empty_password:
@@ -669,7 +741,7 @@ def present(
             if __grains__["kernel"] in ("Darwin", "Windows"):
                 __salt__["user.chhome"](name, val)
             else:
-                __salt__["user.chhome"](name, val, persist=False)
+                __salt__["user.chhome"](name, val, persist=persist_home)
 
         _homedir_changed = False
         if "home" in changes:
@@ -727,11 +799,9 @@ def present(
         # NOTE: list(changes) required here to avoid modifying dictionary
         # during iteration.
         for key in [
-            x
-            for x in list(changes)
-            if x != "groups" and "user.ch{}".format(x) in __salt__
+            x for x in list(changes) if x != "groups" and f"user.ch{x}" in __salt__
         ]:
-            __salt__["user.ch{}".format(key)](name, changes.pop(key))
+            __salt__[f"user.ch{key}"](name, changes.pop(key))
 
         # Do group changes last
         if "groups" in changes:
@@ -759,10 +829,14 @@ def present(
                         ret["changes"][key] = "XXX-REDACTED-XXX"
                     else:
                         ret["changes"][key] = spost[key]
+        if salt.utils.platform.is_windows() and _passwd_changed:
+            ret["changes"]["passwd"] = "XXX-REDACTED-XXX"
+            ret["changes"].pop("password_changed", None)
+            ret["changes"].pop("lstchg", None)
         if __grains__["kernel"] in ("OpenBSD", "FreeBSD") and lcpost != lcpre:
             ret["changes"]["loginclass"] = lcpost
         if ret["changes"]:
-            ret["comment"] = "Updated user {}".format(name)
+            ret["comment"] = f"Updated user {name}"
         changes = _changes(
             name,
             uid,
@@ -802,7 +876,7 @@ def present(
         # first time we ran _changes().
 
         if changes:
-            ret["comment"] = "These values could not be changed: {}".format(changes)
+            ret["comment"] = f"These values could not be changed: {changes}"
             ret["result"] = False
         return ret
 
@@ -810,7 +884,11 @@ def present(
         # The user is not present, make it!
         if __opts__["test"]:
             ret["result"] = None
-            ret["comment"] = "User {} set to be added".format(name)
+            ret["comment"] = f"User {name} set to be added"
+            if missing_groups:
+                ret["comment"] += " (pending groups: {})".format(
+                    ",".join(missing_groups)
+                )
             return ret
         if groups and present_optgroups:
             groups.extend(present_optgroups)
@@ -853,7 +931,7 @@ def present(
             }
         result = __salt__["user.add"](**params)
         if result is True:
-            ret["comment"] = "New user {} created".format(name)
+            ret["comment"] = f"New user {name} created"
             ret["changes"] = __salt__["user.info"](name)
             if not createhome:
                 # pwd incorrectly reports presence of home
@@ -867,10 +945,10 @@ def present(
                     __salt__["shadow.set_password"](name, password)
                     spost = __salt__["shadow.info"](name)
                     if spost["passwd"] != password:
-                        ret[
-                            "comment"
-                        ] = "User {} created but failed to set password to {}".format(
-                            name, "XXX-REDACTED-XXX"
+                        ret["comment"] = (
+                            "User {} created but failed to set password to {}".format(
+                                name, "XXX-REDACTED-XXX"
+                            )
                         )
                         ret["result"] = False
                     ret["changes"]["password"] = "XXX-REDACTED-XXX"
@@ -878,9 +956,9 @@ def present(
                     __salt__["shadow.del_password"](name)
                     spost = __salt__["shadow.info"](name)
                     if spost["passwd"] != "":
-                        ret[
-                            "comment"
-                        ] = "User {} created but failed to empty password".format(name)
+                        ret["comment"] = (
+                            f"User {name} created but failed to empty password"
+                        )
                         ret["result"] = False
                     ret["changes"]["password"] = ""
                 if date is not None:
@@ -931,10 +1009,10 @@ def present(
                     __salt__["shadow.set_warndays"](name, warndays)
                     spost = __salt__["shadow.info"](name)
                     if spost["warn"] != warndays:
-                        ret[
-                            "comment"
-                        ] = "User {} created but failed to set warn days to {}".format(
-                            name, warndays
+                        ret["comment"] = (
+                            "User {} created but failed to set warn days to {}".format(
+                                name, warndays
+                            )
                         )
                         ret["result"] = False
                     ret["changes"]["warndays"] = warndays
@@ -952,10 +1030,10 @@ def present(
             elif salt.utils.platform.is_windows():
                 if password and not empty_password:
                     if not __salt__["user.setpassword"](name, password):
-                        ret[
-                            "comment"
-                        ] = "User {} created but failed to set password to {}".format(
-                            name, "XXX-REDACTED-XXX"
+                        ret["comment"] = (
+                            "User {} created but failed to set password to {}".format(
+                                name, "XXX-REDACTED-XXX"
+                            )
                         )
                         ret["result"] = False
                     ret["changes"]["passwd"] = "XXX-REDACTED-XXX"
@@ -974,10 +1052,10 @@ def present(
                     ret["changes"]["expiration_date"] = spost["expire"]
             elif salt.utils.platform.is_darwin() and password and not empty_password:
                 if not __salt__["shadow.set_password"](name, password):
-                    ret[
-                        "comment"
-                    ] = "User {} created but failed to set password to {}".format(
-                        name, "XXX-REDACTED-XXX"
+                    ret["comment"] = (
+                        "User {} created but failed to set password to {}".format(
+                            name, "XXX-REDACTED-XXX"
+                        )
                     )
                     ret["result"] = False
                 ret["changes"]["passwd"] = "XXX-REDACTED-XXX"
@@ -987,7 +1065,7 @@ def present(
             if isinstance(result, str):
                 ret["comment"] = result
             else:
-                ret["comment"] = "Failed to create new user {}".format(name)
+                ret["comment"] = f"Failed to create new user {name}"
             ret["result"] = False
     return ret
 
@@ -1015,7 +1093,7 @@ def absent(name, purge=False, force=False):
         # The user is present, make it not present
         if __opts__["test"]:
             ret["result"] = None
-            ret["comment"] = "User {} set for removal".format(name)
+            ret["comment"] = f"User {name} set for removal"
             return ret
         beforegroups = set(salt.utils.user.get_group_list(name))
         ret["result"] = __salt__["user.delete"](name, purge, force)
@@ -1023,14 +1101,14 @@ def absent(name, purge=False, force=False):
         if ret["result"]:
             ret["changes"] = {}
             for g in beforegroups - aftergroups:
-                ret["changes"]["{} group".format(g)] = "removed"
+                ret["changes"][f"{g} group"] = "removed"
             ret["changes"][name] = "removed"
-            ret["comment"] = "Removed user {}".format(name)
+            ret["comment"] = f"Removed user {name}"
         else:
             ret["result"] = False
-            ret["comment"] = "Failed to remove user {}".format(name)
+            ret["comment"] = f"Failed to remove user {name}"
         return ret
 
-    ret["comment"] = "User {} is not present".format(name)
+    ret["comment"] = f"User {name} is not present"
 
     return ret

@@ -45,7 +45,6 @@ Using States to deploy a load balancer with extended arguments to specify region
 :depends: apache-libcloud
 """
 
-
 import logging
 
 log = logging.getLogger(__name__)
@@ -105,7 +104,7 @@ def balancer_present(
             profile,
             algorithm=algorithm,
             members=starting_members,
-            **libcloud_kwargs
+            **libcloud_kwargs,
         )
         return state_result(True, "Created new load balancer", name, balancer)
 

@@ -1,6 +1,7 @@
 """
 Tests for the archive state
 """
+
 import os
 import pathlib
 import shutil
@@ -45,7 +46,7 @@ class Archive:
 
     @src.default
     def _src(self):
-        return self.path / "{}_src_dir".format(self.fmt)
+        return self.path / f"{self.fmt}_src_dir"
 
     @src_file.default
     def _src_file(self):
@@ -53,11 +54,11 @@ class Archive:
 
     @archive.default
     def _archive(self):
-        return self.path / "archive.{}".format(self.fmt)
+        return self.path / f"archive.{self.fmt}"
 
     @dst.default
     def _dst(self):
-        return self.path / "{}_dst_dir".format(self.fmt)
+        return self.path / f"{self.fmt}_dst_dir"
 
     @filename.default
     def _filename(self):
@@ -150,7 +151,7 @@ def archive(modules):
 
 
 def unicode_filename_ids(value):
-    return "unicode_filename={}".format(value)
+    return f"unicode_filename={value}"
 
 
 @pytest.fixture(params=[True, False], ids=unicode_filename_ids)
@@ -392,3 +393,41 @@ def test_tar_list_with_similar_top_level_dirs(archive, tmp_path):
         str(tmp_path / "tld_test.tar.gz"), archive_format="tar", verbose=True
     )
     assert ret == expected
+
+
+@pytest.mark.skip_on_windows
+def test_tar_list_no_directory_members_only_files_68227(archive, tmp_path):
+    """
+    Regression test for issue 68227.
+
+    Some tar archives (e.g. Oracle's GraalVM JDK distribution) contain only
+    file members and no explicit directory members, even though all files
+    share a common top-level directory prefix. ``archive.list`` should still
+    report that common prefix as the top-level directory so that
+    ``archive.extracted`` can enforce user/group ownership on it.
+    """
+    import io
+    import tarfile
+
+    archive_path = tmp_path / "no_dir_members.tar.gz"
+    # Build the archive directly with tarfile so we can guarantee that no
+    # directory members are written. ``tar -cvzf`` always emits an entry for
+    # the containing directory.
+    with tarfile.open(str(archive_path), "w:gz") as tar:
+        for rel in ("LICENSE.txt", "GRAALVM-README.md", "bin/java"):
+            data = b"x"
+            info = tarfile.TarInfo(name="graalvm-jdk-21.0.8+12.1/" + rel)
+            info.size = len(data)
+            tar.addfile(info, fileobj=io.BytesIO(data))
+
+    # Sanity-check the archive only has file members
+    with tarfile.open(str(archive_path)) as tar:
+        assert not any(m.isdir() for m in tar.getmembers())
+
+    ret = archive.list(str(archive_path), archive_format="tar", verbose=True)
+    assert ret["dirs"] == []
+    assert "graalvm-jdk-21.0.8+12.1/" in ret["top_level_dirs"], (
+        "Expected the common file prefix to be reported as a top-level "
+        "directory so that archive.extracted can enforce ownership on it; "
+        f"got top_level_dirs={ret['top_level_dirs']!r}"
+    )

@@ -4,6 +4,7 @@ import shutil
 import tempfile
 import textwrap
 import uuid
+from collections import OrderedDict
 
 import jinja2
 import pytest
@@ -12,7 +13,6 @@ import salt.config
 import salt.state
 import salt.utils.files
 from salt.template import compile_template
-from salt.utils.odict import OrderedDict
 from salt.utils.pyobjects import (
     DuplicateState,
     InvalidFunction,
@@ -23,6 +23,10 @@ from salt.utils.pyobjects import (
 )
 from tests.support.runtests import RUNTIME_VARS
 from tests.support.unit import TestCase
+
+pytestmark = [
+    pytest.mark.timeout_unless_on_windows(240),
+]
 
 log = logging.getLogger(__name__)
 
@@ -128,7 +132,7 @@ class StateTests(TestCase):
             "file",
             "managed",
             require=self.File("/usr/local/bin"),
-            **self.pydmesg_kwargs
+            **self.pydmesg_kwargs,
         )
 
         self.assertEqual(f(), self.pydmesg_expected)
@@ -137,7 +141,7 @@ class StateTests(TestCase):
         self.File.managed(
             "/usr/local/bin/pydmesg",
             require=self.File("/usr/local/bin"),
-            **self.pydmesg_kwargs
+            **self.pydmesg_kwargs,
         )
 
         self.assertEqual(
@@ -174,7 +178,7 @@ class StateTests(TestCase):
         self.File.managed(
             "/usr/local/bin/pydmesg",
             require=self.File("/usr/local/bin"),
-            **self.pydmesg_kwargs
+            **self.pydmesg_kwargs,
         )
 
         self.assertEqual(

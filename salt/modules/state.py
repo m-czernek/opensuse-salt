@@ -10,6 +10,7 @@ highdata and won't hit the fileserver except for ``salt://`` links in the
 states themselves.
 """
 
+import base64
 import logging
 import os
 import shutil
@@ -17,12 +18,14 @@ import sys
 import tarfile
 import tempfile
 import time
+from collections import OrderedDict
 
 import salt.config
 import salt.defaults.exitcodes
 import salt.payload
 import salt.state
 import salt.utils.args
+import salt.utils.atomicfile
 import salt.utils.data
 import salt.utils.event
 import salt.utils.files
@@ -32,15 +35,14 @@ import salt.utils.jid
 import salt.utils.json
 import salt.utils.msgpack
 import salt.utils.platform
+import salt.utils.process
 import salt.utils.state
 import salt.utils.stringutils
-import salt.utils.tarfileutil
 import salt.utils.url
 import salt.utils.versions
 from salt.exceptions import CommandExecutionError, SaltInvocationError
 from salt.loader import _format_cached_grains
 from salt.runners.state import orchestrate as _orchestrate
-from salt.utils.odict import OrderedDict
 
 __proxyenabled__ = ["*"]
 
@@ -126,11 +128,15 @@ def _wait(jid, max_queue=0):
     """
     if jid is None:
         jid = salt.utils.jid.gen_jid(__opts__)
-    states = _prior_running_states(jid)
+
+    with salt.utils.state.acquire_queue_lock(__opts__):
+        states = _prior_running_states(jid)
+
     if not max_queue or len(states) < max_queue:
         while states:
             time.sleep(1)
-            states = _prior_running_states(jid)
+            with salt.utils.state.acquire_queue_lock(__opts__):
+                states = _prior_running_states(jid)
         return True
     return False
 
@@ -146,7 +152,7 @@ def _snapper_pre(opts, jid):
             snapper_pre = __salt__["snapper.create_snapshot"](
                 config=__opts__.get("snapper_states_config", "root"),
                 snapshot_type="pre",
-                description="Salt State run for jid {}".format(jid),
+                description=f"Salt State run for jid {jid}",
                 __pub_jid=jid,
             )
     except Exception:  # pylint: disable=broad-except
@@ -165,7 +171,7 @@ def _snapper_post(opts, jid, pre_num):
                 config=__opts__.get("snapper_states_config", "root"),
                 snapshot_type="post",
                 pre_number=pre_num,
-                description="Salt State run for jid {}".format(jid),
+                description=f"Salt State run for jid {jid}",
                 __pub_jid=jid,
             )
     except Exception:  # pylint: disable=broad-except
@@ -380,7 +386,21 @@ def running(concurrent=False):
     if concurrent:
         return ret
     active = __salt__["saltutil.is_running"]("state.*")
+
+    # Get the current JID to avoid false positives (self-detection)
+    # This prevents failures when state.apply(queue=False) is called
+    # but the job has a placeholder in the process table.
+    current_jid = __opts__.get("jid")
+
     for data in active:
+        # Ignore self
+        if current_jid is not None:
+            try:
+                if int(data.get("jid")) == int(current_jid):
+                    continue
+            except (ValueError, TypeError):
+                pass
+
         err = (
             'The function "{}" is running as PID {} and was started at {} '
             "with jid {}".format(
@@ -394,22 +414,56 @@ def running(concurrent=False):
     return ret
 
 
+def _acquire_queue_lock():
+    """
+    Acquire the state queue lock
+    """
+    return salt.utils.state.acquire_queue_lock(__opts__)
+
+
+def _set_queue_flag(jid):
+    """
+    Set a flag to indicate that the state run is checking the queue
+    """
+    if jid is None:
+        return
+    queue_dir = salt.utils.state.state_queue_dir(__opts__)
+    queue_path = os.path.join(queue_dir, str(jid))
+    if not os.path.exists(queue_dir):
+        try:
+            os.makedirs(queue_dir)
+        except OSError:
+            pass
+
+    with _acquire_queue_lock():
+        with salt.utils.files.fopen(queue_path, "w+") as fp_:
+            fp_.write(str(os.getpid()))
+
+
+def _clear_queue_flag(jid):
+    """
+    Clear the queue flag
+    """
+    if jid is None:
+        return
+    queue_dir = salt.utils.state.state_queue_dir(__opts__)
+    queue_path = os.path.join(queue_dir, str(jid))
+
+    with _acquire_queue_lock():
+        if os.path.exists(queue_path):
+            try:
+                os.remove(queue_path)
+            except OSError:
+                pass
+
+
 def _prior_running_states(jid):
     """
     Return a list of dicts of prior calls to state functions.  This function is
     used to queue state calls so only one is run at a time.
     """
-
-    ret = []
     active = __salt__["saltutil.is_running"]("state.*")
-    for data in active:
-        try:
-            data_jid = int(data["jid"])
-        except ValueError:
-            continue
-        if data_jid < int(jid):
-            ret.append(data)
-    return ret
+    return salt.utils.state.check_prior_running_states(__opts__, jid, active)
 
 
 def _check_queue(queue, kwargs):
@@ -421,11 +475,95 @@ def _check_queue(queue, kwargs):
         queue = __salt__["config.option"]("state_queue", False)
 
     if queue is True:
-        _wait(kwargs.get("__pub_jid"))
+        jid = kwargs.get("__pub_jid")
+        if jid is None:
+            # If running locally (salt-call), JID might be in opts or not present.
+            # Fallback to __opts__['jid'] to ensure we have a JID for comparison.
+            jid = __opts__.get("jid")
+
+        with salt.utils.state.acquire_queue_lock(__opts__):
+            states = _prior_running_states(jid)
+            if states:
+                # Conflict found, queue the job
+                queue_dir = salt.utils.state.state_queue_dir(__opts__)
+                if not os.path.exists(queue_dir):
+                    try:
+                        os.makedirs(queue_dir)
+                    except OSError:
+                        pass
+
+                # Construct payload to persist
+                # We need to save enough info to re-execute the job.
+                #
+                # Preserve the master-assigned JID end-to-end (issue #69386).
+                # Job-tracking infrastructure (returners, the jobs runner,
+                # syndic forwarding) keys on the JID the master published; if
+                # the minion executes under a different JID the master never
+                # sees the return.
+                #
+                # Only mint a new JID when one wasn't supplied — that is the
+                # salt-call / local case, where the minion is both publisher
+                # and executor and no master-side tracking is involved.
+                # Filename uniqueness is provided by the microsecond-precision
+                # timestamp prefix, so we do not need a fresh JID for that.
+                queued_jid = jid
+                if queued_jid is None:
+                    queued_jid = salt.utils.jid.gen_jid(__opts__)
+
+                # Remove 'queue' from kwargs to prevent re-queuing logic when executed
+                kwarg = {k: v for k, v in kwargs.items() if not k.startswith("__pub_")}
+                if "queue" in kwarg:
+                    del kwarg["queue"]
+
+                payload = {
+                    "fun": kwargs.get("__pub_fun"),
+                    "arg": kwargs.get("__pub_arg", []),
+                    "tgt": kwargs.get("__pub_tgt"),
+                    "jid": queued_jid,
+                    "ret": kwargs.get("__pub_ret", ""),
+                    "user": kwargs.get("__pub_user", "root"),
+                    "kwarg": kwarg,
+                }
+
+                # Use timestamp to ensure FIFO ordering
+                # We use microseconds to avoid collisions
+                fn = f"queued_{int(time.time() * 1000000)}_{queued_jid}.p"
+                path = os.path.join(queue_dir, fn)
+
+                try:
+                    tmp_path = path + ".tmp"
+                    with salt.utils.files.fopen(tmp_path, "w+b") as fp_:
+                        salt.payload.dump(payload, fp_)
+                    salt.utils.atomicfile.atomic_rename(tmp_path, path)
+
+                    return {
+                        "result": True,
+                        "comment": "Job queued for execution",
+                        "queued": True,
+                        "changes": {},
+                        "__no_return__": True,
+                    }
+                except OSError:
+                    log.error("Failed to write queue file %s", path)
+                    return {
+                        "result": False,
+                        "comment": "Failed to queue job: unable to write queue file",
+                        "changes": {},
+                    }
+            else:
+                # No conflict, we can run.
+                pass
+
     else:
         queue_ret = False
         if not isinstance(queue, bool) and isinstance(queue, int):
-            queue_ret = _wait(kwargs.get("__pub_jid"), max_queue=queue)
+            jid = kwargs.get("__pub_jid")
+            # For max_queue (int), we retain blocking behavior but use lock
+            _set_queue_flag(jid)
+            try:
+                queue_ret = _wait(jid, max_queue=queue)
+            finally:
+                _clear_queue_flag(jid)
 
         if not queue_ret:
             conflict = running(concurrent=kwargs.get("concurrent", False))
@@ -489,8 +627,8 @@ def _get_test_value(test=None, **kwargs):
             ret = True
         else:
             ret = __opts__.get("test", None)
-    else:
-        ret = test
+    elif test is False:
+        ret = False
     return ret
 
 
@@ -588,7 +726,7 @@ def template(tem, queue=None, **kwargs):
             raise CommandExecutionError("Pillar failed to render", info=errors)
 
         if not tem.endswith(".sls"):
-            tem = "{sls}.sls".format(sls=tem)
+            tem = f"{tem}.sls"
         high_state, errors = st_.render_state(
             tem, kwargs.get("saltenv", ""), "", None, local=True
         )
@@ -638,7 +776,8 @@ def apply_(mods=None, **kwargs):
 
     .. rubric:: APPLYING ALL STATES CONFIGURED IN TOP.SLS (A.K.A. :ref:`HIGHSTATE <running-highstate>`)
 
-    To apply all configured states, simply run ``state.apply``:
+    To apply all configured states, simply run ``state.apply`` with no SLS
+    targets, like so:
 
     .. code-block:: bash
 
@@ -685,8 +824,10 @@ def apply_(mods=None, **kwargs):
         a value of ``True`` will queue the new state run to begin running once
         the other has finished.
 
-        This option starts a new thread for each queued state run, so use this
-        option sparingly.
+        The queue is implemented as a disk-based FIFO queue, minimizing memory usage
+        regardless of queue depth. Jobs in the state queue are processed by a background
+        thread and will bypass ``process_count_max`` limits when they are
+        ready to execute, ensuring they are not starved by other workloads.
 
         .. versionchanged:: 3006.0
             This parameter can also be set via the ``state_queue`` configuration
@@ -758,8 +899,10 @@ def apply_(mods=None, **kwargs):
         a value of ``True`` will queue the new state run to begin running once
         the other has finished.
 
-        This option starts a new thread for each queued state run, so use this
-        option sparingly.
+        The queue is implemented as a disk-based FIFO queue, minimizing memory usage
+        regardless of queue depth. Jobs in the state queue are processed by a background
+        thread and will bypass ``process_count_max`` limits when they are
+        ready to execute, ensuring they are not starved by other workloads.
 
         .. versionchanged:: 3006.0
             This parameter can also be set via the ``state_queue`` configuration
@@ -883,7 +1026,7 @@ def request(mods=None, **kwargs):
         try:
             if salt.utils.platform.is_windows():
                 # Make sure cache file isn't read-only
-                __salt__["cmd.run"]('attrib -R "{}"'.format(notify_path))
+                __salt__["cmd.run"](f'attrib -R "{notify_path}"')
             with salt.utils.files.fopen(notify_path, "w+b") as fp_:
                 salt.payload.dump(req, fp_)
         except OSError:
@@ -945,7 +1088,7 @@ def clear_request(name=None):
             try:
                 if salt.utils.platform.is_windows():
                     # Make sure cache file isn't read-only
-                    __salt__["cmd.run"]('attrib -R "{}"'.format(notify_path))
+                    __salt__["cmd.run"](f'attrib -R "{notify_path}"')
                 with salt.utils.files.fopen(notify_path, "w+b") as fp_:
                     salt.payload.dump(req, fp_)
             except OSError:
@@ -1052,8 +1195,10 @@ def highstate(test=None, queue=None, state_events=None, **kwargs):
         a value of ``True`` will queue the new state run to begin running once
         the other has finished.
 
-        This option starts a new thread for each queued state run, so use this
-        option sparingly.
+        The queue is implemented as a disk-based FIFO queue, minimizing memory usage
+        regardless of queue depth. Jobs in the state queue are processed by a background
+        thread and will bypass ``process_count_max`` limits when they are
+        ready to execute, ensuring they are not starved by other workloads.
 
         .. versionchanged:: 3006.0
             This parameter can also be set via the ``state_queue`` configuration
@@ -1215,7 +1360,7 @@ def sls(
     queue=None,
     sync_mods=None,
     state_events=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Execute the states in one or more SLS files
@@ -1262,8 +1407,10 @@ def sls(
         a value of ``True`` will queue the new state run to begin running once
         the other has finished.
 
-        This option starts a new thread for each queued state run, so use this
-        option sparingly.
+        The queue is implemented as a disk-based FIFO queue, minimizing memory usage
+        regardless of queue depth. Jobs in the state queue are processed by a background
+        thread and will bypass ``process_count_max`` limits when they are
+        ready to execute, ensuring they are not starved by other workloads.
 
         .. versionchanged:: 3006.0
             This parameter can also be set via the ``state_queue`` configuration
@@ -1414,7 +1561,7 @@ def sls(
 
     for module_type in sync_mods:
         try:
-            __salt__["saltutil.sync_{}".format(module_type)](saltenv=opts["saltenv"])
+            __salt__[f"saltutil.sync_{module_type}"](saltenv=opts["saltenv"])
         except KeyError:
             log.warning("Invalid custom module type '%s', ignoring", module_type)
 
@@ -1527,8 +1674,10 @@ def top(topfn, test=None, queue=None, **kwargs):
         a value of ``True`` will queue the new state run to begin running once
         the other has finished.
 
-        This option starts a new thread for each queued state run, so use this
-        option sparingly.
+        The queue is implemented as a disk-based FIFO queue, minimizing memory usage
+        regardless of queue depth. Jobs in the state queue are processed by a background
+        thread and will bypass ``process_count_max`` limits when they are
+        ready to execute, ensuring they are not starved by other workloads.
 
         .. versionchanged:: 3006.0
             This parameter can also be set via the ``state_queue`` configuration
@@ -2340,12 +2489,12 @@ def pkg(pkg_path, pkg_sum, hash_type, test=None, **kwargs):
     members = s_pkg.getmembers()
     for member in members:
         if salt.utils.stringutils.to_unicode(member.path).startswith(
-            (os.sep, "..{}".format(os.sep))
+            (os.sep, f"..{os.sep}")
         ):
             return {}
-        elif "..{}".format(os.sep) in salt.utils.stringutils.to_unicode(member.path):
+        elif f"..{os.sep}" in salt.utils.stringutils.to_unicode(member.path):
             return {}
-    salt.utils.tarfileutil.extractall(s_pkg, root)  # nosec B202
+    s_pkg.extractall(root)  # nosec
     s_pkg.close()
     lowstate_json = os.path.join(root, "lowstate.json")
     with salt.utils.files.fopen(lowstate_json, "r") as fp_:
@@ -2421,9 +2570,9 @@ def disable(states):
     _changed = False
     for _state in states:
         if _state in _disabled_state_runs:
-            msg.append("Info: {} state already disabled.".format(_state))
+            msg.append(f"Info: {_state} state already disabled.")
         else:
-            msg.append("Info: {} state disabled.".format(_state))
+            msg.append(f"Info: {_state} state disabled.")
             _disabled_state_runs.append(_state)
             _changed = True
 
@@ -2471,9 +2620,9 @@ def enable(states):
     for _state in states:
         log.debug("_state %s", _state)
         if _state not in _disabled_state_runs:
-            msg.append("Info: {} state already enabled.".format(_state))
+            msg.append(f"Info: {_state} state already enabled.")
         else:
-            msg.append("Info: {} state enabled.".format(_state))
+            msg.append(f"Info: {_state} state enabled.")
             _disabled_state_runs.remove(_state)
             _changed = True
 
@@ -2542,6 +2691,20 @@ def _disabled(funs):
     return ret
 
 
+def _json_safe(obj):
+    """
+    JSON ``default`` fallback for objects that ``json.dumps`` cannot natively
+    serialize. Event payloads may contain raw ``bytes`` (e.g. DER-encoded
+    certificates returned by ``x509.sign_remote_certificate``) that are not
+    valid UTF-8 and therefore cannot be decoded to ``str``; emit them as
+    base64-encoded ASCII so the stream stays valid JSON instead of aborting
+    the runner.
+    """
+    if isinstance(obj, (bytes, bytearray)):
+        return base64.b64encode(bytes(obj)).decode("ascii")
+    raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
+
+
 def event(
     tagmatch="*", count=-1, quiet=False, sock_dir=None, pretty=False, node="minion"
 ):
@@ -2591,9 +2754,10 @@ def event(
                         "{}\t{}".format(
                             salt.utils.stringutils.to_str(ret["tag"]),
                             salt.utils.json.dumps(
-                                salt.utils.data.decode(ret["data"]),
+                                salt.utils.data.decode(ret["data"], keep=True),
                                 sort_keys=pretty,
                                 indent=None if not pretty else 4,
+                                default=_json_safe,
                             ),
                         )
                     )

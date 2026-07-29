@@ -17,10 +17,6 @@ __salt__ = {
 log = logging.getLogger(__name__)
 
 
-def __virtual__():
-    return __opts__.get("enable_lvm_grains", True)
-
-
 def lvm():
     """
     Return list of LVM devices
@@ -37,14 +33,12 @@ def _linux_lvm():
     ret = {}
     cmd = salt.utils.path.which("lvm")
     if cmd:
-        vgs = __salt__["cmd.run_all"]("{} vgs -o vg_name --noheadings".format(cmd))
+        vgs = __salt__["cmd.run_all"](f"{cmd} vgs -o vg_name --noheadings")
 
         for vg in vgs["stdout"].splitlines():
             vg = vg.strip()
             ret[vg] = []
-            lvs = __salt__["cmd.run_all"](
-                "{} lvs -o lv_name --noheadings {}".format(cmd, vg)
-            )
+            lvs = __salt__["cmd.run_all"](f"{cmd} lvs -o lv_name --noheadings {vg}")
             for lv in lvs["stdout"].splitlines():
                 ret[vg].append(lv.strip())
 
@@ -56,11 +50,11 @@ def _linux_lvm():
 def _aix_lvm():
     ret = {}
     cmd = salt.utils.path.which("lsvg")
-    vgs = __salt__["cmd.run"]("{}".format(cmd))
+    vgs = __salt__["cmd.run"](f"{cmd}")
 
     for vg in vgs.splitlines():
         ret[vg] = []
-        lvs = __salt__["cmd.run"]("{} -l {}".format(cmd, vg))
+        lvs = __salt__["cmd.run"](f"{cmd} -l {vg}")
         for lvline in lvs.splitlines()[2:]:
             lv = lvline.split(" ", 1)[0]
             ret[vg].append(lv)

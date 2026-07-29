@@ -4,11 +4,12 @@
 
 import logging
 import textwrap
+from collections import OrderedDict
 
 import pytest  # pylint: disable=unused-import
 
 import salt.state
-from salt.utils.odict import OrderedDict
+from salt.utils.datastructures import DefaultOrderedDict
 
 log = logging.getLogger(__name__)
 
@@ -352,3 +353,87 @@ def test_dont_extend_in_excluded_sls_file(highstate, state_tree_dir):
                 )
             ]
         )
+
+
+def test_verify_tops(highstate):
+    """
+    test basic functionality of verify_tops
+    """
+    tops = DefaultOrderedDict(OrderedDict)
+    tops["base"] = OrderedDict([("*", ["test", "test2"])])
+    matches = highstate.verify_tops(tops)
+    # [] means there where no errors when verifying tops
+    assert matches == []
+
+
+def test_verify_tops_not_dict(highstate):
+    """
+    test verify_tops when top data is not a dict
+    """
+    matches = highstate.verify_tops(["base", "test", "test2"])
+    assert matches == ["Top data was not formed as a dict"]
+
+
+def test_verify_tops_env_empty(highstate):
+    """
+    test verify_tops when the environment is empty
+    """
+    tops = DefaultOrderedDict(OrderedDict)
+    tops[""] = OrderedDict([("*", ["test", "test2"])])
+    matches = highstate.verify_tops(tops)
+    assert matches == ["Empty saltenv statement in top file"]
+
+
+def test_verify_tops_sls_not_list(highstate):
+    """
+    test verify_tops when the sls files are not a list
+    """
+    tops = DefaultOrderedDict(OrderedDict)
+    tops["base"] = OrderedDict([("*", "test test2")])
+    matches = highstate.verify_tops(tops)
+    # [] means there where no errors when verifying tops
+    assert matches == [
+        "Malformed topfile: state declarations for matcher '*' in saltenv"
+        " 'base' are not formed as a list (got str)"
+    ]
+
+
+def test_verify_tops_sls_none(highstate):
+    """
+    Regression test for #68792: when a top.sls target has no listed
+    states (e.g. ``'rhel9*':`` with nothing under it, which parses as
+    ``None``), the error must name the offending saltenv and target so
+    the user can locate the bad declaration.
+    """
+    tops = DefaultOrderedDict(OrderedDict)
+    tops["base"] = OrderedDict([("*", ["common"]), ("rhel9*", None)])
+    matches = highstate.verify_tops(tops)
+    assert matches == [
+        "Malformed topfile: state declarations for matcher 'rhel9*' in"
+        " saltenv 'base' are not formed as a list (got NoneType)"
+    ]
+
+
+def test_verify_tops_match(highstate):
+    """
+    test basic functionality of verify_tops when using a matcher
+    like `match: glob`.
+    """
+    tops = DefaultOrderedDict(OrderedDict)
+    tops["base"] = OrderedDict(
+        [("*", [OrderedDict([("match", "glob")]), "test", "test2"])]
+    )
+    matches = highstate.verify_tops(tops)
+    # [] means there where no errors when verifying tops
+    assert matches == []
+
+
+def test_verify_tops_match_none(highstate):
+    """
+    test basic functionality of verify_tops when using a matcher
+    when it is empty, like `match: ""`.
+    """
+    tops = DefaultOrderedDict(OrderedDict)
+    tops["base"] = OrderedDict([("*", [OrderedDict([("match", "")]), "test", "test2"])])
+    matches = highstate.verify_tops(tops)
+    assert "Improperly formatted top file matcher in saltenv" in matches[0]

@@ -4,10 +4,10 @@
 
 
 from __future__ import absolute_import, division, print_function
-from salt.ext.tornado.httputil import url_concat, parse_multipart_form_data, HTTPHeaders, format_timestamp, HTTPServerRequest, parse_request_start_line, parse_cookie, ParseMultipartConfig
-from salt.ext.tornado.httputil import HTTPInputError
+from salt.ext.tornado.httputil import url_concat, parse_multipart_form_data, HTTPHeaders, format_timestamp, HTTPServerRequest, parse_request_start_line, parse_cookie
 from salt.ext.tornado.escape import utf8, native_str
 from salt.ext.tornado.log import gen_log
+from salt.ext.tornado.testing import ExpectLog
 from salt.ext.tornado.test.util import unittest
 
 import copy
@@ -141,8 +141,6 @@ Foo
                      'a";";.txt',
                      'a\\"b.txt',
                      'a\\b.txt',
-                     'a b.txt',
-                     'a\tb.txt',
                      ]
         for filename in filenames:
             logging.debug("trying filename %r", filename)
@@ -159,29 +157,6 @@ Foo
             file = files["files"][0]
             self.assertEqual(file["filename"], filename)
             self.assertEqual(file["body"], b"Foo")
-
-    def test_invalid_chars(self):
-        filenames = [
-            "a\rb.txt",
-            "a\0b.txt",
-            "a\x08b.txt",
-        ]
-        for filename in filenames:
-            str_data = b'''\
---1234
-Content-Disposition: form-data; name="files"; filename="%s"
-
-Foo
---1234--''' % filename.replace(
-                "\\", "\\\\"
-            ).replace(
-                '"', '\\"'
-            )
-            data = utf8(str_data.replace(b"\n", b"\r\n"))
-            args, files = form_data_args()
-            with self.assertRaises(HTTPInputError) as cm:
-                parse_multipart_form_data(b"1234", data, args, files)
-            self.assertIn("Invalid header value", str(cm.exception))
 
     def test_boundary_starts_and_ends_with_quotes(self):
         data = b'''\
@@ -205,9 +180,7 @@ Foo
 --1234--'''.replace(b"\n", b"\r\n")
         args = {}
         files = {}
-        with self.assertRaises(
-            HTTPInputError, msg="multipart/form-data missing headers"
-        ):
+        with ExpectLog(gen_log, "multipart/form-data missing headers"):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -220,7 +193,7 @@ Foo
 --1234--'''.replace(b"\n", b"\r\n")
         args = {}
         files = {}
-        with self.assertRaises(HTTPInputError, msg="Invalid multipart/form-data"):
+        with ExpectLog(gen_log, "Invalid multipart/form-data"):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -232,7 +205,7 @@ Content-Disposition: form-data; name="files"; filename="ab.txt"
 Foo--1234--'''.replace(b"\n", b"\r\n")
         args = {}
         files = {}
-        with self.assertRaises(HTTPInputError, msg="Invalid multipart/form-data"):
+        with ExpectLog(gen_log, "Invalid multipart/form-data"):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -245,9 +218,7 @@ Foo
 --1234--""".replace(b"\n", b"\r\n")
         args = {}
         files = {}
-        with self.assertRaises(
-            HTTPInputError, msg="multipart/form-data value missing name"
-        ):
+        with ExpectLog(gen_log, "multipart/form-data value missing name"):
             parse_multipart_form_data(b"1234", data, args, files)
         self.assertEqual(files, {})
 
@@ -289,44 +260,9 @@ Foo
             return time.time() - start
 
         d1 = f(1_000)
-        # Note that headers larger than this are blocked by the default configuration.
         d2 = f(10_000)
         if d2 / d1 > 20:
-            self.fail(f"Disposition param parsing is not linear: d1={d1} vs d2={d2}")
-
-    def test_multipart_config(self):
-        boundary = b"1234"
-        body = b"""--1234
-Content-Disposition: form-data; name="files"; filename="ab.txt"
-
---1234--""".replace(
-            b"\n", b"\r\n"
-        )
-        config = ParseMultipartConfig()
-        args, files = form_data_args()
-        parse_multipart_form_data(boundary, body, args, files, config=config)
-        self.assertEqual(files["files"][0]["filename"], "ab.txt")
-
-        config_no_parts = ParseMultipartConfig(max_parts=0)
-        with self.assertRaises(HTTPInputError) as cm:
-            parse_multipart_form_data(
-                boundary, body, args, files, config=config_no_parts
-            )
-        self.assertIn("too many parts", str(cm.exception))
-
-        config_small_headers = ParseMultipartConfig(max_part_header_size=10)
-        with self.assertRaises(HTTPInputError) as cm:
-            parse_multipart_form_data(
-                boundary, body, args, files, config=config_small_headers
-            )
-        self.assertIn("header too large", str(cm.exception))
-
-        config_disabled = ParseMultipartConfig(enabled=False)
-        with self.assertRaises(HTTPInputError) as cm:
-            parse_multipart_form_data(
-                boundary, body, args, files, config=config_disabled
-            )
-        self.assertIn("multipart/form-data parsing is disabled", str(cm.exception))
+            self.fail(f"Disposition param parsing is not linear: {d1=} vs {d2=}")
 
 
 class HTTPHeadersTest(unittest.TestCase):
@@ -451,20 +387,6 @@ Foo: even
         headers2 = HTTPHeaders.parse(str(headers))
         self.assertEquals(headers, headers2)
 
-    def test_linear_performance(self):
-        def f(n):
-            start = time.time()
-            headers = HTTPHeaders()
-            for i in range(n):
-                headers.add("X-Foo", "bar")
-            return time.time() - start
-
-        # This runs under 50ms on my laptop as of 2025-12-09.
-        d1 = f(10000)
-        d2 = f(100000)
-        if d2 / d1 > 20:
-            # d2 should be about 10x d1 but allow a wide margin for variability.
-            self.fail("HTTPHeaders.add() does not scale linearly: %s vs %s" % (d1, d2))
 
 class FormatTimestampTest(unittest.TestCase):
     # Make sure that all the input types are supported.

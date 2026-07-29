@@ -96,6 +96,14 @@ The user to run the Salt processes
 
     user: root
 
+.. note::
+
+    Starting with version `3006.0`, Salt's offical packages ship with a default
+    configuration which runs the Master as a non-priviledged user. The Master's
+    configuration file has the `user` option set to `user: salt`. Unless you
+    are absolutly sure want to run salt as some other user, care should be
+    taken to preserve this setting in your Master configuration file..
+
 .. conf_master:: ret_port
 
 ``enable_ssh_minions``
@@ -366,6 +374,22 @@ Set the default timeout for the salt command and api.
 
 .. conf_master:: loop_interval
 
+.. conf_minion:: ipc_write_timeout
+
+``ipc_write_timeout``
+---------------------
+
+.. versionadded:: 3006.11
+
+Default: ``15``
+
+How many seconds the event publisher process will wait after a client stops
+responding before the client will be disconnected.
+
+.. code-block:: yaml
+
+    ipc_write_timeout: 15
+
 ``loop_interval``
 -----------------
 
@@ -388,6 +412,13 @@ Defines how often to restart the master's Maintenance process.
 
     maintenance_interval: 9600
 
+.. note::
+
+    Scheduled jobs will fail to trigger if their interval is greater than the
+    ``maintenance_interval``. Because the master scheduler only evaluates jobs
+    during maintenance cycles, a default 3600-second (1-hour) maintenance
+    interval will effectively ignore any job set to run every 7200 seconds (2
+    hours).
 
 .. conf_master:: output
 
@@ -2023,6 +2054,21 @@ The number of seconds between AES key rotations on the master.
 
     publish_session: Default: 86400
 
+.. conf_master:: ssl
+
+
+``publish_signing_algorithm``
+-----------------------------
+
+.. versionadded:: 3006.9
+
+Default: PKCS1v15-SHA1
+
+The RSA signing algorithm used by this minion when connecting to the
+master's request channel. Valid values are ``PKCS1v15-SHA1`` and
+``PKCS1v15-SHA224``. Minions must be at version ``3006.9`` or greater if this
+is changed from the default setting.
+
 .. conf_master:: minimum_auth_version
 
 ``minimum_auth_version``
@@ -2084,7 +2130,6 @@ the upgrade process to prevent minions from being locked out.
     a warning message will be logged on the master including the minion ID and the
     protocol version it attempted to use.
 
-.. conf_master:: ssl
 
 ``ssl``
 -------
@@ -5074,6 +5119,7 @@ Default: ``3600``
 If and only if a master has set ``pillar_cache: True``, the cache TTL controls the amount
 of time, in seconds, before the cache is considered invalid by a master and a fresh
 pillar is recompiled and stored.
+The cache TTL does not prevent pillar cache from being refreshed before its TTL expires.
 
 .. conf_master:: pillar_cache_backend
 
@@ -5403,6 +5449,22 @@ send events to all connected masters.
 
     syndic_forward_all_events: False
 
+.. conf_master:: syndic_retries
+
+``syndic_retries``
+------------------
+
+.. versionadded:: 3006.16
+
+Default: ``3``
+
+The maximum number of retries for a syndic return attempt to the Master of Masters.
+If multiple Master of Masters listed, it will attempt this number of retries for
+each master in the list.
+
+.. code-block:: yaml
+
+    syndic_retries: 4
 
 .. _peer-publish-settings:
 
@@ -5520,6 +5582,13 @@ The level of messages to send to the console. See also :conf_log:`log_level`.
 
     log_level: warning
 
+Any log level below the `info` level is INSECURE and may log sensitive data. This currently includes:
+#. profile
+#. debug
+#. trace
+#. garbage
+#. all
+
 .. conf_master:: log_level_logfile
 
 ``log_level_logfile``
@@ -5534,6 +5603,13 @@ it will inherit the level set by :conf_log:`log_level` option.
 .. code-block:: yaml
 
     log_level_logfile: warning
+
+Any log level below the `info` level is INSECURE and may log sensitive data. This currently includes:
+#. profile
+#. debug
+#. trace
+#. garbage
+#. all
 
 .. conf_master:: log_datefmt
 

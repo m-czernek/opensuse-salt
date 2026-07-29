@@ -8,14 +8,15 @@ import inspect
 import logging
 import re
 import shlex
+import sys
 from collections import namedtuple
 
 import salt.utils.data
 import salt.utils.jid
 import salt.utils.versions
+import salt.utils.win_functions
 import salt.utils.yaml
 from salt.exceptions import SaltInvocationError
-from salt.utils.odict import OrderedDict
 
 log = logging.getLogger(__name__)
 
@@ -50,7 +51,7 @@ def invalid_kwargs(invalid_kwargs, raise_exc=True):
     """
     if invalid_kwargs:
         if isinstance(invalid_kwargs, dict):
-            new_invalid = ["{}={}".format(x, y) for x, y in invalid_kwargs.items()]
+            new_invalid = [f"{x}={y}" for x, y in invalid_kwargs.items()]
             invalid_kwargs = new_invalid
     msg = "The following keyword arguments are not valid: {}".format(
         ", ".join(invalid_kwargs)
@@ -222,6 +223,9 @@ def yamlify_arg(arg):
         return original_arg
 
 
+_ArgSpec = namedtuple("ArgSpec", "args varargs keywords defaults")
+
+
 def get_function_argspec(func, is_class_method=None):
     """
     A small wrapper around inspect.signature that also supports callable objects and wrapped functions
@@ -237,7 +241,7 @@ def get_function_argspec(func, is_class_method=None):
                             the argspec unless ``is_class_method`` is True.
     """
     if not callable(func):
-        raise TypeError("{} is not a callable".format(func))
+        raise TypeError(f"{func} is not a callable")
 
     while hasattr(func, "__wrapped__"):
         func = func.__wrapped__
@@ -245,10 +249,9 @@ def get_function_argspec(func, is_class_method=None):
     try:
         sig = inspect.signature(func)
     except TypeError:
-        raise TypeError("Cannot inspect argument list for '{}'".format(func))
+        raise TypeError(f"Cannot inspect argument list for '{func}'")
 
     # Build a namedtuple which looks like the result of a Python 2 argspec
-    _ArgSpec = namedtuple("ArgSpec", "args varargs keywords defaults")
     args = []
     defaults = []
     varargs = keywords = None
@@ -268,16 +271,13 @@ def get_function_argspec(func, is_class_method=None):
 
 def shlex_split(s, **kwargs):
     """
-    Only split if variable is a string
+    Only split if the variable is a string
     """
     if isinstance(s, str):
-        # On PY2, shlex.split will fail with unicode types if there are
-        # non-ascii characters in the string. So, we need to make sure we
-        # invoke it with a str type, and then decode the resulting string back
-        # to unicode to return it.
-        return salt.utils.data.decode(
-            shlex.split(salt.utils.stringutils.to_str(s), **kwargs)
-        )
+        if sys.platform == "win32":
+            return salt.utils.win_functions.shlex_split(s)
+        else:
+            return shlex.split(s, **kwargs)
     else:
         return s
 
@@ -346,7 +346,10 @@ def split_input(val, mapper=None):
     Take an input value and split it into a list, returning the resulting list
     """
     if mapper is None:
-        mapper = lambda x: x
+
+        def mapper(x):
+            return x
+
     if isinstance(val, list):
         return list(map(mapper, val))
     try:
@@ -400,7 +403,7 @@ def format_call(
     ret = initial_ret is not None and initial_ret or {}
 
     ret["args"] = []
-    ret["kwargs"] = OrderedDict()
+    ret["kwargs"] = {}
 
     aspec = get_function_argspec(fun, is_class_method=is_class_method)
 
@@ -467,18 +470,18 @@ def format_call(
                     # In case this is being called for a state module
                     "full",
                     # Not a state module, build the name
-                    "{}.{}".format(fun.__module__, fun.__name__),
+                    f"{fun.__module__}.{fun.__name__}",
                 ),
             )
         else:
             msg = "{} and '{}' are invalid keyword arguments for '{}'".format(
-                ", ".join(["'{}'".format(e) for e in extra][:-1]),
+                ", ".join([f"'{e}'" for e in extra][:-1]),
                 list(extra.keys())[-1],
                 ret.get(
                     # In case this is being called for a state module
                     "full",
                     # Not a state module, build the name
-                    "{}.{}".format(fun.__module__, fun.__name__),
+                    f"{fun.__module__}.{fun.__name__}",
                 ),
             )
 
@@ -530,7 +533,8 @@ def parse_function(s):
             key = None
             word = []
         elif token in "]})":
-            if not brackets or token != {"[": "]", "{": "}", "(": ")"}[brackets.pop()]:
+            _brackets = {"[": "]", "{": "}", "(": ")"}
+            if not brackets or token != _brackets[brackets.pop()]:
                 break
             word.append(token)
         elif token == "=" and not brackets:

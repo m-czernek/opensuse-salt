@@ -41,6 +41,7 @@ Current known limitations
   - struct
   - salt.utils.win_reg
 """
+
 import csv
 import ctypes
 import glob
@@ -317,9 +318,9 @@ class _policy_info:
     AdvAudit Mechanism
     ------------------
 
-    The Advanced Audit Policies are configured using a combination of the
-    auditpol command-line utility and modifying the audit.csv file in two
-    locations. The value of this key is a dict with the following make-up:
+    The Advanced Audit Policies are configured using the Windows security APIs
+    (via Salt's ``auditpol`` execution utility) and modifying the audit.csv file
+    in two locations. The value of this key is a dict with the following make-up:
 
     ======  ===================================
     Key     Value
@@ -2940,6 +2941,16 @@ class _policy_info:
                         },
                         "NetUserModal": {"Modal": 3, "Option": "lockout_threshold"},
                     },
+                    "AdministratorLockout": {
+                        "Policy": "Allow Administrator account lockout",
+                        "lgpo_section": self.account_lockout_policy_gpedit_path,
+                        "Settings": self.enabled_one_disabled_zero_no_not_defined.keys(),
+                        "Secedit": {
+                            "Option": "AllowAdministratorLockout",
+                            "Section": "System Access",
+                        },
+                        "Transform": self.enabled_one_disabled_zero_no_not_defined_transform,
+                    },
                     "LockoutWindow": {
                         "Policy": "Reset account lockout counter after",
                         "lgpo_section": self.account_lockout_policy_gpedit_path,
@@ -4650,7 +4661,7 @@ class _policy_info:
         """
         add quotes around the string
         """
-        return '"{}"'.format(val)
+        return f'"{val}"'
 
     @classmethod
     def _binary_enable_zero_disable_one_conversion(cls, val, **kwargs):
@@ -4664,7 +4675,7 @@ class _policy_info:
                 elif ord(val) == 1:
                     return "Enabled"
                 else:
-                    return "Invalid Value: {!r}".format(val)
+                    return f"Invalid Value: {val!r}"
             else:
                 return "Not Defined"
         except TypeError:
@@ -4799,16 +4810,14 @@ class _policy_info:
         """
         converts a list of pysid objects to string representations
         """
-        if isinstance(val, str):
-            val = val.split(",")
         usernames = []
         for _sid in val:
             try:
                 userSid = win32security.LookupAccountSid("", _sid)
                 if userSid[1]:
-                    userSid = "{1}\\{0}".format(userSid[0], userSid[1])
+                    userSid = f"{userSid[1]}\\{userSid[0]}"
                 else:
-                    userSid = "{}".format(userSid[0])
+                    userSid = f"{userSid[0]}"
             # TODO: This needs to be more specific
             except Exception:  # pylint: disable=broad-except
                 userSid = win32security.ConvertSidToStringSid(_sid)
@@ -4918,11 +4927,11 @@ class _policy_info:
             return None
         if value_lookup:
             if not isinstance(item, list):
-                return "Invalid Value"
+                return "Invalid Value: Not a list"
             ret_val = 0
         else:
             if not isinstance(item, int):
-                return "Invalid Value"
+                return "Invalid Value: Not an int"
             ret_val = []
         if "lookup" in kwargs:
             for k, v in kwargs["lookup"].items():
@@ -4937,7 +4946,7 @@ class _policy_info:
                     if do_test and isinstance(k, int) and item & k == k:
                         ret_val.append(v)
         else:
-            return "Invalid Value"
+            return "Invalid Value: No lookup passed"
         return ret_val
 
     @classmethod
@@ -5000,7 +5009,7 @@ def _updateNamespace(item, new_namespace):
         temp_item = item.tag[i + 1 :]
     else:
         temp_item = item.tag
-    item.tag = "{{{0}}}{1}".format(new_namespace, temp_item)
+    item.tag = f"{{{new_namespace}}}{temp_item}"
     for child in item.getiterator():
         if isinstance(child.tag, str):
             temp_item = ""
@@ -5009,7 +5018,7 @@ def _updateNamespace(item, new_namespace):
                 temp_item = child.tag[i + 1 :]
             else:
                 temp_item = child.tag
-            child.tag = "{{{0}}}{1}".format(new_namespace, temp_item)
+            child.tag = f"{{{new_namespace}}}{temp_item}"
     return item
 
 
@@ -5062,6 +5071,18 @@ def _remove_invalid_xmlns(xml_file):
     return xml_tree
 
 
+def _encode_xmlns_url(match):
+    """
+    Escape spaces in xmlns urls
+    """
+    before_xmlns = match.group(1)
+    xmlns = match.group(2)
+    url = match.group(3)
+    after_url = match.group(4)
+    encoded_url = re.sub(r"\s+", "%20", url)
+    return f'{before_xmlns}{xmlns}="{encoded_url}"{after_url}'
+
+
 def _parse_xml(adm_file):
     """
     Parse the admx/adml file. There are 3 scenarios (so far) that we'll likely
@@ -5077,10 +5098,10 @@ def _parse_xml(adm_file):
 
     modified_xml = ""
     with salt.utils.files.fopen(adm_file, "rb") as rfh:
-        file_hash = "{:X}".format(zlib.crc32(rfh.read()) & 0xFFFFFFFF)
+        file_hash = f"{zlib.crc32(rfh.read()) & 0xFFFFFFFF:X}"
 
     name, ext = os.path.splitext(os.path.basename(adm_file))
-    hashed_filename = "{}-{}{}".format(name, file_hash, ext)
+    hashed_filename = f"{name}-{file_hash}{ext}"
 
     cache_dir = os.path.join(__opts__["cachedir"], "lgpo", "policy_defs")
     if not os.path.exists(cache_dir):
@@ -5092,7 +5113,7 @@ def _parse_xml(adm_file):
         log.debug("LGPO: Generating policy template cache for %s%s", name, ext)
 
         # Remove old files, keep the cache clean
-        file_list = glob.glob(os.path.join(cache_dir, "{}*{}".format(name, ext)))
+        file_list = glob.glob(os.path.join(cache_dir, f"{name}*{ext}"))
         for file_path in file_list:
             os.remove(file_path)
 
@@ -5108,6 +5129,12 @@ def _parse_xml(adm_file):
                 encoding = "utf-16"
                 raw = raw.decode(encoding)
             for line in raw.split("\r\n"):
+                if 'xmlns="' in line:
+                    line = re.sub(
+                        r'(.*)(\bxmlns(?::\w+)?)\s*=\s*"([^"]+)"(.*)',
+                        _encode_xmlns_url,
+                        line,
+                    )
                 if 'key="' in line:
                     start = line.index('key="')
                     q1 = line[start:].index('"') + start
@@ -5315,6 +5342,25 @@ def _get_policy_definitions(path="c:\\Windows\\PolicyDefinitions", language="en-
     return __context__["lgpo.policy_definitions"]
 
 
+def clear_policy_cache():
+    """
+    Clears the policy definitions and resource stored in ``__context__``. They
+    will be rebuilt the next time a policy is applied.
+
+    CLI Example:
+
+    .. code-block:: bash
+
+        salt '*' lgpo.clear_policy_cache
+    """
+    if "lgpo.policy_definitions" in __context__:
+        log.debug("LGPO: Removing cached policy definitions")
+        __context__.pop("lgpo.policy_definitions")
+    if "lgpo.policy_resources" in __context__:
+        log.debug("LGPO: Removing cached policy resources")
+        __context__.pop("lgpo.policy_resources")
+
+
 def _get_policy_resources(path="c:\\Windows\\PolicyDefinitions", language="en-US"):
     if "lgpo.policy_resources" not in __context__:
         log.debug("LGPO: Loading policy resources")
@@ -5339,6 +5385,15 @@ def _get_advaudit_defaults(option=None):
     configurable policies as keys. The values are used to create/modify the
     ``audit.csv`` file. The first entry is `fieldnames` used to create the
     header for the csv file. The rest of the entries are the audit policy names.
+
+    Row templates are built from ``__utils__['auditpol.get_advaudit_policy_rows']()``,
+    which uses Windows ``AuditQuerySystemPolicy`` and English metadata (not
+    ``auditpol /backup``), so defaults stay consistent on non-English Windows.
+    Those templates are still used to **create or update** the machine's
+    ``audit.csv`` files (see ``_advaudit_check_csv`` / ``_set_advaudit_file_data``);
+    only the source of the default *content* changed, not LGPO's use of
+    ``audit.csv`` on disk.
+
     Sample data follows:
 
     {
@@ -5377,8 +5432,9 @@ def _get_advaudit_defaults(option=None):
     }
 
     .. note::
-        `Auditpol Name` designates the value to use when setting the value with
-        the auditpol command
+        ``Auditpol Name`` is the English subcategory string passed to
+        ``__utils__['auditpol.set_setting']``, which applies policy via
+        ``AuditSetSystemPolicy`` (not ``auditpol.exe``).
 
     Args:
         option (str): The item from the dictionary to return. If ``None`` the
@@ -5391,11 +5447,10 @@ def _get_advaudit_defaults(option=None):
     if "lgpo.audit_defaults" not in __context__:
         # Get available setting names and GUIDs
         # This is used to get the fieldnames and GUIDs for individual policies
-        log.debug("Loading auditpol defaults into __context__")
-        dump = __utils__["auditpol.get_auditpol_dump"]()
-        reader = csv.DictReader(dump)
-        audit_defaults = {"fieldnames": reader.fieldnames}
-        for row in reader:
+        log.debug("Loading advanced audit defaults into __context__")
+        rows = __utils__["auditpol.get_advaudit_policy_rows"]()
+        audit_defaults = {"fieldnames": list(rows[0].keys())}
+        for row in rows:
             row["Machine Name"] = ""
             row["Auditpol Name"] = row["Subcategory"]
             # Special handling for snowflake scenarios where the audit.csv names
@@ -5607,7 +5662,10 @@ def _set_advaudit_pol_data(option, value):
     """
     Helper function that updates the current applied settings to match what has
     just been set in the audit.csv files. We're doing it this way instead of
-    running `gpupdate`
+    running `gpupdate`.
+
+    Calls ``__utils__['auditpol.set_setting']``, which uses Windows
+    ``AuditSetSystemPolicy`` (not ``auditpol.exe``).
 
     Args:
         option (str): The name of the option to set
@@ -5637,7 +5695,8 @@ def _set_advaudit_value(option, value):
     C:\\Windows\\Security\\Audit\\audit.csv
     C:\\Windows\\System32\\GroupPolicy\\Machine\\Microsoft\\Windows NT\\Audit\\audit.csv
 
-    Then it applies those settings using ``auditpol``
+    Then it applies those settings using ``__utils__['auditpol.set_setting']``
+    (native ``AuditSetSystemPolicy``).
 
     After that, it updates ``__context__`` with the new setting
 
@@ -5650,7 +5709,7 @@ def _set_advaudit_value(option, value):
     """
     # Set the values in both audit.csv files
     if not _set_advaudit_file_data(option=option, value=value):
-        raise CommandExecutionError("Failed to set audit.csv option: {}".format(option))
+        raise CommandExecutionError(f"Failed to set audit.csv option: {option}")
     # Apply the settings locally
     if not _set_advaudit_pol_data(option=option, value=value):
         # Only log this error, it will be in effect the next time the machine
@@ -5695,7 +5754,7 @@ def _get_netsh_value(profile, option):
 
 def _set_netsh_value(profile, section, option, value):
     if section not in ("firewallpolicy", "settings", "logging", "state"):
-        raise ValueError("LGPO: Invalid section: {}".format(section))
+        raise ValueError(f"LGPO: Invalid section: {section}")
     log.trace(
         "LGPO: Setting the following\nProfile: %s\nSection: %s\nOption: %s\nValue: %s",
         profile,
@@ -5726,8 +5785,9 @@ def _set_netsh_value(profile, section, option, value):
         salt.utils.win_lgpo_netsh.set_logging_settings(
             profile=profile, setting=option, value=value, store="lgpo"
         )
-    log.trace("LGPO: Clearing netsh data for %s profile", profile)
-    __context__["lgpo.netsh_data"].pop(profile)
+    if profile in __context__["lgpo.netsh_data"]:
+        log.trace("LGPO: Clearing netsh data for %s profile", profile)
+        __context__["lgpo.netsh_data"].pop(profile, {})
     return True
 
 
@@ -5739,7 +5799,7 @@ def _load_secedit_data():
     Returns:
         str: The contents of the file generated by the secedit command
     """
-    f_exp = os.path.join(__opts__["cachedir"], "secedit-{}.txt".format(UUID))
+    f_exp = os.path.join(__opts__["cachedir"], f"secedit-{UUID}.txt")
     try:
         __salt__["cmd.run"](["secedit", "/export", "/cfg", f_exp])
         with salt.utils.files.fopen(f_exp, encoding="utf-16") as fp:
@@ -5789,7 +5849,7 @@ def _write_secedit_data(inf_data):
     # Set file names
     # The database must persist in order for the settings to remain in effect
     f_sdb = os.path.join(os.getenv("WINDIR"), "security", "database", "salt.sdb")
-    f_inf = os.path.join(__opts__["cachedir"], "secedit-{}.inf".format(UUID))
+    f_inf = os.path.join(__opts__["cachedir"], f"secedit-{UUID}.inf")
 
     try:
         # Write the changes to the inf file
@@ -5949,9 +6009,7 @@ def _getAdmlPresentationRefId(adml_data, ref_id):
     """
     helper function to check for a presentation label for a policy element
     """
-    search_results = adml_data.xpath(
-        '//*[@*[local-name() = "refId"] = "{}"]'.format(ref_id)
-    )
+    search_results = adml_data.xpath(f'//*[@*[local-name() = "refId"] = "{ref_id}"]')
     alternate_label = ""
     if search_results:
         for result in search_results:
@@ -6217,7 +6275,7 @@ def _encode_string(value):
     elif not isinstance(value, str):
         # Should we raise an error here, or attempt to cast to a string
         raise TypeError(
-            "Value {} is not a string type\nType: {}".format(repr(value), type(value))
+            f"Value {repr(value)} is not a string type\nType: {type(value)}"
         )
     return b"".join([value.encode("utf-16-le"), encoded_null])
 
@@ -6258,7 +6316,7 @@ def _buildKnownDataSearchString(
                 encoded_semicolon,
                 chr(registry.vtype[reg_vtype]).encode("utf-32-le"),
                 encoded_semicolon,
-                chr(len(" {}".format(chr(0)).encode("utf-16-le"))).encode("utf-32-le"),
+                chr(len(f" {chr(0)}".encode("utf-16-le"))).encode("utf-32-le"),
                 encoded_semicolon,
                 " ".encode("utf-16-le"),
                 encoded_null,
@@ -6438,7 +6496,7 @@ def _processValueItem(
                             encoded_semicolon,
                             chr(registry.vtype[this_vtype]).encode("utf-32-le"),
                             encoded_semicolon,
-                            chr(len(" {}".format(chr(0)).encode("utf-16-le"))).encode(
+                            chr(len(f" {chr(0)}".encode("utf-16-le"))).encode(
                                 "utf-32-le"
                             ),
                             encoded_semicolon,
@@ -6493,7 +6551,7 @@ def _processValueItem(
                                 encoded_semicolon,
                                 chr(
                                     len(
-                                        "{}{}".format(element_values[i], chr(0)).encode(
+                                        f"{element_values[i]}{chr(0)}".encode(
                                             "utf-16-le"
                                         )
                                     )
@@ -6524,9 +6582,7 @@ def _processValueItem(
                         encoded_semicolon,
                         chr(registry.vtype[this_vtype]).encode("utf-32-le"),
                         encoded_semicolon,
-                        chr(len(" {}".format(chr(0)).encode("utf-16-le"))).encode(
-                            "utf-32-le"
-                        ),
+                        chr(len(f" {chr(0)}".encode("utf-16-le"))).encode("utf-32-le"),
                         encoded_semicolon,
                         " ".encode("utf-16-le"),
                         encoded_null,
@@ -6590,9 +6646,7 @@ def _processValueItem(
                     encoded_semicolon,
                     chr(registry.vtype[this_vtype]).encode("utf-32-le"),
                     encoded_semicolon,
-                    chr(len(" {}".format(chr(0)).encode("utf-16-le"))).encode(
-                        "utf-32-le"
-                    ),
+                    chr(len(f" {chr(0)}".encode("utf-16-le"))).encode("utf-32-le"),
                     encoded_semicolon,
                     " ".encode("utf-16-le"),
                     encoded_null,
@@ -6644,10 +6698,10 @@ def _checkAllAdmxPolicies(
     if policy_file_data:
         log.trace("POLICY CLASS %s has file data", policy_class)
         policy_filedata_split = re.sub(
-            salt.utils.stringutils.to_bytes(r"\]{}$".format(chr(0))),
+            salt.utils.stringutils.to_bytes(rf"\]{chr(0)}$"),
             b"",
             re.sub(
-                salt.utils.stringutils.to_bytes(r"^\[{}".format(chr(0))),
+                salt.utils.stringutils.to_bytes(rf"^\[{chr(0)}"),
                 b"",
                 re.sub(
                     re.escape(REG_POL_HEADER.encode("utf-16-le")),
@@ -6661,7 +6715,7 @@ def _checkAllAdmxPolicies(
         # Get the policy for each item defined in Registry.pol
         for policy_item in policy_filedata_split:
             policy_item_key = (
-                policy_item.split("{};".format(chr(0)).encode("utf-16-le"))[0]
+                policy_item.split(f"{chr(0)};".encode("utf-16-le"))[0]
                 .decode("utf-16-le")
                 .lower()
             )
@@ -6927,7 +6981,7 @@ def _checkAllAdmxPolicies(
 
                             if etree.QName(child_item).localname == "boolean":
                                 # https://msdn.microsoft.com/en-us/library/dn605978(v=vs.85).aspx
-                                if child_item is not None:
+                                if len(child_item) > 0:
                                     if (
                                         TRUE_VALUE_XPATH(child_item)
                                         and this_element_name not in configured_elements
@@ -6940,9 +6994,9 @@ def _checkAllAdmxPolicies(
                                             TRUE_VALUE_XPATH,
                                             policy_file_data,
                                         ):
-                                            configured_elements[
-                                                this_element_name
-                                            ] = True
+                                            configured_elements[this_element_name] = (
+                                                True
+                                            )
                                             log.trace(
                                                 "element %s is configured true",
                                                 child_item.attrib["id"],
@@ -6959,9 +7013,9 @@ def _checkAllAdmxPolicies(
                                             FALSE_VALUE_XPATH,
                                             policy_file_data,
                                         ):
-                                            configured_elements[
-                                                this_element_name
-                                            ] = False
+                                            configured_elements[this_element_name] = (
+                                                False
+                                            )
                                             policy_disabled_elements = (
                                                 policy_disabled_elements + 1
                                             )
@@ -6983,9 +7037,9 @@ def _checkAllAdmxPolicies(
                                             TRUE_LIST_XPATH,
                                             policy_file_data,
                                         ):
-                                            configured_elements[
-                                                this_element_name
-                                            ] = True
+                                            configured_elements[this_element_name] = (
+                                                True
+                                            )
                                             log.trace(
                                                 "element %s is configured true",
                                                 child_item.attrib["id"],
@@ -7002,9 +7056,9 @@ def _checkAllAdmxPolicies(
                                             FALSE_LIST_XPATH,
                                             policy_file_data,
                                         ):
-                                            configured_elements[
-                                                this_element_name
-                                            ] = False
+                                            configured_elements[this_element_name] = (
+                                                False
+                                            )
                                             policy_disabled_elements = (
                                                 policy_disabled_elements + 1
                                             )
@@ -7104,9 +7158,9 @@ def _checkAllAdmxPolicies(
                                         ),
                                         policy_file_data,
                                     )
-                                    configured_elements[
-                                        this_element_name
-                                    ] = configured_value
+                                    configured_elements[this_element_name] = (
+                                        configured_value
+                                    )
                                     log.trace(
                                         "element %s is enabled, value == %s",
                                         child_item.attrib["id"],
@@ -7226,9 +7280,9 @@ def _checkAllAdmxPolicies(
                                         policy_file_data,
                                         return_value_name=return_value_name,
                                     )
-                                    configured_elements[
-                                        this_element_name
-                                    ] = configured_value
+                                    configured_elements[this_element_name] = (
+                                        configured_value
+                                    )
                                     log.trace(
                                         "element %s is enabled values: %s",
                                         child_item.attrib["id"],
@@ -7424,7 +7478,7 @@ def _build_parent_list(policy_definition, return_full_policy_names, adml_languag
     parent_list = []
     policy_namespace = next(iter(policy_definition.nsmap))
     parent_category = policy_definition.xpath(
-        "{}:parentCategory/@ref".format(policy_namespace),
+        f"{policy_namespace}:parentCategory/@ref",
         namespaces=policy_definition.nsmap,
     )
     admx_policy_definitions = _get_policy_definitions(language=adml_language)
@@ -7495,14 +7549,14 @@ def _admx_policy_parent_walk(
         )
         path.append(this_parent_name)
         if tparent_category.xpath(
-            "{}:parentCategory/@ref".format(policy_namespace), namespaces=policy_nsmap
+            f"{policy_namespace}:parentCategory/@ref", namespaces=policy_nsmap
         ):
             # parent has a parent
             path = _admx_policy_parent_walk(
                 path=path,
                 policy_namespace=policy_namespace,
                 parent_category=tparent_category.xpath(
-                    "{}:parentCategory/@ref".format(policy_namespace),
+                    f"{policy_namespace}:parentCategory/@ref",
                     namespaces=policy_nsmap,
                 )[0],
                 policy_nsmap=policy_nsmap,
@@ -8509,6 +8563,7 @@ def _lookup_admin_template(policy_name, policy_class, adml_language="en-US"):
                             )
                             return False, None, [], msg
                     else:
+                        all_paths = []
                         for possible_policy in admx_search_results:
                             this_parent_list = _build_parent_list(
                                 policy_definition=possible_policy,
@@ -8517,12 +8572,41 @@ def _lookup_admin_template(policy_name, policy_class, adml_language="en-US"):
                             )
                             this_parent_list.reverse()
                             this_parent_list.append(policy_name)
-                            if suggested_policies:
-                                suggested_policies = ", ".join(
-                                    [suggested_policies, "\\".join(this_parent_list)]
+                            all_paths.append("\\".join(this_parent_list))
+                        unique_paths = list(dict.fromkeys(all_paths))
+                        if len(unique_paths) == 1:
+                            # All matches resolve to the same full path (e.g.
+                            # duplicate policy definitions across ADMX files
+                            # like TerminalServer.admx and
+                            # TerminalServer-Server.admx). Treat as a single
+                            # unambiguous policy.
+                            search_result = admx_search_results[0]
+                            if "name" in search_result.attrib:
+                                policy_display_name = _getFullPolicyName(
+                                    policy_item=search_result,
+                                    policy_name=search_result.attrib["name"],
+                                    return_full_policy_names=True,
+                                    adml_language=adml_language,
                                 )
-                            else:
-                                suggested_policies = "\\".join(this_parent_list)
+                                policy_aliases.append(policy_display_name)
+                                policy_aliases.append(search_result.attrib["name"])
+                                full_path_list = _build_parent_list(
+                                    policy_definition=search_result,
+                                    return_full_policy_names=True,
+                                    adml_language=adml_language,
+                                )
+                                full_path_list.reverse()
+                                full_path_list.append(policy_display_name)
+                                policy_aliases.append("\\".join(full_path_list))
+                                return True, search_result, policy_aliases, None
+                        else:
+                            for full_path in all_paths:
+                                if suggested_policies:
+                                    suggested_policies = ", ".join(
+                                        [suggested_policies, full_path]
+                                    )
+                                else:
+                                    suggested_policies = full_path
             if suggested_policies:
                 msg = (
                     'ADML policy name "{}" is used as the display name for '
@@ -8534,7 +8618,7 @@ def _lookup_admin_template(policy_name, policy_class, adml_language="en-US"):
         False,
         None,
         [],
-        "Unable to find {} policy {}".format(policy_class, policy_name),
+        f"Unable to find {policy_class} policy {policy_name}",
     )
 
 
@@ -8543,12 +8627,17 @@ def get_policy_info(policy_name, policy_class, adml_language="en-US"):
     Returns information about a specified policy
 
     Args:
+
         policy_name (str):
             The name of the policy to lookup
+
         policy_class (str):
             The class of policy, i.e. machine, user, both
-        adml_language (str):
-            The ADML language to use for Administrative Template data lookup
+
+        adml_language (:obj:`str`, optional):
+            The ADML language to use for Administrative Template data lookup.
+
+            Default is ``en-US``.
 
     Returns:
         dict: Information about the specified policy
@@ -8689,8 +8778,8 @@ def get_policy_info(policy_name, policy_class, adml_language="en-US"):
     }
     policy_class = policy_class.title()
     policy_data = _policy_info()
-    if policy_class not in policy_data.policies.keys():
-        policy_classes = ", ".join(policy_data.policies.keys())
+    if policy_class not in policy_data.policies:
+        policy_classes = ", ".join(policy_data.policies)
         ret["message"] = (
             'The requested policy class "{}" is invalid, '
             "policy_class should be one of: {}"
@@ -8767,29 +8856,39 @@ def get(
 
     Args:
 
-        policy_class (str):
+        policy_class (:obj:`str`, optional):
             Some policies are both user and computer, by default all policies
             will be pulled, but this can be used to retrieve only a specific
             policy class User/USER/user = retrieve user policies
             Machine/MACHINE/machine/Computer/COMPUTER/computer = retrieve
-            machine/computer policies
+            machine/computer policies.
 
-        return_full_policy_names (bool):
-            True/False to return the policy name as it is seen in the
+            Default is ``None``.
+
+        return_full_policy_names (:obj:`bool`, optional):
+            ``True``/``False`` to return the policy name as it is seen in the
             ``gpedit.msc`` GUI or to only return the policy key/id.
 
-        hierarchical_return (bool):
-            True/False to return the policy data in the hierarchy as seen in the
-            ``gpedit.msc`` GUI. The default of False will return data split only
-            into User/Computer configuration sections
+            Default is ``True``.
 
-        adml_language (str):
+        hierarchical_return (:obj:`bool`, optional):
+            ``True``/``False`` to return the policy data in the hierarchy as
+            seen in the ``gpedit.msc`` GUI. The default of False will return
+            data split only into User/Computer configuration sections.
+
+            Default is ``False``.
+
+        adml_language (:obj:`str`, optional):
             The ADML language to use for processing display/descriptive names
-            and enumeration values of ADMX template data, defaults to en-US
+            and enumeration values of ADMX template data.
 
-        return_not_configured (bool):
+            Default is ``en-US``.
+
+        return_not_configured (:obj:`bool`, optional):
             Include Administrative Template policies that are 'Not Configured'
-            in the return data
+            in the return data.
+
+            Default is ``False``.
 
     Returns:
         dict: A dictionary containing the policy values for the specified class
@@ -9195,7 +9294,7 @@ def _get_policy_adm_setting(
                     )
                     if etree.QName(child_item).localname == "boolean":
                         # https://msdn.microsoft.com/en-us/library/dn605978(v=vs.85).aspx
-                        if child_item is not None:
+                        if len(child_item) > 0:
                             if (
                                 TRUE_VALUE_XPATH(child_item)
                                 and this_element_name not in configured_elements
@@ -9404,23 +9503,23 @@ def _get_policy_adm_setting(
                                             log.trace(
                                                 "all valueList items exist in file"
                                             )
-                                            configured_elements[
-                                                this_element_name
-                                            ] = _getAdmlDisplayName(
+                                            configured_elements[this_element_name] = (
+                                                _getAdmlDisplayName(
+                                                    adml_xml_data=adml_policy_resources,
+                                                    display_name=enum_item.attrib[
+                                                        "displayName"
+                                                    ],
+                                                )
+                                            )
+                                            break
+                                    else:
+                                        configured_elements[this_element_name] = (
+                                            _getAdmlDisplayName(
                                                 adml_xml_data=adml_policy_resources,
                                                 display_name=enum_item.attrib[
                                                     "displayName"
                                                 ],
                                             )
-                                            break
-                                    else:
-                                        configured_elements[
-                                            this_element_name
-                                        ] = _getAdmlDisplayName(
-                                            adml_xml_data=adml_policy_resources,
-                                            display_name=enum_item.attrib[
-                                                "displayName"
-                                            ],
                                         )
                                         break
                     elif etree.QName(child_item).localname == "list":
@@ -9555,12 +9654,12 @@ def _get_policy_adm_setting(
         this_policy_namespace in policy_vals
         and this_policy_name in policy_vals[this_policy_namespace]
     ):
-        hierarchy.setdefault(this_policy_namespace, {})[
-            this_policy_name
-        ] = _build_parent_list(
-            policy_definition=admx_policy,
-            return_full_policy_names=return_full_policy_names,
-            adml_language=adml_language,
+        hierarchy.setdefault(this_policy_namespace, {})[this_policy_name] = (
+            _build_parent_list(
+                policy_definition=admx_policy,
+                return_full_policy_names=return_full_policy_names,
+                adml_language=adml_language,
+            )
         )
 
     if policy_vals and return_full_policy_names and not hierarchical_return:
@@ -9662,6 +9761,7 @@ def get_policy(
     Get the current settings for a single policy on the machine
 
     Args:
+
         policy_name (str):
             The name of the policy to retrieve. Can be the any of the names
             or alieses returned by ``lgpo.get_policy_info``
@@ -9669,26 +9769,33 @@ def get_policy(
         policy_class (str):
             The policy class. Must be one of ``machine`` or ``user``
 
-        adml_language (str):
-            The language code for the adml file to use for localization. The
-            default is ``en-US``
+        adml_language (:obj:`str`, optional):
+            The language code for the adml file to use for localization.
 
-        return_value_only (bool):
+            Default is ``en-US``.
+
+        return_value_only (:obj:`bool`, optional):
             ``True`` will return only the value for the policy, without the
             name of the policy. ``return_full_policy_names`` and
-            ``hierarchical_return`` will be ignored. Default is ``True``
+            ``hierarchical_return`` will be ignored.
 
-        return_full_policy_names (bool):
+            Default is ``True``
+
+        return_full_policy_names (:obj:`bool`, optional):
             Returns the full policy name regardless of what was passed in
-            ``policy_name``
+            ``policy_name``.
 
             .. note::
                 This setting applies to sub-elements of the policy if they
                 exist. The value passed in ``policy_name`` will always be used
                 as the policy name when this setting is ``False``
 
-        hierarchical_return (bool):
-            Returns a hierarchical view of the policy showing its parents
+            Default is ``True``.
+
+        hierarchical_return (:obj:`bool`, optional):
+            Returns a hierarchical view of the policy showing its parents.
+
+            Default is ``False``.
 
     Returns:
         dict: A dictionary containing the policy settings
@@ -9714,7 +9821,7 @@ def get_policy(
         raise SaltInvocationError("policy_class must be defined")
     policy_class = policy_class.title()
     policy_data = _policy_info()
-    if policy_class not in policy_data.policies.keys():
+    if policy_class not in policy_data.policies:
         policy_classes = ", ".join(policy_data.policies.keys())
         raise CommandExecutionError(
             'The requested policy class "{}" is invalid, policy_class should '
@@ -9790,24 +9897,29 @@ def set_computer_policy(
     Set a single computer policy
 
     Args:
+
         name (str):
             The name of the policy to configure
 
         setting (str):
             The setting to configure the named policy with
 
-        cumulative_rights_assignments (bool): Determine how user rights
-            assignment policies are configured. If True, user right assignment
-            specifications are simply added to the existing policy. If False,
-            only the users specified will get the right (any existing will have
-            the right revoked)
+        cumulative_rights_assignments (:obj:`bool`, optional):
+            Determine how user rights assignment policies are configured. If
+            ``True``, user right assignment specifications are simply added to
+            the existing policy. If ``False``, only the users specified will get
+            the right (any existing will have the right revoked)
 
-        adml_language (str): The language files to use for looking up
-            Administrative Template policy data (i.e. how the policy is
-            displayed in the GUI).  Defaults to 'en-US' (U.S. English).
+            Default is ``True``.
+
+        adml_language (:obj:`str`, optional):
+            The language files to use for looking up Administrative Template
+            policy data (i.e. how the policy is displayed in the GUI).
+
+            Default is ``en-US``.
 
     Returns:
-        bool: True if successful, otherwise False
+        bool: ``True`` if successful, otherwise ``False``.
 
     CLI Example:
 
@@ -9836,10 +9948,11 @@ def set_user_policy(name, setting, adml_language="en-US"):
         setting (str):
             The setting to configure the named policy with
 
-        adml_language (str):
+        adml_language (:obj:`str`, optional):
             The language files to use for looking up Administrative Template
-            policy data (i.e. how the policy is displayed in the GUI). Defaults
-            to 'en-US' (U.S. English).
+            policy data (i.e. how the policy is displayed in the GUI).
+
+            Default is ``en-US``.
 
     Returns:
         bool: True if successful, Otherwise False
@@ -9870,12 +9983,13 @@ def set_(
 
     Args:
 
-        computer_policy (dict):
+        computer_policy (:obj:`dict`, optional):
             A dictionary of "policyname: value" pairs of computer policies to
             set. 'value' should be how it is displayed in the gpedit GUI, i.e.
-            if a setting can be 'Enabled'/'Disabled', then that should be passed
+            if a setting can be 'Enabled'/'Disabled', then that should be
+            passed.
 
-            Administrative Template data may require dicts within dicts, to
+            Administrative Template data may require dicts within dicts to
             specify each element of the Administrative Template policy.
             Administrative Templates policies are always cumulative.
 
@@ -9912,32 +10026,39 @@ def set_(
                     Use the get_policy_info function for the policy name to view
                     the element ID/names that the module will accept.
 
-        user_policy (dict):
+            Default is ``None``.
+
+        user_policy (:obj:`dict`, optional):
             The same setup as the computer_policy, except with data to configure
             the local user policy.
 
-        cumulative_rights_assignments (bool):
+            Default is ``None``.
+
+        cumulative_rights_assignments (:obj:`bool`, optional):
             Determine how user rights assignment policies are configured.
 
-            If True, user right assignment specifications are simply added to
-            the existing policy
+            If ``True``, user right assignment specifications are simply added
+            to the existing policy
 
-            If False, only the users specified will get the right (any existing
-            will have the right revoked)
+            If ``False``, only the users specified will get the right (any
+            existing will have the right revoked)
 
-        adml_language (str):
+            Default is ``True``.
+
+        adml_language (:obj:`str`, optional):
             The language files to use for looking up Administrative Template
-            policy data (i.e. how the policy is displayed in the GUI). Defaults
-            to 'en-US' (U.S. English).
+            policy data (i.e. how the policy is displayed in the GUI).
+
+            Default is ``en-US``.
 
     Returns:
-        bool: True is successful, otherwise False
+        bool: ``True`` is successful, otherwise ``False``.
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' lgpo.set computer_policy="{'LockoutDuration': 2, 'RestrictAnonymous': 'Enabled', 'AuditProcessTracking': 'Succes, Failure'}"
+        salt '*' lgpo.set computer_policy='{"LockoutDuration": 2, "RestrictAnonymous": "Enabled", "AuditProcessTracking": "Succes, Failure"}'
     """
 
     if computer_policy and not isinstance(computer_policy, dict):

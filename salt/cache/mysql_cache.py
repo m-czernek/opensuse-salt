@@ -34,7 +34,7 @@ could be set in the master config. These are the defaults:
     mysql.database: salt_cache
     mysql.table_name: cache
 
-Related docs can be found in the `python-mysql documentation`_.
+Related docs can be found in the `PyMySQL documentation`_.
 
 To use the mysql as a minion data cache backend, set the master ``cache`` config
 value to ``mysql``:
@@ -45,7 +45,7 @@ value to ``mysql``:
 
 
 .. _`MySQL documentation`: https://github.com/coreos/mysql
-.. _`python-mysql documentation`: http://python-mysql.readthedocs.io/en/latest/
+.. _`PyMySQL documentation`: https://pymysql.readthedocs.io/en/latest/
 
 """
 
@@ -144,9 +144,7 @@ def run_query(conn, query, args=None, retries=3):
         if len(query) > 150:
             query = query[:150] + "<...>"
         raise SaltCacheError(
-            "Error running {}{}: {}".format(
-                query, "- args: {}".format(args) if args else "", e
-            )
+            "Error running {}{}: {}".format(query, f"- args: {args}" if args else "", e)
         )
 
 
@@ -266,7 +264,7 @@ def store(bank, key, data):
     cur, cnt = run_query(__context__.get("mysql_client"), query, args=args)
     cur.close()
     if cnt not in (1, 2):
-        raise SaltCacheError("Error storing {} {} returned {}".format(bank, key, cnt))
+        raise SaltCacheError(f"Error storing {bank} {key} returned {cnt}")
 
 
 def fetch(bank, key):

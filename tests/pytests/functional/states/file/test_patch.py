@@ -259,8 +259,11 @@ def test_patch_saltenv(file, files, patches):
     # in an environment other than base.
     ret = file.patch(name=str(files.math), source=patches.math_patch, saltenv="prod")
     assert ret.result is False
-    assert ret.comment == "Source file {} not found in saltenv 'prod'".format(
-        patches.math_patch
+    assert (
+        ret.comment
+        == "Unable to manage file: Source file {} not found in saltenv 'prod'".format(
+            patches.math_patch
+        )
     )
 
 
@@ -291,7 +294,7 @@ def test_patch_single_file_failure(file, tmp_path, files, patches):
         assert_fpath = f".*{reject_file.name}"
     else:
         assert_fpath = reject_file
-    assert re.search("saving rejects to (file )?{}".format(assert_fpath), ret.comment)
+    assert re.search(f"saving rejects to (file )?{assert_fpath}", ret.comment)
 
 
 @pytest.mark.skip_on_freebsd(
@@ -324,7 +327,7 @@ def test_patch_directory_failure(file, tmp_path, files, patches):
         assert_fpath = f".*{reject_file.name}"
     else:
         assert_fpath = reject_file
-    assert re.search("saving rejects to (file )?{}".format(assert_fpath), ret.comment)
+    assert re.search(f"saving rejects to (file )?{assert_fpath}", ret.comment)
 
 
 def test_patch_single_file_remote_source(file, files, patches, subtests):

@@ -32,15 +32,16 @@ Connection module for Amazon KMS
 
 :depends: boto
 """
+
 # keep lint from choking on _get_conn and _cache_id
 # pylint: disable=E0602
 
 
 import logging
+from collections import OrderedDict
 
 import salt.serializers.json
 import salt.utils.compat
-import salt.utils.odict as odict
 import salt.utils.versions
 
 log = logging.getLogger(__name__)
@@ -492,7 +493,7 @@ def get_key_policy(
     try:
         key_policy = conn.get_key_policy(key_id, policy_name)
         r["key_policy"] = salt.serializers.json.deserialize(
-            key_policy["Policy"], object_pairs_hook=odict.OrderedDict
+            key_policy["Policy"], object_pairs_hook=OrderedDict
         )
     except boto.exception.BotoServerError as e:
         r["error"] = __utils__["boto.get_error"](e)

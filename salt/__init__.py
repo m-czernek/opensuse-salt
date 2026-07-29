@@ -3,16 +3,68 @@ Salt package
 """
 
 import importlib
+import os
 import sys
 import warnings
 
-if sys.version_info < (3,):
-    sys.stderr.write(
-        "\n\nAfter the Sodium release, 3001, Salt no longer supports Python 2. Exiting.\n\n"
-    )
-    sys.stderr.flush()
+# Work around cpython#104135 on Windows: ssl._load_windows_store_certs feeds
+# every cert in the OS root store to load_verify_locations(cadata=...) as one
+# blob, so a single ASN.1-malformed cert aborts the whole load. OpenSSL 3.5.x
+# (shipped by relenv >= 0.22.13) is strict enough to reject certs the prior
+# OpenSSL accepted, which breaks ssl.create_default_context() at import time
+# for salt and for any third-party lib (aiohttp, requests, urllib3, ...)
+# running under the salt onedir on Windows. Replace the loader with the
+# iterate-and-skip variant proposed upstream.
+#
+# This block is needed on Python 3.10 and 3.11: cpython merged the
+# iterate-and-skip fix into Lib/ssl.py for the 3.12 branch but never
+# backported it to 3.10 (security-only) or 3.11 (still in bug-fix mode but
+# the backport never landed). The salt 3006.x onedir is the only branch
+# shipping Python 3.10 via relenv; 3008.x and later use Python 3.14, whose
+# stdlib already has the upstream fix. DO NOT forward-merge this block to a
+# branch whose onedir Python is >= 3.12 - delete it instead.
+#
+# DURABLE CLEANUP: the right home for this patch is relenv's cpython build
+# (one patch_file call against Lib/ssl.py during build) - once a relenv
+# release carrying it lands in this branch's onedir, drop this block and
+# all companion work-arounds below. Tracked at TODO(salt: link to relenv PR
+# once filed).
+#
+# Companion work-arounds (delete together with this block):
+#   - salt/ext/tornado/netutil.py: certifi.where() pin on Windows
+#   - cicd/windows-ssl-104135-patch.py + the Patch-Lib/ssl.py steps in
+#     .github/workflows/{build-deps-ci,test,test-packages}-action.yml's
+#     Windows jobs, which re-apply this same patch to the onedir Python
+#     *before* salt is importable (covers pip when nox/test helpers spawn
+#     venvs from the onedir).
+if sys.platform == "win32":
+    import ssl as _ssl
 
-USE_VENDORED_TORNADO = sys.version_info < (3,11)
+    # _SSLError is captured as a default-arg so this stays callable after
+    # the surrounding names are deleted at the bottom of this block.
+    def _salt_safe_load_windows_store_certs(
+        self, storename, purpose, _SSLError=_ssl.SSLError
+    ):
+        try:
+            from _ssl import enum_certificates
+        except ImportError:
+            return
+        try:
+            for cert, encoding, trust in enum_certificates(storename):
+                if encoding != "x509_asn":
+                    continue
+                if trust is True or purpose.oid in trust:
+                    try:
+                        self.load_verify_locations(cadata=cert)
+                    except _SSLError:
+                        pass
+        except PermissionError:
+            pass
+
+    _ssl.SSLContext._load_windows_store_certs = _salt_safe_load_windows_store_certs
+    del _ssl, _salt_safe_load_windows_store_certs
+
+USE_VENDORED_TORNADO = True
 
 
 class TornadoImporter:
@@ -20,29 +72,68 @@ class TornadoImporter:
         if USE_VENDORED_TORNADO:
             if module_name.startswith("tornado"):
                 return self
-        else:
+        else:  # pragma: no cover
             if module_name.startswith("salt.ext.tornado"):
                 return self
         return None
 
-    def load_module(self, name):
+    def create_module(self, spec):
         if USE_VENDORED_TORNADO:
-            mod = importlib.import_module("salt.ext.{}".format(name))
-        else:
+            mod = importlib.import_module(f"salt.ext.{spec.name}")
+        else:  # pragma: no cover
             # Remove 'salt.ext.' from the module
-            mod = importlib.import_module(name[9:])
-        sys.modules[name] = mod
+            mod = importlib.import_module(spec.name[9:])
+        sys.modules[spec.name] = mod
         return mod
 
+    def exec_module(self, module):
+        return None
+
+
+class NaclImporter:
+    """
+    Import hook to force PyNaCl to perform dlopen on libsodium with the
+    RTLD_DEEPBIND flag. This is to work around an issue where pyzmq does a dlopen
+    with RTLD_GLOBAL which then causes calls to libsodium to resolve to
+    tweetnacl when it's been bundled with pyzmq.
+
+    See:  https://github.com/zeromq/pyzmq/issues/1878
+    """
+
+    loading = False
+
+    def find_module(self, module_name, package_path=None):
+        if not NaclImporter.loading and module_name.startswith("nacl"):
+            NaclImporter.loading = True
+            return self
+        return None
+
     def create_module(self, spec):
-        return self.load_module(spec.name)
+        dlopen = hasattr(sys, "getdlopenflags")
+        if dlopen:
+            dlflags = sys.getdlopenflags()
+            # Use RTDL_DEEPBIND in case pyzmq was compiled with ZMQ_USE_TWEETNACL. This is
+            # needed because pyzmq imports libzmq with RTLD_GLOBAL.
+            if hasattr(os, "RTLD_DEEPBIND"):
+                flags = os.RTLD_DEEPBIND | dlflags
+            else:
+                flags = dlflags
+            sys.setdlopenflags(flags)
+        try:
+            mod = importlib.import_module(spec.name)
+        finally:
+            if dlopen:
+                sys.setdlopenflags(dlflags)
+        NaclImporter.loading = False
+        sys.modules[spec.name] = mod
+        return mod
 
     def exec_module(self, module):
         return None
 
 
 # Try our importer first
-sys.meta_path = [TornadoImporter()] + sys.meta_path
+sys.meta_path = [TornadoImporter(), NaclImporter()] + sys.meta_path
 
 
 # All salt related deprecation warnings should be shown once each!
@@ -71,110 +162,35 @@ warnings.filterwarnings(
     module="_distutils_hack",
 )
 
-
-def __getdefaultlocale(envvars=("LC_ALL", "LC_CTYPE", "LANG", "LANGUAGE")):
-    """
-    This function was backported from Py3.11 which started triggering a
-    deprecation warning about it's removal in 3.13.
-    """
-    import locale
-
-    try:
-        # check if it's supported by the _locale module
-        import _locale
-
-        code, encoding = _locale._getdefaultlocale()
-    except (ImportError, AttributeError):
-        pass
-    else:
-        # make sure the code/encoding values are valid
-        if sys.platform == "win32" and code and code[:2] == "0x":
-            # map windows language identifier to language name
-            code = locale.windows_locale.get(int(code, 0))
-        # ...add other platform-specific processing here, if
-        # necessary...
-        return code, encoding
-
-    # fall back on POSIX behaviour
-    import os
-
-    lookup = os.environ.get
-    for variable in envvars:
-        localename = lookup(variable, None)
-        if localename:
-            if variable == "LANGUAGE":
-                localename = localename.split(":")[0]
-            break
-    else:
-        localename = "C"
-    return locale._parse_localename(localename)
-
-# Filter deprecated datetime calls in third-party libraries (like dateutil)
-# All core Salt code has been migrated to use salt.utils.timeutil wrappers.
 warnings.filterwarnings(
     "ignore",
-    message="datetime.datetime.utcfromtimestamp\\(\\) is deprecated and scheduled for removal.*",
+    message="invalid escape sequence.*",
+    category=DeprecationWarning,
+)
+
+warnings.filterwarnings(
+    "ignore",
+    "Deprecated call to `pkg_resources.declare_namespace.*",
     category=DeprecationWarning,
 )
 warnings.filterwarnings(
     "ignore",
-    message="datetime.datetime.utcnow\\(\\) is deprecated and scheduled for removal.*",
+    ".*pkg_resources is deprecated as an API.*",
     category=DeprecationWarning,
 )
 
 
 def __define_global_system_encoding_variable__():
-    import sys
-
-    # This is the most trustworthy source of the system encoding, though, if
-    # salt is being imported after being daemonized, this information is lost
-    # and reset to None
-    encoding = None
-
-    if not sys.platform.startswith("win") and sys.stdin is not None:
-        # On linux we can rely on sys.stdin for the encoding since it
-        # most commonly matches the filesystem encoding. This however
-        # does not apply to windows
-        encoding = sys.stdin.encoding
-
-    if not encoding:
-        # If the system is properly configured this should return a valid
-        # encoding. MS Windows has problems with this and reports the wrong
-        # encoding
-
-        try:
-            encoding = __getdefaultlocale()[-1]
-        except ValueError:
-            # A bad locale setting was most likely found:
-            #   https://github.com/saltstack/salt/issues/26063
-            pass
-
-        if not encoding:
-            # This is most likely ascii which is not the best but we were
-            # unable to find a better encoding. If this fails, we fall all
-            # the way back to ascii
-            encoding = sys.getdefaultencoding()
-        if not encoding:
-            if sys.platform.startswith("darwin"):
-                # Mac OS X uses UTF-8
-                encoding = "utf-8"
-            elif sys.platform.startswith("win"):
-                # Windows uses a configurable encoding; on Windows, Python uses the name “mbcs”
-                # to refer to whatever the currently configured encoding is.
-                encoding = "mbcs"
-            else:
-                # On linux default to ascii as a last resort
-                encoding = "ascii"
 
     import builtins
+    import sys
 
     # Define the detected encoding as a built-in variable for ease of use
-    setattr(builtins, "__salt_system_encoding__", encoding)
+    setattr(builtins, "__salt_system_encoding__", sys.getdefaultencoding())
 
     # This is now garbage collectable
-    del sys
     del builtins
-    del encoding
+    del sys
 
 
 __define_global_system_encoding_variable__()
@@ -188,9 +204,3 @@ del __define_global_system_encoding_variable__
 import salt._logging  # isort:skip
 
 # pylint: enable=unused-import
-
-
-# When we are running in a 'onedir' environment, setup the path for user
-# installed packages.
-if hasattr(sys, "RELENV"):
-    sys.path.insert(0, str(sys.RELENV / "extras-{}.{}".format(*sys.version_info)))

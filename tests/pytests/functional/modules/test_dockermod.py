@@ -1,29 +1,20 @@
 """
 Integration tests for the docker_container states
 """
+
 import logging
-import os
 
 import pytest
 from saltfactories.utils import random_string
 from saltfactories.utils.functional import StateResult
 
-from salt.utils.versions import Version
-
-docker = pytest.importorskip("docker")
+pytest.importorskip("docker")
 
 log = logging.getLogger(__name__)
-
-INSIDE_CONTAINER = os.getenv("HOSTNAME", "") == "salt-test-container"
 
 pytestmark = [
     pytest.mark.slow_test,
     pytest.mark.skip_if_binaries_missing("docker", "dockerd", check_all=False),
-    pytest.mark.skipif(INSIDE_CONTAINER, reason="Cannot run inside a container"),
-    pytest.mark.skipif(
-        Version(docker.__version__) < Version("4.0.0"),
-        reason="Test does not work in this version of docker-py",
-    ),
 ]
 
 
@@ -58,7 +49,7 @@ def container(salt_factories, state_tree):
 
     factory = salt_factories.get_container(
         random_string("python-3-"),
-        image_name="ghcr.io/saltstack/salt-ci-containers/python:3",
+        image_name="ghcr.io/saltstack/salt-ci-containers/python:3.10",
         container_run_kwargs={
             "ports": {"8500/tcp": None},
             "entrypoint": "tail -f /dev/null",
@@ -69,6 +60,15 @@ def container(salt_factories, state_tree):
     )
 
     with factory.started():
+        # The dockermod modules determines it's python by running 'python
+        # --version'. There is currently no way to change this. As of August
+        # 2025 our container has a default python of 3.13 wich will cause these
+        # tests to break. Working around this until one of the following
+        # happens; dockermod supports using an alternate python, the containers
+        # are fixed to have the default python correspond to the container
+        # being requested, our codebase supports python 3.13.
+        factory.run("unlink", "/usr/bin/python3")
+        factory.run("ln", "-s", "/usr/bin/python3", "/usr/bin/python3.10")
         yield factory
 
 

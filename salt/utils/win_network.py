@@ -18,14 +18,18 @@ depending on the version of Windows this is run on. Once support for Windows
 :depends: - pythonnet
           - wmi
 """
+
 # https://docs.microsoft.com/en-us/dotnet/api/system.net.networkinformation.networkinterface.getallnetworkinterfaces?view=netframework-4.7.2
 
+import logging
 import platform
 
 import salt.utils.win_reg
 from salt._compat import ipaddress
 
 IS_WINDOWS = platform.system() == "Windows"
+
+log = logging.getLogger(__name__)
 
 __virtualname__ = "win_network"
 
@@ -53,8 +57,24 @@ if IS_WINDOWS:
         import salt.utils.winapi
     else:
         # This uses .NET to get network settings and is faster than WMI
-        import clr
-        from System.Net import NetworkInformation
+        try:
+            # pylint: disable=unused-import
+            import clr
+
+            # pylint: enable=unused-import
+            from System.Net import NetworkInformation
+            from System.Net.NetworkInformation import NetworkInterfaceComponent
+        except RuntimeError:
+            # In some environments, using the Relenv OneDir package, we can't
+            # load pythonnet. Uninstalling and reinstalling pythonnet fixes the
+            # issue, but it is a manual step. Until we figure it out, we are
+            # just going to fall back to WMI. I was able to reproduce a failing
+            # system using Windows 10 Home Edition
+            log.debug("Failed to load pythonnet. Falling back to WMI")
+            USE_WMI = True
+            import wmi
+
+            import salt.utils.winapi
 
 # TODO: Should we deprecate support for pythonnet 2.5.2, these enumerations can
 # TODO: be deleted
@@ -152,12 +172,62 @@ def _get_base_properties(i_face):
 
 
 def _get_ip_base_properties(i_face):
+    # DNS Properties
     ip_properties = i_face.GetIPProperties()
-    return {
+    ip_base_properties = {
         "dns_suffix": ip_properties.DnsSuffix,
         "dns_enabled": ip_properties.IsDnsEnabled,
         "dynamic_dns_enabled": ip_properties.IsDynamicDnsEnabled,
     }
+    # IPv4 Properties
+    if i_face.Supports(
+        NetworkInterfaceComponent.IPv4  # pylint: disable=used-before-assignment
+    ):
+        ipv4_properties = ip_properties.GetIPv4Properties()
+        if ipv4_properties:
+            ip_base_properties.update(
+                {
+                    "ipv4_apipa_active": ipv4_properties.IsAutomaticPrivateAddressingActive,
+                    "ipv4_apipa_enabled": ipv4_properties.IsAutomaticPrivateAddressingEnabled,
+                    "ipv4_dhcp_enabled": ipv4_properties.IsDhcpEnabled,
+                    "ipv4_forwarding_enabled": ipv4_properties.IsForwardingEnabled,
+                    "ipv4_index": ipv4_properties.Index,
+                    "ipv4_mtu": ipv4_properties.Mtu,
+                    "ipv4_wins_enabled": ipv4_properties.UsesWins,
+                }
+            )
+        else:
+            ip_base_properties.update(
+                {
+                    "ipv4_apipa_active": None,
+                    "ipv4_apipa_enabled": None,
+                    "ipv4_dhcp_enabled": None,
+                    "ipv4_forwarding_enabled": None,
+                    "ipv4_index": None,
+                    "ipv4_mtu": None,
+                    "ipv4_wins_enabled": None,
+                }
+            )
+    # IPv6 Properties
+    if i_face.Supports(NetworkInterfaceComponent.IPv6):
+        ipv6_properties = ip_properties.GetIPv6Properties()
+        if ipv6_properties:
+            ip_base_properties.update(
+                {
+                    "ipv6_index": ipv6_properties.Index,
+                    "ipv6_mtu": ipv6_properties.Mtu,
+                }
+            )
+        else:
+            log.debug("No IPv6 properties found for %s", i_face.Name)
+            ip_base_properties.update(
+                {
+                    "ipv6_index": None,
+                    "ipv6_mtu": None,
+                }
+            )
+
+    return ip_base_properties
 
 
 def _get_ip_unicast_info(i_face):
@@ -312,7 +382,7 @@ def _get_ip_wins_info(i_face):
 
 
 def _get_network_interfaces():
-    clr.AddReference("System.Net")
+    # pylint: disable=used-before-assignment
     return NetworkInformation.NetworkInterface.GetAllNetworkInterfaces()
 
 
@@ -329,18 +399,30 @@ def get_interface_info_dot_net_formatted():
     i_faces = {}
     for i_face in interfaces:
         if interfaces[i_face]["status"] == "Up":
-            name = interfaces[i_face]["description"]
+            name = i_face
             i_faces.setdefault(name, {}).update(
-                {"hwaddr": interfaces[i_face]["physical_address"], "up": True}
+                {
+                    "description": interfaces[i_face]["description"],
+                    "hwaddr": interfaces[i_face]["physical_address"],
+                    "up": True,
+                }
             )
             for ip in interfaces[i_face].get("ip_addresses", []):
                 i_faces[name].setdefault("inet", []).append(
                     {
                         "address": ip["address"],
+                        "apipa_active": interfaces[i_face].get("ipv4_apipa_active"),
+                        "apipa_enabled": interfaces[i_face].get("ipv4_apipa_enabled"),
                         "broadcast": ip["broadcast"],
-                        "netmask": ip["netmask"],
+                        "dhcp_enabled": interfaces[i_face].get("ipv4_dhcp_enabled"),
+                        "index": interfaces[i_face].get("ipv4_index"),
                         "gateway": interfaces[i_face].get("ip_gateways", [""])[0],
-                        "label": name,
+                        "mtu": interfaces[i_face].get("ipv4_mtu"),
+                        "netmask": ip["netmask"],
+                        "forwarding_enabled": interfaces[i_face].get(
+                            "ipv4_forwarding_enabled"
+                        ),
+                        "wins_enabled": interfaces[i_face].get("ipv4_wins_enabled"),
                     }
                 )
             for ip in interfaces[i_face].get("ipv6_addresses", []):
@@ -349,6 +431,8 @@ def get_interface_info_dot_net_formatted():
                         "address": ip["address"],
                         "gateway": interfaces[i_face].get("ipv6_gateways", [""])[0],
                         "prefixlen": ip["prefix_length"],
+                        "index": interfaces[i_face].get("ipv6_index"),
+                        "mtu": interfaces[i_face].get("ipv6_mtu"),
                     }
                 )
 
@@ -402,26 +486,36 @@ def get_interface_info_wmi():
                             i_faces[i_face.Description]["inet"] = []
                         item = {"address": ip, "label": i_face.Description}
                         if i_face.DefaultIPGateway:
-                            broadcast = next(
+                            gateway = next(
                                 (i for i in i_face.DefaultIPGateway if "." in i), ""
                             )
-                            if broadcast:
-                                item["broadcast"] = broadcast
+                            if gateway:
+                                item["gateway"] = gateway
                         if i_face.IPSubnet:
                             netmask = next((i for i in i_face.IPSubnet if "." in i), "")
                             if netmask:
                                 item["netmask"] = netmask
+                                try:
+                                    item["broadcast"] = ipaddress.IPv4Network(
+                                        f"{ip}/{netmask}", strict=False
+                                    ).broadcast_address.compressed
+                                except (ValueError, ipaddress.AddressValueError):
+                                    log.debug(
+                                        "Could not compute broadcast for %s/%s",
+                                        ip,
+                                        netmask,
+                                    )
                         i_faces[i_face.Description]["inet"].append(item)
                     if ":" in ip:
                         if "inet6" not in i_faces[i_face.Description]:
                             i_faces[i_face.Description]["inet6"] = []
                         item = {"address": ip}
                         if i_face.DefaultIPGateway:
-                            broadcast = next(
+                            gateway = next(
                                 (i for i in i_face.DefaultIPGateway if ":" in i), ""
                             )
-                            if broadcast:
-                                item["broadcast"] = broadcast
+                            if gateway:
+                                item["gateway"] = gateway
                         if i_face.IPSubnet:
                             prefixlen = next(
                                 (int(i) for i in i_face.IPSubnet if "." not in i), None

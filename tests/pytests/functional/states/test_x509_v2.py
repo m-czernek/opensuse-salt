@@ -1,14 +1,12 @@
 import base64
-from pathlib import Path
+import pathlib
+import shutil
 
 import pytest
-
-from tests.support.mock import patch
 
 try:
     import cryptography
     import cryptography.x509 as cx509
-    from cryptography.exceptions import UnsupportedAlgorithm
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.asymmetric import ec, ed448, ed25519, rsa
     from cryptography.hazmat.primitives.serialization import (
@@ -29,11 +27,34 @@ CRYPTOGRAPHY_VERSION = tuple(int(x) for x in cryptography.__version__.split(".")
 pytestmark = [
     pytest.mark.slow_test,
     pytest.mark.skipif(HAS_LIBS is False, reason="Needs cryptography library"),
+    pytest.mark.skip_on_fips_enabled_platform,
+    pytest.mark.windows_whitelisted,
 ]
 
 
 @pytest.fixture(scope="module")
-def minion_config_overrides():
+def ca_dir(tmp_path_factory):
+    ca_dir = tmp_path_factory.mktemp("ca")
+    try:
+        yield ca_dir
+    finally:
+        shutil.rmtree(str(ca_dir), ignore_errors=True)
+
+
+@pytest.fixture(scope="module")
+def ca_key_file(ca_dir, ca_key):
+    with pytest.helpers.temp_file("ca.key", ca_key, ca_dir) as key:
+        yield key
+
+
+@pytest.fixture(scope="module")
+def ca_cert_file(ca_dir, ca_cert):
+    with pytest.helpers.temp_file("ca.crt", ca_cert, ca_dir) as crt:
+        yield crt
+
+
+@pytest.fixture(scope="module")
+def minion_config_overrides(ca_key_file, ca_cert_file):
     return {
         "x509_signing_policies": {
             "testpolicy": {
@@ -49,6 +70,11 @@ def minion_config_overrides():
             "testnosubjectpolicy": {
                 "CN": "from_signing_policy",
             },
+            "test_fixed_signing_private_key": {
+                "subject": "CN=from_signing_policy",
+                "signing_cert": str(ca_cert_file),
+                "signing_private_key": str(ca_key_file),
+            },
         },
         "features": {
             "x509_v2": True,
@@ -61,7 +87,7 @@ def x509(loaders, states, tmp_path):
     yield states.x509
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def ca_cert():
     return """\
 -----BEGIN CERTIFICATE-----
@@ -87,7 +113,7 @@ LN1w5sybsYwIw6QN
 """
 
 
-@pytest.fixture
+@pytest.fixture(scope="module")
 def ca_key():
     return """\
 -----BEGIN RSA PRIVATE KEY-----
@@ -387,11 +413,11 @@ O68=
 
 
 @pytest.fixture
-def cert_args(tmp_path, ca_cert, ca_key):
+def cert_args(tmp_path, ca_cert_file, ca_key_file):
     return {
         "name": f"{tmp_path}/cert",
-        "signing_private_key": ca_key,
-        "signing_cert": ca_cert,
+        "signing_private_key": str(ca_key_file),
+        "signing_cert": str(ca_cert_file),
         "CN": "success",
     }
 
@@ -418,11 +444,11 @@ def cert_args_exts():
 
 
 @pytest.fixture
-def crl_args(tmp_path, ca_cert, ca_key):
+def crl_args(tmp_path, ca_cert_file, ca_key_file):
     return {
         "name": f"{tmp_path}/crl",
-        "signing_private_key": ca_key,
-        "signing_cert": ca_cert,
+        "signing_private_key": str(ca_key_file),
+        "signing_cert": str(ca_cert_file),
         "revoked": [],
     }
 
@@ -694,12 +720,6 @@ def existing_csr_exts(x509, csr_args, csr_args_exts, ca_key, rsa_privkey, reques
 def existing_pk(x509, pk_args, request):
     pk_args.update(request.param)
     ret = x509.private_key_managed(**pk_args)
-    if ret.result == False and (
-        "UnsupportedAlgorithm" in ret.comment or "NotImplementedError" in ret.comment
-    ):
-        pytest.skip(
-            f"Algorithm '{pk_args['algo']}' is not supported on this OpenSSL version"
-        )
     _assert_pk_basic(
         ret,
         pk_args.get("algo", "rsa"),
@@ -712,16 +732,20 @@ def existing_pk(x509, pk_args, request):
 @pytest.fixture(params=["existing_cert"])
 def existing_symlink(request):
     existing = request.getfixturevalue(request.param)
-    test_file = Path(existing).with_name("symlink")
+    test_file = pathlib.Path(existing).with_name("symlink")
     test_file.symlink_to(existing)
     yield test_file
     # cleanup is done by tmp_path
 
 
-def test_certificate_managed_self_signed(x509, cert_args, ca_key):
+@pytest.mark.parametrize("encoding", ("pem", "der", "pkcs7_pem", "pkcs7_der", "pkcs12"))
+def test_certificate_managed_self_signed(x509, cert_args, ca_key, encoding):
     cert_args.pop("signing_cert")
+    cert_args["encoding"] = encoding
     ret = x509.certificate_managed(**cert_args)
-    _assert_cert_created_basic(ret, cert_args["name"], ca_key, ca_key)
+    _assert_cert_created_basic(
+        ret, cert_args["name"], ca_key, ca_key, encoding=encoding
+    )
 
 
 def test_certificate_managed_self_signed_enc(x509, cert_args, ca_key, ca_key_enc):
@@ -846,6 +870,20 @@ def test_certificate_managed_with_signing_policy(x509, cert_args, rsa_privkey, c
     assert _signed_by(cert, ca_key)
 
 
+def test_certificate_managed_with_fixed_signing_key_in_signing_policy(
+    x509, rsa_privkey, ca_key, cert_args
+):
+    cert_args["signing_policy"] = "test_fixed_signing_private_key"
+    cert_args["private_key"] = rsa_privkey
+    ret = x509.certificate_managed(**cert_args)
+    assert ret.result is True
+    assert ret.changes
+    assert ret.changes.get("created")
+    cert = _get_cert(cert_args["name"])
+    assert _belongs_to(cert, rsa_privkey)
+    assert _signed_by(cert, ca_key)
+
+
 def test_certificate_managed_with_distinguished_name_kwargs(
     x509, cert_args, rsa_privkey, ca_key
 ):
@@ -893,7 +931,7 @@ def test_certificate_managed_test_true(x509, cert_args, rsa_privkey, ca_key):
     ret = x509.certificate_managed(**cert_args)
     assert ret.result is None
     assert ret.changes
-    assert not Path(cert_args["name"]).exists()
+    assert not pathlib.Path(cert_args["name"]).exists()
 
 
 @pytest.mark.usefixtures("existing_cert")
@@ -923,6 +961,25 @@ def test_certificate_managed_existing_from_csr(x509, cert_args):
 def test_certificate_managed_existing_with_signing_policy(x509, cert_args):
     """
     Ensure signing policies are taken into account when checking for changes
+    """
+    ret = x509.certificate_managed(**cert_args)
+    _assert_not_changed(ret)
+
+
+@pytest.mark.usefixtures("existing_cert")
+@pytest.mark.parametrize(
+    "existing_cert",
+    [{"signing_policy": "test_fixed_signing_private_key"}],
+    indirect=True,
+)
+def test_certificate_managed_existing_with_fixed_signing_key_in_signing_policy(
+    x509, rsa_privkey, ca_key, cert_args
+):
+    """
+    If the policy defines a fixed signing_private_key and a certificate
+    is managed locally (without ca_server), the state module should not crash
+    when checking for changes.
+    Issue #66414
     """
     ret = x509.certificate_managed(**cert_args)
     _assert_not_changed(ret)
@@ -1058,8 +1115,6 @@ def test_certificate_managed_days_valid_does_not_override_days_remaining(
 def test_certificate_managed_privkey_change(x509, cert_args, ec_privkey, ca_key):
     cert_args["private_key"] = ec_privkey
     ret = x509.certificate_managed(**cert_args)
-    if ret.result == False and "NotImplementedError" in ret.comment:
-        pytest.skip("Current OpenSSL does not support 'ec' algorithm")
     _assert_cert_basic(ret, cert_args["name"], ec_privkey, ca_key)
     assert ret.changes["private_key"]
 
@@ -1243,8 +1298,6 @@ def test_certificate_managed_wrong_ca_key(
     cert_args["private_key"] = ec_privkey
     cert_args["signing_private_key"] = rsa_privkey
     ret = x509.certificate_managed(**cert_args)
-    if ret.result == False and "NotImplementedError" in ret.comment:
-        pytest.skip("Current OpenSSL does not support 'ec' algorithm")
     assert ret.result is False
     assert not ret.changes
     assert "Signing private key does not match the certificate" in ret.comment
@@ -1314,6 +1367,7 @@ def test_certificate_managed_extension_removed(x509, cert_args, rsa_privkey, ca_
     }
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.parametrize("mode", ["0400", "0640", "0644"])
 def test_certificate_managed_mode(x509, cert_args, rsa_privkey, ca_key, mode, modules):
     """
@@ -1337,9 +1391,10 @@ def test_certificate_managed_file_managed_create_false(
     ret = x509.certificate_managed(**cert_args)
     assert ret.result is True
     assert not ret.changes
-    assert not Path(cert_args["name"]).exists()
+    assert not pathlib.Path(cert_args["name"]).exists()
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.usefixtures("existing_cert")
 @pytest.mark.parametrize("existing_cert", [{"mode": "0644"}], indirect=True)
 def test_certificate_managed_mode_change_only(
@@ -1361,6 +1416,7 @@ def test_certificate_managed_mode_change_only(
     assert cert_new.serial_number == cert.serial_number
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.usefixtures("existing_cert")
 def test_certificate_managed_mode_test_true(x509, cert_args, modules):
     """
@@ -1410,7 +1466,7 @@ def test_certificate_managed_follow_symlinks(
     """
     cert_args["name"] = str(existing_symlink)
     cert_args["encoding"] = encoding
-    assert Path(cert_args["name"]).is_symlink()
+    assert pathlib.Path(cert_args["name"]).is_symlink()
     cert_args["follow_symlinks"] = follow
     ret = x509.certificate_managed(**cert_args)
     assert bool(ret.changes) == (not follow)
@@ -1430,13 +1486,13 @@ def test_certificate_managed_follow_symlinks_changes(
     the checking of the existing file is performed by the x509 module
     """
     cert_args["name"] = str(existing_symlink)
-    assert Path(cert_args["name"]).is_symlink()
+    assert pathlib.Path(cert_args["name"]).is_symlink()
     cert_args["follow_symlinks"] = follow
     cert_args["encoding"] = encoding
     cert_args["CN"] = "new"
     ret = x509.certificate_managed(**cert_args)
     assert ret.changes
-    assert Path(ret.name).is_symlink() == follow
+    assert pathlib.Path(ret.name).is_symlink() == follow
 
 
 @pytest.mark.parametrize("encoding", ["pem", "der"])
@@ -1449,7 +1505,7 @@ def test_certificate_managed_file_managed_error(
     cert_args["private_key"] = rsa_privkey
     cert_args["makedirs"] = False
     cert_args["encoding"] = encoding
-    cert_args["name"] = str(Path(cert_args["name"]).parent / "missing" / "cert")
+    cert_args["name"] = str(pathlib.Path(cert_args["name"]).parent / "missing" / "cert")
     ret = x509.certificate_managed(**cert_args)
     assert ret.result is False
     assert "Could not create file, see file.managed output" in ret.comment
@@ -1471,6 +1527,21 @@ def test_certificate_managed_pkcs12_embedded_pk_kept(
     assert list(ret.changes) == ["expiration"]
     new_pk = _get_cert(cert_args["name"], encoding="pkcs12").key
     assert new_pk.public_key().public_numbers() == cur_pk.public_key().public_numbers()
+
+
+@pytest.mark.parametrize("prepend_cn", [False, True])
+def test_certificate_managed_copypath(
+    x509, cert_args, rsa_privkey, ca_key, prepend_cn, tmp_path
+):
+    cert_args["private_key"] = rsa_privkey
+    cert_args["copypath"] = str(tmp_path)
+    cert_args["prepend_cn"] = prepend_cn
+    ret = x509.certificate_managed(**cert_args)
+    cert = _assert_cert_basic(ret, cert_args["name"], rsa_privkey, ca_key)
+    prefix = ""
+    if prepend_cn:
+        prefix = "success-"
+    assert (tmp_path / f"{prefix}{cert.serial_number:x}.crt").exists()
 
 
 def test_crl_managed_empty(x509, crl_args, ca_key):
@@ -1517,7 +1588,7 @@ def test_crl_managed_test_true(x509, crl_args, crl_revoked):
     assert ret.result is None
     assert ret.changes
     assert ret.result is None
-    assert not Path(crl_args["name"]).exists()
+    assert not pathlib.Path(crl_args["name"]).exists()
 
 
 @pytest.mark.usefixtures("existing_crl")
@@ -1702,6 +1773,7 @@ def test_crl_managed_existing_encoding_change_only(x509, crl_args, ca_key):
     assert new.extensions[0].value.crl_number == 1
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.parametrize("mode", ["0400", "0640", "0644"])
 def test_crl_managed_mode(x509, crl_args, ca_key, mode, modules):
     """
@@ -1721,9 +1793,10 @@ def test_crl_managed_file_managed_create_false(x509, crl_args):
     ret = x509.crl_managed(**crl_args)
     assert ret.result is True
     assert not ret.changes
-    assert not Path(crl_args["name"]).exists()
+    assert not pathlib.Path(crl_args["name"]).exists()
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.usefixtures("existing_crl")
 @pytest.mark.parametrize(
     "existing_crl",
@@ -1749,6 +1822,7 @@ def test_crl_managed_mode_change_only(x509, crl_args, ca_key, modules):
     )
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.usefixtures("existing_crl")
 def test_crl_managed_mode_test_true(x509, crl_args, modules):
     """
@@ -1795,7 +1869,7 @@ def test_crl_managed_follow_symlinks(
     """
     crl_args["name"] = str(existing_symlink)
     crl_args["encoding"] = encoding
-    assert Path(crl_args["name"]).is_symlink()
+    assert pathlib.Path(crl_args["name"]).is_symlink()
     crl_args["follow_symlinks"] = follow
     ret = x509.crl_managed(**crl_args)
     assert bool(ret.changes) == (not follow)
@@ -1815,13 +1889,13 @@ def test_crl_managed_follow_symlinks_changes(
     the checking of the existing file is performed by the x509 module
     """
     crl_args["name"] = str(existing_symlink)
-    assert Path(crl_args["name"]).is_symlink()
+    assert pathlib.Path(crl_args["name"]).is_symlink()
     crl_args["follow_symlinks"] = follow
     crl_args["encoding"] = encoding
     crl_args["revoked"] = crl_revoked
     ret = x509.crl_managed(**crl_args)
     assert ret.changes
-    assert Path(ret.name).is_symlink() == follow
+    assert pathlib.Path(ret.name).is_symlink() == follow
 
 
 @pytest.mark.parametrize("encoding", ["pem", "der"])
@@ -1831,7 +1905,7 @@ def test_crl_managed_file_managed_error(x509, crl_args, encoding):
     """
     crl_args["makedirs"] = False
     crl_args["encoding"] = encoding
-    crl_args["name"] = str(Path(crl_args["name"]).parent / "missing" / "crl")
+    crl_args["name"] = str(pathlib.Path(crl_args["name"]).parent / "missing" / "crl")
     ret = x509.crl_managed(**crl_args)
     assert ret.result is False
     assert "Could not create file, see file.managed output" in ret.comment
@@ -1879,7 +1953,7 @@ def test_csr_managed_test_true(x509, csr_args, rsa_privkey):
     ret = x509.csr_managed(**csr_args)
     assert ret.result is None
     assert ret.changes
-    assert not Path(csr_args["name"]).exists()
+    assert not pathlib.Path(csr_args["name"]).exists()
 
 
 @pytest.mark.usefixtures("existing_csr")
@@ -1925,8 +1999,6 @@ def test_csr_managed_existing_invalid_version(x509, csr_args, rsa_privkey):
 def test_csr_managed_privkey_change(x509, csr_args, ec_privkey):
     csr_args["private_key"] = ec_privkey
     ret = x509.csr_managed(**csr_args)
-    if ret.result == False and "NotImplementedError" in ret.comment:
-        pytest.skip("Current OpenSSL does not support 'ec' algorithm")
     _assert_csr_basic(ret, ec_privkey)
     assert ret.changes["private_key"]
 
@@ -1998,6 +2070,7 @@ def test_csr_managed_extension_removed(x509, csr_args, csr_args_exts, rsa_privke
     }
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.parametrize("mode", ["0400", "0640", "0644"])
 def test_csr_managed_mode(x509, csr_args, rsa_privkey, mode, modules):
     """
@@ -2017,9 +2090,10 @@ def test_csr_managed_file_managed_create_false(x509, csr_args):
     ret = x509.csr_managed(**csr_args)
     assert ret.result is True
     assert not ret.changes
-    assert not Path(csr_args["name"]).exists()
+    assert not pathlib.Path(csr_args["name"]).exists()
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.usefixtures("existing_csr")
 @pytest.mark.parametrize("existing_csr", [{"mode": "0644"}], indirect=True)
 def test_csr_managed_mode_change_only(x509, csr_args, ca_key, modules):
@@ -2036,6 +2110,7 @@ def test_csr_managed_mode_change_only(x509, csr_args, ca_key, modules):
     assert modules.file.get_mode(csr_args["name"]) == "0640"
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.usefixtures("existing_csr")
 def test_csr_managed_mode_test_true(x509, csr_args, modules):
     """
@@ -2081,12 +2156,12 @@ def test_csr_managed_follow_symlinks(
     the checking of the existing file is performed by the x509 module
     """
     csr_args["name"] = str(existing_symlink)
-    assert Path(csr_args["name"]).is_symlink()
+    assert pathlib.Path(csr_args["name"]).is_symlink()
     csr_args["follow_symlinks"] = follow
     csr_args["encoding"] = encoding
     ret = x509.csr_managed(**csr_args)
     assert bool(ret.changes) == (not follow)
-    assert Path(ret.name).is_symlink() == follow
+    assert pathlib.Path(ret.name).is_symlink() == follow
 
 
 @pytest.mark.parametrize(
@@ -2103,14 +2178,14 @@ def test_csr_managed_follow_symlinks_changes(
     the checking of the existing file is performed by the x509 module
     """
     csr_args["name"] = str(existing_symlink)
-    assert Path(csr_args["name"]).is_symlink()
+    assert pathlib.Path(csr_args["name"]).is_symlink()
     csr_args["follow_symlinks"] = follow
     csr_args["encoding"] = encoding
     csr_args["CN"] = "new"
     ret = x509.csr_managed(**csr_args)
     assert ret.result
     assert ret.changes
-    assert Path(ret.name).is_symlink() == follow
+    assert pathlib.Path(ret.name).is_symlink() == follow
 
 
 @pytest.mark.parametrize("encoding", ["pem", "der"])
@@ -2120,7 +2195,7 @@ def test_csr_managed_file_managed_error(x509, csr_args, encoding):
     """
     csr_args["makedirs"] = False
     csr_args["encoding"] = encoding
-    csr_args["name"] = str(Path(csr_args["name"]).parent / "missing" / "csr")
+    csr_args["name"] = str(pathlib.Path(csr_args["name"]).parent / "missing" / "csr")
     ret = x509.csr_managed(**csr_args)
     assert ret.result is False
     assert "Could not create file, see file.managed output" in ret.comment
@@ -2151,15 +2226,10 @@ def test_private_key_managed(x509, pk_args, algo, encoding, passphrase):
         pytest.skip(
             "PKCS12 serialization of Edwards-curve keys requires cryptography v37"
         )
-
     pk_args["algo"] = algo
     pk_args["encoding"] = encoding
     pk_args["passphrase"] = passphrase
     ret = x509.private_key_managed(**pk_args)
-    if ret.result == False and (
-        "UnsupportedAlgorithm" in ret.comment or "NotImplementedError" in ret.comment
-    ):
-        pytest.skip(f"Algorithm '{algo}' is not supported on this OpenSSL version")
     _assert_pk_basic(ret, algo, encoding, passphrase)
 
 
@@ -2168,8 +2238,6 @@ def test_private_key_managed_keysize(x509, pk_args, algo, keysize):
     pk_args["algo"] = algo
     pk_args["keysize"] = keysize
     ret = x509.private_key_managed(**pk_args)
-    if ret.result == False and "NotImplementedError" in ret.comment:
-        pytest.skip("Current OpenSSL does not support 'ec' algorithm")
     pk = _assert_pk_basic(ret, algo)
     assert pk.key_size == keysize
 
@@ -2189,13 +2257,22 @@ def test_private_key_managed_keysize(x509, pk_args, algo, keysize):
 )
 def test_private_key_managed_existing(x509, pk_args):
     ret = x509.private_key_managed(**pk_args)
-    if ret.result == False and (
-        "UnsupportedAlgorithm" in ret.comment or "NotImplementedError" in ret.comment
-    ):
-        pytest.skip(
-            f"Algorithm '{pk_args['algo']}' is not supported on this OpenSSL version"
-        )
     _assert_not_changed(ret)
+
+
+@pytest.mark.usefixtures("existing_pk")
+@pytest.mark.parametrize(
+    "existing_pk",
+    [
+        {"algo": "rsa", "keysize": 3072},
+    ],
+    indirect=True,
+)
+def test_private_key_managed_existing_keysize_change_to_default(x509, pk_args):
+    pk_args.pop("keysize")
+    ret = x509.private_key_managed(**pk_args)
+    assert ret.changes
+    assert ret.changes["keysize"] == 2048
 
 
 @pytest.mark.usefixtures("existing_pk")
@@ -2222,8 +2299,6 @@ def test_private_key_managed_existing_new_with_passphrase_change(x509, pk_args):
 def test_private_key_managed_algo_change(x509, pk_args):
     pk_args["algo"] = "ed25519"
     ret = x509.private_key_managed(**pk_args)
-    if ret.result == False and "UnsupportedAlgorithm" in ret.comment:
-        pytest.skip("Algorithm 'ed25519' is not supported on this OpenSSL version")
     _assert_pk_basic(ret, "ed25519")
 
 
@@ -2291,9 +2366,12 @@ def test_private_key_managed_passphrase_changed_not_overwrite(x509, pk_args):
     ret = x509.private_key_managed(**pk_args)
     assert ret.result is False
     assert not ret.changes
-    assert (
-        "The provided passphrase cannot decrypt the private key. Pass overwrite"
-        in ret.comment
+    assert any(
+        x in ret.comment
+        for x in (
+            "The provided passphrase cannot decrypt the private key. Pass overwrite",
+            "Could not load PEM-encoded private key",
+        )
     )
 
 
@@ -2303,9 +2381,19 @@ def test_private_key_managed_passphrase_changed_overwrite(x509, pk_args):
     pk_args["passphrase"] = "hunter1"
     pk_args["overwrite"] = True
     ret = x509.private_key_managed(**pk_args)
+    if ret.result is False:
+        assert any(
+            x in ret.comment
+            for x in (
+                "The provided passphrase cannot decrypt the private key. Pass overwrite",
+                "Could not load PEM-encoded private key",
+            )
+        )
+        return
     _assert_pk_basic(ret, "rsa", passphrase="hunter1")
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.parametrize("encoding", ["pem", "der"])
 @pytest.mark.parametrize("mode", [None, "0600", "0644"])
 def test_private_key_managed_mode(x509, pk_args, mode, encoding, modules):
@@ -2327,9 +2415,10 @@ def test_private_key_managed_file_managed_create_false(x509, pk_args):
     ret = x509.private_key_managed(**pk_args)
     assert ret.result is True
     assert not ret.changes
-    assert not Path(pk_args["name"]).exists()
+    assert not pathlib.Path(pk_args["name"]).exists()
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.usefixtures("existing_pk")
 def test_private_key_managed_mode_test_true(x509, pk_args, modules):
     """
@@ -2376,7 +2465,7 @@ def test_private_key_managed_follow_symlinks(
     """
     pk_args["name"] = str(existing_symlink)
     pk_args["encoding"] = encoding
-    assert Path(pk_args["name"]).is_symlink()
+    assert pathlib.Path(pk_args["name"]).is_symlink()
     pk_args["follow_symlinks"] = follow
     ret = x509.private_key_managed(**pk_args)
     assert bool(ret.changes) == (not follow)
@@ -2396,17 +2485,16 @@ def test_private_key_managed_follow_symlinks_changes(
     the checking of the existing file is performed by the x509 module
     """
     pk_args["name"] = str(existing_symlink)
-    assert Path(pk_args["name"]).is_symlink()
+    assert pathlib.Path(pk_args["name"]).is_symlink()
     pk_args["follow_symlinks"] = follow
     pk_args["encoding"] = encoding
     pk_args["algo"] = "ec"
     ret = x509.private_key_managed(**pk_args)
-    if ret.result == False and "NotImplementedError" in ret.comment:
-        pytest.skip("Current OpenSSL does not support 'ec' algorithm")
     assert ret.changes
-    assert Path(ret.name).is_symlink() == follow
+    assert pathlib.Path(ret.name).is_symlink() == follow
 
 
+@pytest.mark.skip_on_windows
 @pytest.mark.usefixtures("existing_pk")
 @pytest.mark.parametrize("existing_pk", [{"mode": "0400"}], indirect=True)
 def test_private_key_managed_mode_change_only(x509, pk_args, modules):
@@ -2432,7 +2520,7 @@ def test_private_key_managed_file_managed_error(x509, pk_args, encoding):
     """
     pk_args["makedirs"] = False
     pk_args["encoding"] = encoding
-    pk_args["name"] = str(Path(pk_args["name"]).parent / "missing" / "pk")
+    pk_args["name"] = str(pathlib.Path(pk_args["name"]).parent / "missing" / "pk")
     ret = x509.private_key_managed(**pk_args)
     assert ret.result is False
     assert "Could not create file, see file.managed output" in ret.comment
@@ -2447,7 +2535,14 @@ def test_private_key_managed_existing_not_a_pk(x509, pk_args, overwrite):
     assert bool(ret.result) == overwrite
     assert bool(ret.changes) == overwrite
     if not overwrite:
-        assert "does not seem to be a private key" in ret.comment
+        assert any(
+            x in ret.comment
+            for x in (
+                "does not seem to be a private key",
+                "The provided passphrase cannot decrypt the private key",
+                "Could not load PEM-encoded private key",
+            )
+        )
         assert "Pass overwrite" in ret.comment
 
 
@@ -2710,7 +2805,7 @@ def _assert_cert_basic(
 
 def _get_cert(cert, encoding="pem", passphrase=None):
     try:
-        p = Path(cert)
+        p = pathlib.Path(cert)
         if p.exists():
             cert = p.read_bytes()
     except Exception:  # pylint: disable=broad-except
@@ -2743,12 +2838,7 @@ def _get_cert(cert, encoding="pem", passphrase=None):
 def _belongs_to(cert_or_pubkey, privkey):
     if isinstance(cert_or_pubkey, cx509.Certificate):
         cert_or_pubkey = cert_or_pubkey.public_key()
-    try:
-        return x509util.is_pair(cert_or_pubkey, x509util.load_privkey(privkey))
-    except NotImplementedError:
-        pytest.skip(
-            "This OpenSSL version does not support current cryptographic algorithm"
-        )
+    return x509util.is_pair(cert_or_pubkey, x509util.load_privkey(privkey))
 
 
 def _signed_by(cert, privkey):
@@ -2797,7 +2887,7 @@ def _assert_not_changed(ret):
 
 def _get_crl(crl, encoding="pem"):
     try:
-        p = Path(crl)
+        p = pathlib.Path(crl)
         if p.exists():
             crl = p.read_bytes()
     except Exception:  # pylint: disable=broad-except
@@ -2815,7 +2905,7 @@ def _get_crl(crl, encoding="pem"):
 
 def _get_csr(csr, encoding="pem"):
     try:
-        p = Path(csr)
+        p = pathlib.Path(csr)
         if p.exists():
             csr = p.read_bytes()
     except Exception:  # pylint: disable=broad-except
@@ -2833,7 +2923,7 @@ def _get_csr(csr, encoding="pem"):
 
 def _get_privkey(pk, encoding="pem", passphrase=None):
     try:
-        p = Path(pk)
+        p = pathlib.Path(pk)
         if p.exists():
             pk = p.read_bytes()
     except Exception:  # pylint: disable=broad-except
@@ -2854,30 +2944,3 @@ def _get_privkey(pk, encoding="pem", passphrase=None):
             pk = base64.b64decode(pk)
         return pkcs12.load_pkcs12(pk, passphrase).key
     raise ValueError("Need correct encoding")
-
-
-@pytest.mark.usefixtures("existing_pk")
-@pytest.mark.parametrize("existing_pk", [{"passphrase": "password"}], indirect=True)
-def test_exceptions_on_calling_load_pem_private_key(x509, pk_args):
-    pk_args["passphrase"] = "hunter1"
-    pk_args["overwrite"] = True
-
-    with patch(
-        "cryptography.hazmat.primitives.serialization.load_pem_private_key",
-        side_effect=ValueError("Bad decrypt. Incorrect password?"),
-    ):
-        ret = x509.private_key_managed(**pk_args)
-    _assert_pk_basic(ret, "rsa", passphrase="hunter1")
-
-    with patch(
-        "cryptography.hazmat.primitives.serialization.load_pem_private_key",
-        side_effect=ValueError(
-            "Could not deserialize key data. The data may be in an incorrect format, "
-            "the provided password may be incorrect, "
-            "it may be encrypted with an unsupported algorithm, "
-            "or it may be an unsupported key type "
-            "(e.g. EC curves with explicit parameters)."
-        ),
-    ):
-        ret = x509.private_key_managed(**pk_args)
-    _assert_pk_basic(ret, "rsa", passphrase="hunter1")

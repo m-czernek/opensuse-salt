@@ -2,6 +2,7 @@ import os.path
 import random
 import string
 import sys
+from collections import OrderedDict
 from copy import deepcopy
 
 import pytest
@@ -9,7 +10,6 @@ import pytest
 import salt.config
 import salt.loader
 import salt.modules.boto_secgroup as boto_secgroup
-from salt.utils.odict import OrderedDict
 from salt.utils.versions import Version
 from tests.support.mixins import LoaderModuleMockMixin
 from tests.support.runtests import RUNTIME_VARS
@@ -70,7 +70,7 @@ boto_conn_parameters = {
 
 
 def _random_group_id():
-    group_id = "sg-{:x}".format(random.randrange(2**32))
+    group_id = f"sg-{random.randrange(2**32):x}"
     return group_id
 
 

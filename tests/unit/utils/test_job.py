@@ -2,7 +2,6 @@
 unit tests for salt.utils.job
 """
 
-
 import salt.minion
 import salt.utils.job as job
 from tests.support.mock import patch
@@ -23,6 +22,12 @@ class MockMasterMinion:
     }
 
     def __init__(self, *args, **kwargs):
+        pass
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
         pass
 
 

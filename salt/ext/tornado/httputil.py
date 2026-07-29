@@ -71,10 +71,6 @@ except ImportError:
 # To be used with str.strip() and related methods.
 HTTP_WHITESPACE = " \t"
 
-# Roughly the inverse of RequestHandler._VALID_HEADER_CHARS, but permits
-# chars greater than \xFF (which may appear after decoding utf8).
-_FORBIDDEN_HEADER_CHARS_RE = re.compile(r"[\x00-\x08\x0A-\x1F\x7F]")
-
 # RFC 7230 section 3.5: a recipient MAY recognize a single LF as a line
 # terminator and ignore any preceding CR.
 _CRLF_RE = re.compile(r"\r?\n")
@@ -143,8 +139,8 @@ class HTTPHeaders(MutableMapping):
     """
 
     def __init__(self, *args, **kwargs):
+        self._dict = {}  # type: typing.Dict[str, str]
         self._as_list = {}  # type: typing.Dict[str, typing.List[str]]
-        self._combined_cache = {} # type: typing.Dict[str, str]
         self._last_key = None
         if len(args) == 1 and len(kwargs) == 0 and isinstance(args[0], HTTPHeaders):
             # Copy constructor
@@ -159,12 +155,12 @@ class HTTPHeaders(MutableMapping):
     def add(self, name, value):
         # type: (str, str) -> None
         """Adds a new value for the given key."""
-        if _FORBIDDEN_HEADER_CHARS_RE.search(value):
-            raise HTTPInputError("Invalid header value %r" % value)
         norm_name = _normalized_headers[name]
         self._last_key = norm_name
         if norm_name in self:
-            self._combined_cache.pop(norm_name, None)
+            self._dict[norm_name] = (
+                native_str(self[norm_name]) + "," + native_str(value)
+            )
             self._as_list[norm_name].append(value)
         else:
             self[norm_name] = value
@@ -193,30 +189,13 @@ class HTTPHeaders(MutableMapping):
         >>> h.get('content-type')
         'text/html'
         """
-        m = re.search(r"\r?\n$", line)
-        if m:
-            # RFC 9112 section 2.2: a recipient MAY recognize a single LF as a line
-            # terminator and ignore any preceding CR.
-            # TODO(7.0): Remove this support for LF-only line endings.
-            line = line[: m.start()]
-        if not line:
-            # Empty line, or the final CRLF of a header block.
-            return
-        if line[0] in HTTP_WHITESPACE:
+        if line[0].isspace():
             # continuation of a multi-line header
-            # TODO(7.0): Remove support for line folding.
-            if self._last_key is None:
-                raise HTTPInputError("first header line cannot start with whitespace")
-            new_part = " " + line.strip(HTTP_WHITESPACE)
-            if _FORBIDDEN_HEADER_CHARS_RE.search(new_part):
-                raise HTTPInputError("Invalid header value %r" % new_part)
+            new_part = " " + line.lstrip(HTTP_WHITESPACE)
             self._as_list[self._last_key][-1] += new_part
-            self._combined_cache.pop(self._last_key, None)
+            self._dict[self._last_key] += new_part
         else:
-            try:
-                name, value = line.split(":", 1)
-            except ValueError:
-                raise HTTPInputError("no colon in header line")
+            name, value = line.split(":", 1)
             self.add(name, value.strip(HTTP_WHITESPACE))
 
     @classmethod
@@ -237,33 +216,23 @@ class HTTPHeaders(MutableMapping):
 
     def __setitem__(self, name, value):
         norm_name = _normalized_headers[name]
-        self._combined_cache[norm_name] = value
+        self._dict[norm_name] = value
         self._as_list[norm_name] = [value]
-
-    def __contains__(self, name):
-        # This is an important optimization to avoid the expensive concatenation
-        # in __getitem__ when it's not needed.
-        if not isinstance(name, str):
-            return False
-        return name in self._as_list
 
     def __getitem__(self, name):
         # type: (str) -> str
-        header = _normalized_headers[name]
-        if header not in self._combined_cache:
-            self._combined_cache[header] = ",".join(self._as_list[header])
-        return self._combined_cache[header]
+        return self._dict[_normalized_headers[name]]
 
     def __delitem__(self, name):
         norm_name = _normalized_headers[name]
-        del self._combined_cache[norm_name]
+        del self._dict[norm_name]
         del self._as_list[norm_name]
 
     def __len__(self):
-        return len(self._as_list)
+        return len(self._dict)
 
     def __iter__(self):
-        return iter(self._as_list)
+        return iter(self._dict)
 
     def copy(self):
         # defined in dict but not in MutableMapping.
@@ -777,83 +746,28 @@ def _int_or_none(val):
 
 
 class ParseMultipartConfig:
-    """This class configures the parsing of ``multipart/form-data`` request bodies.
+    """Configures the parsing of multipart/form-data request bodies.
 
-    Its primary purpose is to place limits on the size and complexity of request messages
-    to avoid potential denial-of-service attacks.
+    Its primary purpose is to place limits on the size and complexity of
+    request messages to avoid potential denial-of-service attacks.
     """
-    def __init__(self, enabled=True, max_parts=100, max_part_header_size=10*1024):
+
+    def __init__(self, enabled=True, max_parts=100, max_part_header_size=10 * 1024):
         self.enabled = enabled
-        """Set this to false to disable the parsing of ``multipart/form-data`` requests entirely.
-
-        This may be desirable for applications that do not need to handle this format, since
-        multipart request have a history of DoS vulnerabilities in Tornado. Multipart requests
-        are used primarily for ``<input type="file">`` in HTML forms, or in APIs that mimic this
-        format. File uploads that use the HTTP ``PUT`` method generally do not use the multipart
-        format.
-        """
-
         self.max_parts = max_parts
-        """The maximum number of parts accepted in a multipart request.
-
-        Each ``<input>`` element in an HTML form corresponds to at least one "part".
-        """
-
         self.max_part_header_size = max_part_header_size
-        """The maximum size of the headers for each part of a multipart request.
-
-        The header for a part contains the name of the form field and optionally the filename
-        and content type of the uploaded file.
-        """
-
-    def __repr__(self):
-        return (f"ParseMultipartConfig(enabled={self.enabled}, "
-                f"max_parts={self.max_parts}, "
-                f"max_part_header_size={self.max_part_header_size})")
 
 
-class ParseBodyConfig:
-    """This class configures the parsing of request bodies.
-    """
-
-    def __init__(self, multipart=None):
-        if multipart is None:
-            multipart = ParseMultipartConfig()
-        self.multipart = multipart
-        """Configuration for ``multipart/form-data`` request bodies."""
-
-    def __repr__(self):
-        return (f"ParseBodyConfig(multipart={self.multipart})")
-
-
-_DEFAULT_PARSE_BODY_CONFIG = ParseBodyConfig()
+_DEFAULT_MULTIPART_CONFIG = ParseMultipartConfig()
 
 
 def set_parse_body_config(config):
-    r"""Sets the **global** default configuration for parsing request bodies.
-
-    This global setting is provided as a stopgap for applications that need to raise the limits
-    introduced in Tornado 6.5.5, or who wish to disable the parsing of multipart/form-data bodies
-    entirely. Non-global configuration for this functionality will be introduced in a future
-    release.
-
-    >>> content_type = "multipart/form-data; boundary=foo"
-    >>> multipart_body = b"--foo--\r\n"
-    >>> parse_body_arguments(content_type, multipart_body, {}, {})
-    >>> multipart_config = ParseMultipartConfig(enabled=False)
-    >>> config = ParseBodyConfig(multipart=multipart_config)
-    >>> set_parse_body_config(config)
-    >>> parse_body_arguments(content_type, multipart_body, {}, {})
-    Traceback (most recent call last):
-        ...
-    tornado.httputil.HTTPInputError: ...: multipart/form-data parsing is disabled
-    >>> set_parse_body_config(ParseBodyConfig())  # reset to defaults
-    """
-    global _DEFAULT_PARSE_BODY_CONFIG
-    _DEFAULT_PARSE_BODY_CONFIG = config
+    """Sets the global default configuration for parsing request bodies."""
+    global _DEFAULT_MULTIPART_CONFIG
+    _DEFAULT_MULTIPART_CONFIG = config
 
 
-def parse_body_arguments(content_type, body, arguments, files, headers=None, config=None):
+def parse_body_arguments(content_type, body, arguments, files, headers=None):
     """Parses a form request body.
 
     Supports ``application/x-www-form-urlencoded`` and
@@ -862,17 +776,14 @@ def parse_body_arguments(content_type, body, arguments, files, headers=None, con
     and ``files`` parameters are dictionaries that will be updated
     with the parsed contents.
     """
-    if config is None:
-        config = _DEFAULT_PARSE_BODY_CONFIG
     if headers and "Content-Encoding" in headers:
-        raise HTTPInputError(
-            "Unsupported Content-Encoding: %s" % headers["Content-Encoding"]
-        )
+        raise HTTPInputError("Unsupported Content-Encoding: %s" % headers["Content-Encoding"])
+        return
     if content_type.startswith("application/x-www-form-urlencoded"):
         try:
             uri_arguments = parse_qs_bytes(native_str(body), keep_blank_values=True)
         except Exception as e:
-            raise HTTPInputError("Invalid x-www-form-urlencoded body: %s" % e)
+            raise HTTPInputError("Invalid x-www-form-urlencoded body: %s" % e) from e
         for name, values in uri_arguments.items():
             if values:
                 arguments.setdefault(name, []).extend(values)
@@ -880,19 +791,19 @@ def parse_body_arguments(content_type, body, arguments, files, headers=None, con
         try:
             fields = content_type.split(";")
             if fields[0].strip() != "multipart/form-data":
-                # This catches "Content-Type: multipart/form-dataxyz"
                 raise HTTPInputError("Invalid content type")
             for field in fields:
                 k, sep, v = field.strip().partition("=")
                 if k == "boundary" and v:
                     parse_multipart_form_data(
-                        utf8(v), body, arguments, files, config.multipart
+                        utf8(v), body, arguments, files,
+                        config=_DEFAULT_MULTIPART_CONFIG,
                     )
                     break
             else:
                 raise HTTPInputError("multipart boundary not found")
         except Exception as e:
-            raise HTTPInputError("Invalid multipart/form-data: %s" % e)
+            raise HTTPInputError("Invalid multipart/form-data: %s" % e) from e
 
 
 def parse_multipart_form_data(boundary, data, arguments, files, config=None):
@@ -903,7 +814,7 @@ def parse_multipart_form_data(boundary, data, arguments, files, config=None):
     will be updated with the contents of the body.
     """
     if config is None:
-        config = _DEFAULT_PARSE_BODY_CONFIG.multipart
+        config = _DEFAULT_MULTIPART_CONFIG
     if not config.enabled:
         raise HTTPInputError("multipart/form-data parsing is disabled")
     # The standard allows for the boundary to be quoted in the header,
@@ -915,7 +826,7 @@ def parse_multipart_form_data(boundary, data, arguments, files, config=None):
         boundary = boundary[1:-1]
     final_boundary_index = data.rfind(b"--" + boundary + b"--")
     if final_boundary_index == -1:
-        raise HTTPInputError("Invalid multipart/form-data: no final boundary found")
+        raise HTTPInputError("Invalid multipart/form-data: no final boundary")
     parts = data[:final_boundary_index].split(b"--" + boundary + b"\r\n")
     if len(parts) > config.max_parts:
         raise HTTPInputError("multipart/form-data has too many parts")
@@ -934,7 +845,7 @@ def parse_multipart_form_data(boundary, data, arguments, files, config=None):
             raise HTTPInputError("Invalid multipart/form-data")
         value = part[eoh + 4 : -2]
         if not disp_params.get("name"):
-            raise HTTPInputError("multipart/form-data missing name")
+            raise HTTPInputError("multipart/form-data value missing name")
         name = disp_params["name"]
         if disp_params.get("filename"):
             ctype = headers.get("Content-Type", "application/unknown")
@@ -1092,7 +1003,7 @@ def _encode_header(key, pdict):
 def doctests():
     import doctest
 
-    return doctest.DocTestSuite(optionflags=doctest.ELLIPSIS)
+    return doctest.DocTestSuite()
 
 
 def split_host_and_port(netloc):

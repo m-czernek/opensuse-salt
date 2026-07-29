@@ -123,8 +123,8 @@ def test_present_invalid_gid_change():
     )
     dunder_salt = {
         "user.info": mock_info,
-        "file.group_to_gid": MagicMock(side_effect=["foo"]),
-        "file.gid_to_group": MagicMock(side_effect=[5000, 5000]),
+        "file.group_to_gid": MagicMock(return_value="foo"),
+        "file.gid_to_group": MagicMock(return_value=5000),
     }
     with patch.dict(user.__grains__, {"kernel": "Linux"}), patch.dict(
         user.__salt__, dunder_salt
@@ -148,8 +148,8 @@ def test_present_invalid_uid_gid_change():
     )
     dunder_salt = {
         "user.info": mock_info,
-        "file.group_to_gid": MagicMock(side_effect=["foo"]),
-        "file.gid_to_group": MagicMock(side_effect=[5000, 5000]),
+        "file.group_to_gid": MagicMock(return_value="foo"),
+        "file.gid_to_group": MagicMock(return_value=5000),
     }
     with patch.dict(user.__grains__, {"kernel": "Linux"}), patch.dict(
         user.__salt__, dunder_salt
@@ -179,7 +179,7 @@ def test_present_uid_gid_change():
     # get the before/after for the changes dict, and one last time to
     # confirm that no changes still need to be made.
     mock_info = MagicMock(side_effect=[before, before, after, after])
-    mock_group_to_gid = MagicMock(side_effect=[5000, 5001])
+    mock_group_to_gid = MagicMock(side_effect=[5000, 5000, 5001, 5001])
     mock_gid_to_group = MagicMock(
         side_effect=["othergroup", "foo", "othergroup", "othergroup"]
     )
@@ -256,12 +256,11 @@ def test_changes():
         "file.gid_to_group": MagicMock(side_effect=[5000, 5000]),
     }
 
-    def mock_exists(*args):
-        return True
-
     with patch.dict(user.__grains__, {"kernel": "Linux"}), patch.dict(
         user.__salt__, dunder_salt
-    ), patch.dict(user.__opts__, {"test": False}), patch("os.path.isdir", mock_exists):
+    ), patch.dict(user.__opts__, {"test": False}), patch(
+        "os.path.isdir", MagicMock(return_value=True)
+    ):
         ret = user._changes("foo", maxdays=999999, inactdays=0, warndays=7)
         assert ret == {
             "maxdays": 999999,
@@ -461,3 +460,103 @@ def test_present_password_unlock():
         else:
             unlock_password.assert_called_once()
             unlock_account.assert_not_called()
+
+
+def test_present_test_mode_missing_group_new_user():
+    """
+    Regression test for #68110: user.present should not fail in test mode
+    when a referenced group does not yet exist (e.g. it will be created by
+    a group.present requisite during the actual run). When the user also
+    does not yet exist, the state should report it would be added and that
+    the missing groups are pending.
+    """
+    mock_false = MagicMock(return_value=False)
+    mock_empty_list = MagicMock(return_value=[])
+    with patch.dict(user.__grains__, {"kernel": "Linux"}), patch.dict(
+        user.__salt__,
+        {
+            "group.info": mock_false,
+            "user.info": mock_empty_list,
+            "user.chkey": mock_empty_list,
+            "user.add": mock_false,
+        },
+    ), patch.dict(user.__opts__, {"test": True}):
+        ret = user.present("foo", groups=["foo"])
+        assert ret["result"] is None, ret
+        assert "set to be added" in ret["comment"], ret
+        assert "foo" in ret["comment"], ret
+
+
+def test_present_test_mode_missing_group_existing_user():
+    """
+    Regression test for #68110: when the user already exists, a missing
+    required group should not cause a hard failure in test mode. The
+    pending group(s) should appear in the test-mode comment.
+    """
+    mock_info = MagicMock(
+        return_value={
+            "uid": 5000,
+            "gid": 5000,
+            "groups": ["bar"],
+            "home": "/home/baz",
+            "fullname": "Baz",
+        }
+    )
+    # group.info: "foo" missing, "bar" exists.
+    group_info = MagicMock(
+        side_effect=lambda name: False if name == "foo" else {"gid": 5000}
+    )
+    dunder_salt = {
+        "group.info": group_info,
+        "user.info": mock_info,
+        "file.group_to_gid": MagicMock(return_value=5000),
+        "file.gid_to_group": MagicMock(return_value="bar"),
+    }
+    with patch.dict(user.__grains__, {"kernel": "Linux"}), patch.dict(
+        user.__salt__, dunder_salt
+    ), patch.dict(user.__opts__, {"test": True}):
+        ret = user.present("baz", groups=["foo", "bar"])
+        assert ret["result"] is not False, ret
+        assert "not present" not in ret["comment"], ret
+        # Pending group should be reported somewhere in the comment.
+        assert "foo" in ret["comment"], ret
+
+
+@pytest.mark.parametrize(
+    "current,wanted,remove,return_value,expected",
+    [
+        (["grp1"], ["grp1"], False, MagicMock(return_value={"gid": 100}), False),
+        (
+            ["grp1"],
+            ["grp1", "grp2"],
+            False,
+            MagicMock(side_effect=[{"gid": 100}, {"gid": 200}]),
+            True,
+        ),
+        (
+            ["grp1"],
+            ["grp1", "grp2"],
+            False,
+            MagicMock(side_effect=[{"gid": 100}, {"gid": 100}]),
+            False,
+        ),
+        (
+            ["grp1", "grp2"],
+            ["grp1"],
+            True,
+            MagicMock(side_effect=[{"gid": 100}, {"gid": 200}]),
+            True,
+        ),
+        (
+            ["grp1", "grp2"],
+            ["grp1"],
+            True,
+            MagicMock(side_effect=[{"gid": 100}, {"gid": 100}]),
+            False,
+        ),
+    ],
+)
+def test__group_changes(current, wanted, remove, return_value, expected):
+    with patch.dict(user.__salt__, {"group.info": return_value}):
+        ret = user._group_changes(current, wanted, remove)
+    assert ret == expected

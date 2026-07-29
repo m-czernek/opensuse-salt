@@ -7,6 +7,20 @@ pytestmark = [
 ]
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_utf16(path, text):
+    """Write *text* to *path* as UTF-16 (with BOM)."""
+    path.write_text(text, encoding="utf-16")
+
+
+def _read_utf16(path):
+    return path.read_text(encoding="utf-16")
+
+
 def test_replace(file, tmp_path):
     """
     file.replace
@@ -86,9 +100,9 @@ def test_replace_issue_18612_prepend(file, tmp_path):
         )
 
     # ensure, the resulting file contains the expected lines
-    assert path_test.read_text() == "en_US.UTF-8\n{}".format(contents)
+    assert path_test.read_text() == f"en_US.UTF-8\n{contents}"
 
-    backup_file = path_test.with_name("{}.bak".format(path_test.name))
+    backup_file = path_test.with_name(f"{path_test.name}.bak")
     assert backup_file.is_file()
     assert backup_file.read_text() == contents
 
@@ -127,9 +141,9 @@ def test_replace_issue_18612_append(file, tmp_path):
         )
 
     # ensure, the resulting file contains the expected lines
-    assert path_test.read_text() == "{}\nen_US.UTF-8\n".format(contents)
+    assert path_test.read_text() == f"{contents}\nen_US.UTF-8\n"
 
-    backup_file = path_test.with_name("{}.bak".format(path_test.name))
+    backup_file = path_test.with_name(f"{path_test.name}.bak")
     assert backup_file.is_file()
     assert backup_file.read_text() == contents
 
@@ -171,9 +185,9 @@ def test_replace_issue_18612_append_not_found_content(file, tmp_path):
         )
 
     # ensure, the resulting file contains the expected lines
-    assert path_test.read_text() == "{}\n{}\n".format(contents, not_found_content)
+    assert path_test.read_text() == f"{contents}\n{not_found_content}\n"
 
-    backup_file = path_test.with_name("{}.bak".format(path_test.name))
+    backup_file = path_test.with_name(f"{path_test.name}.bak")
     assert backup_file.is_file()
     assert backup_file.read_text() == contents
 
@@ -215,7 +229,7 @@ def test_replace_issue_18612_change_mid_line_with_comment(file, tmp_path):
     # ensure, the resulting file contains the expected lines
     assert path_test.read_text() == contents.replace("#foo=bar", "foo=salt")
 
-    backup_file = path_test.with_name("{}.bak".format(path_test.name))
+    backup_file = path_test.with_name(f"{path_test.name}.bak")
     assert backup_file.is_file()
     assert backup_file.read_text() == contents
 
@@ -273,7 +287,7 @@ def test_replace_issue_18841_no_changes(file, tmp_path):
     assert path_test.read_text() == contents
 
     # ensure no backup file was created
-    backup_file = path_test.with_name("{}.bak".format(path_test.name))
+    backup_file = path_test.with_name(f"{path_test.name}.bak")
     assert backup_file.is_file() is False
 
     # ensure the file's mtime didn't change
@@ -328,7 +342,7 @@ def test_replace_issue_18841_omit_backup(file, tmp_path):
     assert path_test.read_text() == contents
 
     # ensure no backup file was created
-    backup_file = path_test.with_name("{}.bak".format(path_test.name))
+    backup_file = path_test.with_name(f"{path_test.name}.bak")
     assert backup_file.is_file() is False
 
     # ensure the file's mtime didn't change
@@ -378,20 +392,20 @@ def test_file_replace_prerequired_issues_55775(modules, state_tree, tmp_path):
     assert managed_file.exists()
 
 
-def test_file_replace_check_cmd(modules, state_tree, tmp_path):
+def test_file_replace_check_cmd(modules, state_tree):
     """
     Test that check_cmd works for file.replace
     and those states do not run.
     """
-    sls_contents = f"""
-replace_in_file:
-  file.replace:
-    - name: /tmp/test
-    - pattern: hi
-    - repl: "replacement text"
-    - append_if_not_found: True
-    - check_cmd:
-      - "djasjahj"
+    sls_contents = """
+    replace_in_file:
+      file.replace:
+        - name: /tmp/test
+        - pattern: hi
+        - repl: "replacement text"
+        - append_if_not_found: True
+        - check_cmd:
+          - "djasjahj"
     """
     with pytest.helpers.temp_file(
         "file-replace-check-cmd.sls", sls_contents, state_tree
@@ -400,3 +414,163 @@ replace_in_file:
         for state_run in ret:
             assert state_run.result is False
             assert state_run.comment == "check_cmd determined the state failed"
+
+
+# ---------------------------------------------------------------------------
+# UTF-16 encoding tests (issue #52793)
+# ---------------------------------------------------------------------------
+
+
+def test_replace_utf16_state(file, tmp_path):
+    """
+    file.replace state with encoding='utf-16' should successfully replace a
+    pattern in a UTF-16 encoded file and keep the file in UTF-16 encoding.
+    """
+    name = tmp_path / "PSWindowsUpdate.psd1"
+    _write_utf16(name, "PowerShellVersion = '2.0'\r\nModuleVersion = '1.0'\r\n")
+
+    ret = file.replace(
+        name=str(name),
+        pattern=r"PowerShellVersion\s+=\s+'2\.0'",
+        repl="PowerShellVersion = '3.0'",
+        encoding="utf-16",
+        backup=False,
+    )
+
+    assert ret.result is True
+    content = _read_utf16(name)
+    assert "PowerShellVersion = '3.0'" in content
+    assert "PowerShellVersion = '2.0'" not in content
+    assert "ModuleVersion = '1.0'" in content
+
+    raw = name.read_bytes()
+    assert raw[:2] in (b"\xff\xfe", b"\xfe\xff"), "BOM missing after replace"
+
+
+def test_replace_utf16_state_idempotent(file, tmp_path):
+    """
+    Calling file.replace twice on a UTF-16 file should produce no changes on
+    the second run (idempotency, similar to issue #18612).
+    """
+    name = tmp_path / "idempotent.psd1"
+    _write_utf16(name, "PowerShellVersion = '2.0'\r\n")
+
+    results = []
+    for _ in range(2):
+        results.append(
+            file.replace(
+                name=str(name),
+                pattern=r"PowerShellVersion\s+=\s+'2\.0'",
+                repl="PowerShellVersion = '3.0'",
+                encoding="utf-16",
+                backup=False,
+            )
+        )
+
+    assert results[0].result is True
+    assert results[1].result is True
+    assert "PowerShellVersion = '3.0'" in _read_utf16(name)
+    assert "PowerShellVersion = '2.0'" not in _read_utf16(name)
+
+
+def test_replace_utf16_state_no_match(file, tmp_path):
+    """
+    file.replace state with encoding='utf-16' should report no changes when
+    the pattern is not found, leaving the file byte-for-byte identical.
+    """
+    name = tmp_path / "no_match.psd1"
+    _write_utf16(name, "PowerShellVersion = '3.0'\n")
+    original_bytes = name.read_bytes()
+
+    ret = file.replace(
+        name=str(name),
+        pattern=r"DoesNotExist",
+        repl="something",
+        encoding="utf-16",
+        backup=False,
+    )
+
+    assert ret.result is True
+    assert name.read_bytes() == original_bytes
+
+
+def test_replace_utf16_state_append_if_not_found(file, tmp_path):
+    """
+    append_if_not_found=True should append content to a UTF-16 file when the
+    pattern is absent, and not grow the file on subsequent runs.
+    """
+    name = tmp_path / "append.psd1"
+    _write_utf16(name, "ModuleVersion = '1.0'\r\n")
+
+    results = []
+    for _ in range(3):
+        results.append(
+            file.replace(
+                name=str(name),
+                pattern=r"^PowerShellVersion\s*=.*$",
+                repl="PowerShellVersion = '3.0'",
+                append_if_not_found=True,
+                encoding="utf-16",
+                backup=False,
+            )
+        )
+
+    for ret in results:
+        assert ret.result is True
+
+    content = _read_utf16(name)
+    assert content.count("PowerShellVersion") == 1
+    assert "ModuleVersion = '1.0'" in content
+
+
+def test_replace_utf32_state(file, tmp_path):
+    """
+    file.replace state with encoding='utf-32' should successfully replace a
+    pattern in a UTF-32 encoded file and keep the file in UTF-32 encoding.
+    """
+    name = tmp_path / "test_utf32.txt"
+    name.write_text("key = old_value\n", encoding="utf-32")
+
+    ret = file.replace(
+        name=str(name),
+        pattern=r"key = old_value",
+        repl="key = new_value",
+        encoding="utf-32",
+        backup=False,
+    )
+
+    assert ret.result is True
+    content = name.read_text(encoding="utf-32")
+    assert "key = new_value" in content
+    assert "key = old_value" not in content
+
+    raw = name.read_bytes()
+    assert raw[:4] in (
+        b"\xff\xfe\x00\x00",
+        b"\x00\x00\xfe\xff",
+    ), "BOM missing after replace: file is no longer UTF-32"
+
+
+def test_replace_utf16_execution_module(modules, tmp_path):
+    """
+    The file.replace execution module called directly should handle UTF-16
+    files when encoding is specified.
+    """
+    name = tmp_path / "exec_module.psd1"
+    _write_utf16(name, "PowerShellVersion = '2.0'\r\nModuleVersion = '1.0'\r\n")
+
+    result = modules.file.replace(
+        path=str(name),
+        pattern=r"PowerShellVersion\s+=\s+'2\.0'",
+        repl="PowerShellVersion = '3.0'",
+        encoding="utf-16",
+        show_changes=False,
+    )
+
+    assert result is True
+    content = _read_utf16(name)
+    assert "PowerShellVersion = '3.0'" in content
+    assert "PowerShellVersion = '2.0'" not in content
+
+    raw = name.read_bytes()
+    assert raw[:2] in (b"\xff\xfe", b"\xfe\xff"), "BOM missing after replace"

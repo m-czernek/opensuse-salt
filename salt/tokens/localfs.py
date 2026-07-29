@@ -2,7 +2,6 @@
 Stores eauth tokens in the filesystem of the master. Location is configured by the master config option 'token_dir'
 """
 
-
 import hashlib
 import logging
 import os
@@ -11,6 +10,7 @@ import salt.payload
 import salt.utils.files
 import salt.utils.path
 import salt.utils.verify
+from salt.config import DEFAULT_HASH_TYPE
 
 log = logging.getLogger(__name__)
 
@@ -27,10 +27,10 @@ def mk_token(opts, tdata):
     :param tdata: Token data to be stored with 'token' attribute of this dict set to the token.
     :returns: tdata with token if successful. Empty dict if failed.
     """
-    hash_type = getattr(hashlib, opts.get("hash_type", "md5"))
+    hash_type = getattr(hashlib, opts.get("hash_type", DEFAULT_HASH_TYPE))
     tok = str(hash_type(os.urandom(512)).hexdigest())
     t_path = os.path.join(opts["token_dir"], tok)
-    temp_t_path = "{}.tmp".format(t_path)
+    temp_t_path = f"{t_path}.tmp"
     while os.path.isfile(t_path):
         tok = str(hash_type(os.urandom(512)).hexdigest())
         t_path = os.path.join(opts["token_dir"], tok)
@@ -89,10 +89,10 @@ def list_tokens(opts):
     List all tokens in the store.
 
     :param opts: Salt master config options
-    :returns: List of dicts (tokens)
+    :returns: Generator of tokens
     """
-    ret = []
-    for (dirpath, dirnames, filenames) in salt.utils.path.os_walk(opts["token_dir"]):
-        for token in filenames:
-            ret.append(token)
-    return ret
+    if not os.path.exists(opts["token_dir"]):
+        return
+    for entry in os.scandir(opts["token_dir"]):
+        if entry.is_file():
+            yield entry.name

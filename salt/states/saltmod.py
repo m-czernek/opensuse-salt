@@ -33,7 +33,6 @@ import salt.syspaths
 import salt.utils.data
 import salt.utils.event
 import salt.utils.versions
-from salt.features import features
 
 log = logging.getLogger(__name__)
 
@@ -97,6 +96,48 @@ def _parallel_map(func, inputs):
             exc_type, exc_value, exc_traceback = error
             raise exc_value.with_traceback(exc_traceback)
     return outputs
+
+
+def _format_failure_detail(minion, m_ret, m_no_return):
+    """
+    Build a one-line human-readable detail string explaining a
+    minion-level failure that did *not* produce a state-result dict.
+
+    The orchestrate state historically reported these failures as a bare
+    ``Run failed on minions: <minion>`` line with an opaque ``False`` (or
+    list of error strings) buried in ``changes``. That left operators
+    with no clue what went wrong (issue #68326). This helper produces
+    the per-minion line we append to that comment.
+
+    The contract:
+
+    * ``m_no_return=True`` means the minion's response had no ``ret``
+      key at all (the master flagged it ``failed: True``, or otherwise
+      lost the return). We say so explicitly.
+    * A list/tuple ``m_ret`` is treated as a sequence of error strings
+      (state.sls returns this shape for pillar errors, queue conflicts,
+      and similar pre-compilation failures) and joined.
+    * Any other non-dict ``m_ret`` (``False`` is the case that triggered
+      the report) is reproduced literally so the operator can see what
+      came back.
+    * A dict ``m_ret`` reaching this helper means
+      ``state.check_result`` rejected the high-level shape; we omit a
+      detail line and let the existing ``changes`` payload speak for
+      itself rather than dumping the full dict into the comment.
+
+    Returns an empty string when there is no useful one-line summary to
+    add; callers should treat empty as "nothing to append".
+    """
+    if m_no_return:
+        return f"Minion {minion} did not return a state result."
+    if isinstance(m_ret, (list, tuple)):
+        parts = [str(item) for item in m_ret if item]
+        if not parts:
+            return f"Minion {minion} returned an empty error list."
+        return "Minion {} returned errors: {}".format(minion, "; ".join(parts))
+    if isinstance(m_ret, dict):
+        return ""
+    return f"Minion {minion} returned {m_ret!r} instead of a state result."
 
 
 def state(
@@ -350,9 +391,11 @@ def state(
         cmd_ret = {
             __opts__["id"]: {
                 "ret": tmp_ret,
-                "out": tmp_ret.get("out", "highstate")
-                if isinstance(tmp_ret, dict)
-                else "highstate",
+                "out": (
+                    tmp_ret.get("out", "highstate")
+                    if isinstance(tmp_ret, dict)
+                    else "highstate"
+                ),
             }
         }
 
@@ -363,6 +406,12 @@ def state(
 
     changes = {}
     fail = set()
+    # Per-minion human-readable detail collected for failures whose minion
+    # return value isn't a state-result dict (e.g. False, a list of error
+    # strings, or no return at all). Surfaced in the final comment so users
+    # see *why* their orchestrate run failed instead of only seeing the
+    # opaque minion-id list (issue #68326).
+    fail_detail = {}
     no_change = set()
 
     if fail_minions is None:
@@ -385,24 +434,41 @@ def state(
             log.warning("Output from salt state not highstate")
 
         m_ret = False
+        # Track whether the minion had no usable return at all, separate
+        # from "the return was present but indicated failure" so we can
+        # explain the difference in the comment.
+        m_no_return = False
 
         if "return" in mdata and "ret" not in mdata:
             mdata["ret"] = mdata.pop("return")
 
         m_state = True
+        # Capture whatever the minion actually returned (if anything) for
+        # use in failure-detail formatting. The legacy code only consumes
+        # ``mdata["ret"]`` on the non-failed path; for `failed: True`
+        # responses with a useful ``ret`` payload we still want to show
+        # the user what came back rather than reporting a bare ``False``.
+        m_raw_ret = mdata.get("ret", mdata.get("return", None))
         if mdata.get("failed", False):
             m_state = False
+            m_no_return = "ret" not in mdata and "return" not in mdata
         else:
             try:
                 m_ret = mdata["ret"]
             except KeyError:
                 m_state = False
+                m_no_return = True
             if m_state:
                 m_state = __utils__["state.check_result"](m_ret, recurse=True)
 
         if not m_state:
             if minion not in fail_minions:
                 fail.add(minion)
+                fail_detail[minion] = _format_failure_detail(
+                    minion,
+                    m_raw_ret if m_raw_ret is not None else m_ret,
+                    m_no_return,
+                )
             changes[minion] = m_ret
             continue
         try:
@@ -422,6 +488,17 @@ def state(
     if len(fail) > allow_fail:
         state_ret["result"] = False
         state_ret["comment"] = "Run failed on minions: {}".format(", ".join(fail))
+        # Append per-minion detail for any failures whose minion return
+        # was not a state-result dict — without this, the orchestrate
+        # output is just an opaque ``False`` in ``changes`` and gives the
+        # operator no clue what went wrong (issue #68326).
+        details = [
+            fail_detail[minion]
+            for minion in sorted(fail)
+            if minion in fail_detail and fail_detail[minion]
+        ]
+        if details:
+            state_ret["comment"] += "\n" + "\n".join(details)
     else:
         state_ret["comment"] = "States ran successfully."
         if changes:
@@ -663,7 +740,7 @@ def wait_for_event(name, id_list, event_id="id", timeout=300, node="master"):
     ret = {"name": name, "changes": {}, "comment": "", "result": False}
 
     if __opts__.get("test"):
-        ret["comment"] = "Orchestration would wait for event '{}'".format(name)
+        ret["comment"] = f"Orchestration would wait for event '{name}'"
         ret["result"] = None
         return ret
 
@@ -783,7 +860,9 @@ def runner(name, **kwargs):
     try:
         kwargs["__pub_user"] = __user__
         log.debug(
-            f"added __pub_user to kwargs using dunder user '{__user__}', kwargs '{kwargs}'"
+            "added __pub_user to kwargs using dunder user '%s', kwargs '%s'",
+            __user__,
+            kwargs,
         )
     except NameError:
         log.warning("unable to find user for fire args event due to missing __user__")
@@ -793,7 +872,7 @@ def runner(name, **kwargs):
             "name": name,
             "result": None,
             "changes": {},
-            "comment": "Runner function '{}' would be executed.".format(name),
+            "comment": f"Runner function '{name}' would be executed.",
         }
         return ret
 
@@ -812,11 +891,11 @@ def runner(name, **kwargs):
         "executed" if success else "failed",
     )
 
-    if features.get("enable_deprecated_orchestration_flag", False):
+    if __opts__["features"].get("enable_deprecated_orchestration_flag", False):
         ret["__orchestration__"] = True
         salt.utils.versions.warn_until(
-            "Argon",
-            "The __orchestration__ return flag will be removed in Salt Argon. "
+            3008,
+            "The __orchestration__ return flag will be removed in {version}. "
             "For more information see https://github.com/saltstack/salt/pull/59917.",
         )
 
@@ -918,7 +997,7 @@ def parallel_runners(name, runners, **kwargs):  # pylint: disable=unused-argumen
             "result": False,
             "success": False,
             "changes": {},
-            "comment": "One of the runners raised an exception: {}".format(exc),
+            "comment": f"One of the runners raised an exception: {exc}",
         }
     # We bundle the results of the runners with the IDs of the runners so that
     # we can easily identify which output belongs to which runner. At the same
@@ -997,7 +1076,7 @@ def parallel_runners(name, runners, **kwargs):  # pylint: disable=unused-argumen
             comment = "All runner functions executed successfully."
         else:
             if len(failed_runners) == 1:
-                comment = "Runner {} failed.".format(failed_runners[0])
+                comment = f"Runner {failed_runners[0]} failed."
             else:
                 comment = "Runners {} failed.".format(", ".join(failed_runners))
         changes = {"ret": {runner_id: out for runner_id, out in outputs.items()}}
@@ -1041,9 +1120,9 @@ def wheel(name, **kwargs):
         jid = None
 
     if __opts__.get("test", False):
-        ret["result"] = (None,)
+        ret["result"] = None
         ret["changes"] = {}
-        ret["comment"] = "Wheel function '{}' would be executed.".format(name)
+        ret["comment"] = f"Wheel function '{name}' would be executed."
         return ret
 
     out = __salt__["saltutil.wheel"](
@@ -1061,7 +1140,7 @@ def wheel(name, **kwargs):
         "executed" if success else "failed",
     )
 
-    if features.get("enable_deprecated_orchestration_flag", False):
+    if __opts__["features"].get("enable_deprecated_orchestration_flag", False):
         ret["__orchestration__"] = True
         salt.utils.versions.warn_until(
             "Argon",

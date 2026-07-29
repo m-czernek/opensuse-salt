@@ -1,48 +1,35 @@
-import salt.fileclient
-from tests.support.mock import patch
+"""
+Unit tests for salt.fileclient
+"""
+
+import salt.config
+import salt.fileclient as fileclient
+from tests.support.mock import MagicMock, patch
 
 
-class MockReqChannel:
-    def factory(self, opts):
-        return self
-
-    def close(self):
-        return True
-
-    def send(self, load):
-        return self
-
-
-def test_fileclient_context_manager_closes(temp_salt_minion, temp_salt_master):
+def test_fsclient_master_no_fs_update(master_opts):
     """
-    ensure fileclient channel closes
-    when used with a context manager
+    Test that an FSClient spawned from the master does not cause fileserver
+    backends to be refreshed on instantiation. The master already has the
+    maintenance thread for that.
     """
-    opts = temp_salt_minion.config.copy()
-    opts.update(
-        {
-            "id": "root",
-            "transport": "zeromq",
-            "auth_tries": 1,
-            "auth_timeout": 5,
-            "master_ip": "127.0.0.1",
-            "master_port": temp_salt_master.config["ret_port"],
-            "master_uri": "tcp://127.0.0.1:{}".format(
-                temp_salt_master.config["ret_port"]
-            ),
-        }
-    )
-    master_uri = "tcp://{master_ip}:{master_port}".format(
-        master_ip="localhost", master_port=opts["master_port"]
-    )
-    mock_reqchannel = MockReqChannel()
-    patch_reqchannel = patch.object(
-        salt.channel.client, "ReqChannel", return_value=mock_reqchannel
-    )
-    with patch_reqchannel:
-        with salt.fileclient.get_file_client(opts) as client:
-            client.master_opts()
-            assert not client._closing
+    overrides = {"file_client": "local"}
+    opts = salt.config.apply_master_config(overrides, master_opts)
+    fileserver = MagicMock()
+    with patch("salt.fileserver.Fileserver", fileserver):
+        client = fileclient.FSClient(opts)
+        assert client.channel.fs.update.call_count == 0
 
-        assert client._closing
-        assert client.channel.close.called
+
+def test_fsclient_masterless_fs_update(minion_opts):
+    """
+    Test that an FSClient spawned from a masterless run refreshes the
+    fileserver backends. This is necessary to ensure that a masterless run
+    can access any configured gitfs remotes.
+    """
+    overrides = {"file_client": "local"}
+    opts = salt.config.apply_minion_config(overrides, minion_opts)
+    fileserver = MagicMock()
+    with patch("salt.fileserver.Fileserver", fileserver):
+        client = fileclient.FSClient(opts)
+        assert client.channel.fs.update.call_count == 1

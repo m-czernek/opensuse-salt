@@ -1,10 +1,11 @@
 import base64
 import copy
-import datetime
 import ipaddress
 import logging
 import os.path
 import re
+from collections import OrderedDict
+from datetime import datetime, timedelta, timezone
 from enum import Enum
 from urllib.parse import urlparse, urlunparse
 
@@ -19,10 +20,8 @@ from cryptography.x509.oid import SubjectInformationAccessOID
 import salt.utils.files
 import salt.utils.immutabletypes as immutabletypes
 import salt.utils.stringutils
-import salt.utils.timeutil
 import salt.utils.versions
 from salt.exceptions import CommandExecutionError, SaltInvocationError
-from salt.utils.odict import OrderedDict
 
 try:
     import idna
@@ -207,6 +206,84 @@ PEM_END = b"-----END"
 TIME_FMT = "%Y-%m-%d %H:%M:%S"
 
 
+class DeserializationError(SaltInvocationError):
+    """
+    Raised when the input format of a private key/certificate/CSR/CRL is unsupported
+    or could not be loaded for various reasons.
+    """
+
+
+class CertDeserializationError(DeserializationError):
+    """
+    Raised when the input format of a certificate is unsupported
+    or could not be loaded for various reasons.
+    """
+
+
+class PrivDeserializationError(DeserializationError):
+    """
+    Raised when the input format of a private key is unsupported
+    or could not be loaded for various reasons.
+    """
+
+
+class PubDeserializationError(DeserializationError):
+    """
+    Raised when the input format of a public key is unsupported
+    or could not be loaded for various reasons.
+    """
+
+
+class CRLDeserializationError(DeserializationError):
+    """
+    Raised when the input format of a CRL is unsupported
+    or could not be loaded for various reasons.
+    """
+
+
+class CSRDeserializationError(DeserializationError):
+    """
+    Raised when the input format of a CSR is unsupported
+    or could not be loaded for various reasons.
+    """
+
+
+class PasswordError(SaltInvocationError):
+    """
+    Raised when a private key or PKCS#12 container could be loaded, but the provided password has an issue.
+    """
+
+
+class InvalidPassword(PasswordError):
+    """
+    Raised when the provided password could not be used to decrypt an encrypted private key/PKCS#12 container.
+    """
+
+    def __init__(self):
+        super().__init__("Bad decrypt - is the password correct?")
+
+
+class MissingPassword(PasswordError):
+    """
+    Raised when a private key is encrypted, but no password was provided.
+    At least in cryptography releases 46+, this cannot be determined for PKCS#12 format,
+    where it's always InvalidPassword.
+    """
+
+    def __init__(self):
+        super().__init__("Private key is encrypted. Please provide a password.")
+
+
+class SuperfluousPassword(PasswordError):
+    """
+    Raised when a private key is not encrypted, but a password was provided.
+    Cannot be determined for PKCS#12 format, where it's always InvalidPassword.
+    """
+
+    def __init__(self):
+        super().__init__("Private key is unencrypted. Please remove the password.")
+
+
 def ensure_cert_kwargs_compat(kwargs):
     """
     Ensures the deprecated long form of Name Attribute and
@@ -279,7 +356,7 @@ def build_crt(
         ca_pub = public_key
 
     if self_signed:
-        pass
+        private_key_loaded = signing_private_key
     elif private_key:
         private_key_loaded = load_privkey(
             private_key, passphrase=private_key_passphrase
@@ -314,14 +391,14 @@ def build_crt(
     )
 
     not_before = (
-        datetime.datetime.strptime(not_before, TIME_FMT)
+        datetime.strptime(not_before, TIME_FMT).replace(tzinfo=timezone.utc)
         if not_before
-        else salt.utils.timeutil.utcnow()
+        else datetime.now(tz=timezone.utc)
     )
     not_after = (
-        datetime.datetime.strptime(not_after, TIME_FMT)
+        datetime.strptime(not_after, TIME_FMT).replace(tzinfo=timezone.utc)
         if not_after
-        else salt.utils.timeutil.utcnow() + datetime.timedelta(days=days_valid)
+        else datetime.now(tz=timezone.utc) + timedelta(days=days_valid)
     )
     builder = builder.not_valid_before(not_before).not_valid_after(not_after)
 
@@ -423,32 +500,38 @@ def build_crl(
     builder = cx509.CertificateRevocationListBuilder()
     if signing_cert:
         builder = builder.issuer_name(signing_cert.subject)
-    builder = builder.last_update(datetime.datetime.today())
+    builder = builder.last_update(datetime.now(tz=timezone.utc))
     builder = builder.next_update(
-        datetime.datetime.today() + datetime.timedelta(days=days_valid)
+        datetime.now(tz=timezone.utc) + timedelta(days=days_valid)
     )
     for rev in revoked:
         serial_number = not_after = revocation_date = None
         if "not_after" in rev:
-            not_after = datetime.datetime.strptime(rev["not_after"], TIME_FMT)
+            not_after = datetime.strptime(rev["not_after"], TIME_FMT).replace(
+                tzinfo=timezone.utc
+            )
         if "serial_number" in rev:
             serial_number = rev["serial_number"]
         if "certificate" in rev:
             rev_cert = load_cert(rev["certificate"])
             serial_number = rev_cert.serial_number
-            not_after = rev_cert.not_valid_after
+            try:
+                not_after = rev_cert.not_valid_after_utc
+            except AttributeError:
+                # naive datetime object, release <42 (it's always UTC)
+                not_after = rev_cert.not_valid_after.replace(tzinfo=timezone.utc)
         if not serial_number:
             raise SaltInvocationError("Need serial_number or certificate")
         serial_number = _get_serial_number(serial_number)
         if not_after and not include_expired:
-            if salt.utils.timeutil.utcnow() > not_after:
+            if datetime.now(tz=timezone.utc) > not_after:
                 continue
         if "revocation_date" in rev:
-            revocation_date = datetime.datetime.strptime(
+            revocation_date = datetime.strptime(
                 rev["revocation_date"], TIME_FMT
-            )
+            ).replace(tzinfo=timezone.utc)
         else:
-            revocation_date = salt.utils.timeutil.utcnow()
+            revocation_date = datetime.now(tz=timezone.utc)
 
         revoked_cert = cx509.RevokedCertificateBuilder(
             serial_number=serial_number, revocation_date=revocation_date
@@ -695,38 +778,16 @@ def load_privkey(pk, passphrase=None, get_encoding=False):
             if get_encoding:
                 return pk, "pem", None
             return pk
-        except ValueError as err:
-            str_err = str(err)
-            if "Bad decrypt" in str_err or "Could not deserialize key data" in str_err:
-                raise SaltInvocationError(
-                    "Bad decrypt - is the password correct?"
-                ) from err
-            raise CommandExecutionError(
+        except (ValueError, TypeError) as err:
+            err_str = str(err)
+            if "Bad decrypt" in err_str or "Incorrect password" in err_str:
+                raise InvalidPassword() from err
+            if "private key is encrypted" in err_str:
+                raise MissingPassword() from err
+            if "but private key is not encrypted" in err_str:
+                raise SuperfluousPassword() from err
+            raise PrivDeserializationError(
                 "Could not load PEM-encoded private key"
-            ) from err
-        except TypeError as err:
-            if "private key is encrypted" in str(err):
-                raise SaltInvocationError(
-                    "Private key is encrypted. Please provide a password."
-                ) from err
-            if "but private key is not encrypted" in str(err):
-                raise SaltInvocationError("Private key is unencrypted") from err
-            raise CommandExecutionError(
-                "Could not load PEM-encoded private key"
-            ) from err
-    # DER
-    try:
-        pk = serialization.load_der_private_key(pk, password=passphrase)
-        if get_encoding:
-            return pk, "der", None
-        return pk
-    except ValueError as err:
-        if "Bad decrypt" in str(err):
-            raise SaltInvocationError("Bad decrypt - is the password correct?") from err
-    except TypeError as err:
-        if "private key is encrypted" in str(err):
-            raise SaltInvocationError(
-                "Private key is encrypted. Please provide a password."
             ) from err
     # PKCS12
     try:
@@ -740,17 +801,32 @@ def load_privkey(pk, passphrase=None, get_encoding=False):
             return loaded.key, "pkcs12", loaded
         return loaded.key
     except ValueError as err:
-        if "Bad decrypt" in str(err):
-            raise SaltInvocationError("Bad decrypt - is the password correct?") from err
+        err_str = str(err)
+        if "Bad decrypt" in err_str or "Invalid password" in err_str:
+            raise InvalidPassword() from err
     except TypeError as err:
         if "private key is encrypted" in str(err):
-            raise SaltInvocationError(
-                "Private key is encrypted. Please provide a password."
-            ) from err
+            raise MissingPassword() from err
     except AttributeError:
         pass
+    # DER
+    try:
+        pk = serialization.load_der_private_key(pk, password=passphrase)
+        if get_encoding:
+            return pk, "der", None
+        return pk
+    except ValueError as err:
+        err_str = str(err)
+        if "Bad decrypt" in err_str or "Incorrect password" in err_str:
+            raise InvalidPassword() from err
+    except TypeError as err:
+        err_str = str(err)
+        if "private key is encrypted" in err_str:
+            raise MissingPassword() from err
+        if "private key is not encrypted" in err_str:
+            raise SuperfluousPassword() from err
     # nothing worked
-    raise SaltInvocationError(
+    raise PrivDeserializationError(
         "Could not deserialize binary data, neither as DER nor PKCS#12."
     )
 
@@ -784,13 +860,13 @@ def load_pubkey(pk, get_encoding=False):
         try:
             return serialization.load_pem_public_key(pk)
         except ValueError as err:
-            raise CommandExecutionError(
+            raise PubDeserializationError(
                 "Could not load PEM-encoded public key."
             ) from err
     try:
         return serialization.load_der_public_key(pk)
     except ValueError as err:
-        raise CommandExecutionError("Could not load DER-encoded public key.") from err
+        raise PubDeserializationError("Could not load DER-encoded public key.") from err
 
 
 def load_cert(cert, passphrase=None, load_chain=False, get_encoding=False):
@@ -829,7 +905,7 @@ def load_cert(cert, passphrase=None, load_chain=False, get_encoding=False):
                     return loaded, "pem", chain, None
                 return loaded
             except (ValueError, IndexError) as err:
-                raise CommandExecutionError(
+                raise CertDeserializationError(
                     "Could not load PEM-encoded certificate."
                 ) from err
         else:
@@ -841,7 +917,7 @@ def load_cert(cert, passphrase=None, load_chain=False, get_encoding=False):
                     return loaded.pop(0), "pkcs7_pem", loaded, None
                 return loaded.pop(0)
             except ValueError as err:
-                raise CommandExecutionError(
+                raise CertDeserializationError(
                     "Could not load PEM-encoded PKCS#7 blob"
                 ) from err
     # DER
@@ -867,7 +943,11 @@ def load_cert(cert, passphrase=None, load_chain=False, get_encoding=False):
             if get_encoding:
                 return loaded.cert.certificate, "pkcs12", chain, loaded
         return loaded.cert.certificate
-    except (AttributeError, ValueError):
+    except ValueError as err:
+        err_str = str(err)
+        if "Bad decrypt" in err_str or "Invalid password" in err_str:
+            raise InvalidPassword()
+    except AttributeError:
         pass
     # PKCS7
     try:
@@ -881,7 +961,7 @@ def load_cert(cert, passphrase=None, load_chain=False, get_encoding=False):
     except ValueError:
         pass
     # nothing worked
-    raise SaltInvocationError(
+    raise CertDeserializationError(
         "Could not deserialize binary data, neither as DER nor PKCS#7, PKCS#12."
     )
 
@@ -908,7 +988,7 @@ def load_crl(crl, get_encoding=False):
                 return loaded, "pem"
             return loaded
         except ValueError as err:
-            raise SaltInvocationError(
+            raise CRLDeserializationError(
                 "Could not load PEM-encoded certificate revocation list."
             ) from err
     try:
@@ -917,7 +997,7 @@ def load_crl(crl, get_encoding=False):
             return loaded, "der"
         return loaded
     except ValueError as err:
-        raise SaltInvocationError(
+        raise CRLDeserializationError(
             "Could not load DER-encoded certificate revocation list."
         ) from err
 
@@ -944,7 +1024,7 @@ def load_csr(csr, get_encoding=False):
                 return loaded, "pem"
             return loaded
         except ValueError as err:
-            raise SaltInvocationError(
+            raise CSRDeserializationError(
                 "Could not load PEM-encoded certificate signing request."
             ) from err
     try:
@@ -953,7 +1033,7 @@ def load_csr(csr, get_encoding=False):
             return loaded, "der"
         return loaded
     except ValueError as err:
-        raise SaltInvocationError(
+        raise CSRDeserializationError(
             "Could not load DER-encoded certificate signing request."
         ) from err
 
@@ -1053,7 +1133,9 @@ def load_file_or_bytes(fob):
         with salt.utils.files.fopen(fob, "rb") as f:
             fob = f.read()
     if isinstance(fob, str):
-        if PEM_BEGIN.decode() in fob:
+        if fob.startswith("b64:"):
+            fob = base64.b64decode(fob[4:])
+        elif PEM_BEGIN.decode() in fob:
             fob = fob.encode()
         else:
             try:
@@ -1192,21 +1274,21 @@ def _create_authority_key_identifier(val, ca_crt, ca_pub, **kwargs):
                     cx509.SubjectKeyIdentifier
                 ).value.digest
             except cx509.ExtensionNotFound:
-                args[
-                    "key_identifier"
-                ] = cx509.AuthorityKeyIdentifier.from_issuer_public_key(
-                    ca_crt.public_key()
-                ).key_identifier
+                args["key_identifier"] = (
+                    cx509.AuthorityKeyIdentifier.from_issuer_public_key(
+                        ca_crt.public_key()
+                    ).key_identifier
+                )
             except Exception:  # pylint: disable=broad-except
                 pass
         if not args["key_identifier"] and ca_pub:
             # this should happen for self-signed certificates
             try:
-                args[
-                    "key_identifier"
-                ] = cx509.AuthorityKeyIdentifier.from_issuer_public_key(
-                    ca_pub
-                ).key_identifier
+                args["key_identifier"] = (
+                    cx509.AuthorityKeyIdentifier.from_issuer_public_key(
+                        ca_pub
+                    ).key_identifier
+                )
             except Exception:  # pylint: disable=broad-except
                 pass
 
@@ -1486,12 +1568,14 @@ def _create_policy_constraints(val, **kwargs):
     if isinstance(val, str):
         val, critical = _deserialize_openssl_confstring(val)
     args = {
-        "require_explicit_policy": int(val["requireExplicitPolicy"])
-        if "requireExplicitPolicy" in val
-        else None,
-        "inhibit_policy_mapping": int(val["inhibitPolicyMapping"])
-        if "inhibitPolicyMapping" in val
-        else None,
+        "require_explicit_policy": (
+            int(val["requireExplicitPolicy"])
+            if "requireExplicitPolicy" in val
+            else None
+        ),
+        "inhibit_policy_mapping": (
+            int(val["inhibitPolicyMapping"]) if "inhibitPolicyMapping" in val else None
+        ),
     }
     try:
         # not sure why pylint complains about this line having kwargs from keyUsage
@@ -1546,12 +1630,12 @@ def _create_name_constraints(val, **kwargs):
             ],
         }
     args = {
-        "permitted_subtrees": _parse_general_names(val["permitted"])
-        if "permitted" in val
-        else None,
-        "excluded_subtrees": _parse_general_names(val["excluded"])
-        if "excluded" in val
-        else None,
+        "permitted_subtrees": (
+            _parse_general_names(val["permitted"]) if "permitted" in val else None
+        ),
+        "excluded_subtrees": (
+            _parse_general_names(val["excluded"]) if "excluded" in val else None
+        ),
     }
     if not any(args.values()):
         raise SaltInvocationError("nameConstraints needs at least one definition")
@@ -1622,8 +1706,9 @@ def _create_invalidity_date(val, **kwargs):
     if critical:
         val = val.split(" ", maxsplit=1)[1]
     try:
+        # InvalidityDate deals in naive datetime objects only currently
         return (
-            cx509.InvalidityDate(datetime.datetime.strptime(val, TIME_FMT)),
+            cx509.InvalidityDate(datetime.strptime(val, TIME_FMT)),
             critical,
         )
     except ValueError as err:
@@ -1685,19 +1770,40 @@ def _deserialize_openssl_confstring(conf, multiple=False):
 
 
 def _parse_general_names(val):
-    def idna_encode(val, allow_leading_dot=False):
-        if HAS_IDNA:
-            # A leading dot is allowed in some values.
-            # idna complains about it not being a valid domain name
-            has_dot = False
-            if allow_leading_dot:
-                has_dot = val.startswith(".")
-                val = val.lstrip(".")
-            ret = idna.encode(val).decode()
+    def idna_encode(val, allow_leading_dot=False, allow_wildcard=False):
+        # A leading dot is allowed in some values (nameConstraints).
+        # idna complains about it not being a valid domain name
+        try:
+            has_dot = val.startswith(".")
+        except AttributeError:
+            raise SaltInvocationError(
+                f"Expected string value, got {type(val).__name__}: `{val}`"
+            )
+        if has_dot:
+            if not allow_leading_dot:
+                raise CommandExecutionError(
+                    "Leading dots are not allowed in this context"
+                )
+            val = val.lstrip(".")
+        has_wildcard = val.startswith("*.")
+        if has_wildcard:
+            if not allow_wildcard:
+                raise CommandExecutionError("Wildcards are not allowed in this context")
             if has_dot:
-                return f".{ret}"
-            return ret
+                raise CommandExecutionError(
+                    "Wildcards and leading dots cannot be present together"
+                )
+            val = val[2:]
+            if val.startswith("."):
+                raise CommandExecutionError("Empty label")
+        if HAS_IDNA:
+            try:
+                ret = idna.encode(val).decode()
+            except idna.IDNAError as err:
+                raise CommandExecutionError(str(err)) from err
         else:
+            if not val:
+                raise CommandExecutionError("Empty domain")
             try:
                 val.encode(encoding="ascii")
             except UnicodeEncodeError as err:
@@ -1705,6 +1811,20 @@ def _parse_general_names(val):
                     "Cannot encode non-ASCII strings to internationalized domain "
                     "name format, missing library: idna"
                 ) from err
+            for elem in val.split("."):
+                if not elem:
+                    raise CommandExecutionError("Empty Label")
+                invalid = re.search(r"[^A-Za-z\d\-\.]", elem)
+                if invalid is not None:
+                    raise CommandExecutionError(
+                        f"Codepoint U+00{hex(ord(invalid.group()))[2:]} at position {invalid.end()} of '{val}' not allowed"
+                    )
+            ret = val
+        if has_dot:
+            return f".{ret}"
+        if has_wildcard:
+            return f"*.{ret}"
+        return ret
 
     valid_types = {
         "email": cx509.general_name.RFC822Name,
@@ -1740,6 +1860,7 @@ def _parse_general_names(val):
                 domain = idna_encode(domain)
                 v = "@".join((user, domain))
             else:
+                # nameConstraints
                 v = idna_encode(splits[0], allow_leading_dot=True)
         elif typ == "uri":
             url = urlparse(v)
@@ -1749,7 +1870,7 @@ def _parse_general_names(val):
                     (url.scheme, domain, url.path, url.params, url.query, url.fragment)
                 )
         elif typ == "dns":
-            v = idna_encode(v, allow_leading_dot=True)
+            v = idna_encode(v, allow_leading_dot=True, allow_wildcard=True)
         elif typ == "othername":
             raise SaltInvocationError("otherName is currently not implemented")
         if typ in valid_types:
@@ -1920,13 +2041,15 @@ def _render_subject_key_identifier(ext):
 
 def _render_authority_key_identifier(ext):
     return {
-        "keyid": pretty_hex(ext.value.key_identifier)
-        if ext.value.key_identifier
-        else None,
+        "keyid": (
+            pretty_hex(ext.value.key_identifier) if ext.value.key_identifier else None
+        ),
         "issuer": [render_gn(x) for x in ext.value.authority_cert_issuer or []] or None,
-        "issuer_sn": dec2hex(ext.value.authority_cert_serial_number)
-        if ext.value.authority_cert_serial_number
-        else None,
+        "issuer_sn": (
+            dec2hex(ext.value.authority_cert_serial_number)
+            if ext.value.authority_cert_serial_number
+            else None
+        ),
     }
 
 
@@ -1960,11 +2083,11 @@ def _render_authority_info_access(ext):
         for description in ext.value._descriptions:
             rendered.append(
                 {
-                    description.access_method._name
-                    if description.access_method._name != "Unknown OID"
-                    else description.access_method.dotted_string: render_gn(
-                        description.access_location.value
-                    )
+                    (
+                        description.access_method._name
+                        if description.access_method._name != "Unknown OID"
+                        else description.access_method.dotted_string
+                    ): render_gn(description.access_location.value)
                 }
             )
     except AttributeError:
@@ -1981,9 +2104,11 @@ def _render_distribution_points(ext):
                     "crlissuer": [render_gn(x) for x in dpoint.crl_issuer or []],
                     "fullname": [render_gn(x) for x in dpoint.full_name or []],
                     "reasons": list(sorted(x.value for x in dpoint.reasons or [])),
-                    "relativename": dpoint.relative_name.rfc4514_string()
-                    if dpoint.relative_name
-                    else None,
+                    "relativename": (
+                        dpoint.relative_name.rfc4514_string()
+                        if dpoint.relative_name
+                        else None
+                    ),
                 }
             )
     except AttributeError:
@@ -1997,9 +2122,11 @@ def _render_issuing_distribution_point(ext):
         "onysomereasons": list(
             sorted(x.value for x in ext.value.only_some_reasons or [])
         ),
-        "relativename": ext.value.relative_name.rfc4514_string()
-        if ext.value.relative_name
-        else None,
+        "relativename": (
+            ext.value.relative_name.rfc4514_string()
+            if ext.value.relative_name
+            else None
+        ),
         "onlyuser": ext.value.only_contains_user_certs,
         "onlyCA": ext.value.only_contains_ca_certs,
         "onlyAA": ext.value.only_contains_attribute_certs,

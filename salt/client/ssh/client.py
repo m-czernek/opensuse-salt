@@ -39,6 +39,10 @@ class SSHClient:
 
         # Salt API should never offer a custom roster!
         self.opts["__disable_custom_roster"] = disable_custom_roster
+        # Pillar compilation and nested SSH calls require the correct config_dir
+        # in __opts__, otherwise we will use the SSH minion's one later.
+        if "config_dir" not in self.opts:
+            self.opts["config_dir"] = os.path.dirname(c_path)
 
     def sanitize_kwargs(self, kwargs):
         roster_vals = [
@@ -52,9 +56,6 @@ class SSHClient:
             ("ssh_priv_passwd", str),
             ("ssh_identities_only", bool),
             ("ssh_remote_port_forwards", str),
-            ("ssh_keepalive", bool),
-            ("ssh_keepalive_interval", int),
-            ("ssh_keepalive_count_max", int),
             ("ssh_options", list),
             ("ssh_max_procs", int),
             ("ssh_askpass", bool),
@@ -111,15 +112,7 @@ class SSHClient:
         return sane_kwargs
 
     def _prep_ssh(
-        self,
-        tgt,
-        fun,
-        arg=(),
-        timeout=None,
-        tgt_type="glob",
-        kwarg=None,
-        context=None,
-        **kwargs
+        self, tgt, fun, arg=(), timeout=None, tgt_type="glob", kwarg=None, **kwargs
     ):
         """
         Prepare the arguments
@@ -134,7 +127,7 @@ class SSHClient:
         opts["selected_target_option"] = tgt_type
         opts["tgt"] = tgt
         opts["arg"] = arg
-        return salt.client.ssh.SSH(opts, context=context)
+        return salt.client.ssh.SSH(opts)
 
     def cmd_iter(
         self,
@@ -145,7 +138,7 @@ class SSHClient:
         tgt_type="glob",
         ret="",
         kwarg=None,
-        **kwargs
+        **kwargs,
     ):
         """
         Execute a single command via the salt-ssh subsystem and return a
@@ -171,7 +164,7 @@ class SSHClient:
             final.update(ret)
         return final
 
-    def cmd_sync(self, low, context=None):
+    def cmd_sync(self, low):
         """
         Execute a salt-ssh call synchronously.
 
@@ -204,8 +197,7 @@ class SSHClient:
             low.get("timeout"),
             low.get("tgt_type"),
             low.get("kwarg"),
-            context=context,
-            **kwargs
+            **kwargs,
         )
 
     def cmd_async(self, low, timeout=None):
@@ -238,7 +230,7 @@ class SSHClient:
         ret="",
         kwarg=None,
         subset=3,
-        **kwargs
+        **kwargs,
     ):
         """
         Execute a command on a random subset of the targeted systems

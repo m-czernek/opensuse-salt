@@ -2,7 +2,7 @@
 This module contains the function calls to execute command line scripts
 """
 
-
+import contextlib
 import functools
 import logging
 import os
@@ -18,9 +18,6 @@ import salt.defaults.exitcodes
 from salt.exceptions import SaltClientError, SaltReqTimeoutError, SaltSystemExit
 
 log = logging.getLogger(__name__)
-
-if sys.version_info < (3,):
-    raise SystemExit(salt.defaults.exitcodes.EX_GENERIC)
 
 
 def _handle_signals(client, signum, sigframe):
@@ -165,8 +162,11 @@ def salt_minion():
     """
     import signal
 
+    import salt.utils.debug
     import salt.utils.platform
     import salt.utils.process
+
+    salt.utils.debug.enable_sigusr1_handler()
 
     salt.utils.process.notify_systemd()
 
@@ -189,7 +189,6 @@ def salt_minion():
         return
 
     if "--disable-keepalive" in sys.argv:
-        sys.argv.remove("--disable-keepalive")
         minion = salt.cli.daemons.Minion()
         minion.start()
         return
@@ -207,6 +206,7 @@ def salt_minion():
     # keep one minion subprocess running
     prev_sigint_handler = signal.getsignal(signal.SIGINT)
     prev_sigterm_handler = signal.getsignal(signal.SIGTERM)
+    supervisor_privileges_dropped = False
     while True:
         try:
             process = multiprocessing.Process(
@@ -230,6 +230,19 @@ def salt_minion():
             minion = salt.cli.daemons.Minion()
             minion.start()
             break
+
+        # Drop the supervisor's privileges now that the child has been
+        # forked. The child inherits root and performs its own
+        # verify_env/pidfile/check_user dance; this parent only needs
+        # to forward signals and restart on keepalive exits. Only do
+        # this once: subsequent loop iterations re-fork from an already
+        # unprivileged parent, which is fine because the dirs created
+        # by the first child already have the right ownership.
+        if not supervisor_privileges_dropped:
+            import salt.config
+
+            _supervisor_drop_privileges(salt.config.minion_config, "minion")
+            supervisor_privileges_dropped = True
 
         process.join()
 
@@ -344,12 +357,12 @@ def salt_proxy():
         return
 
     if "--disable-keepalive" in sys.argv:
-        sys.argv.remove("--disable-keepalive")
         proxyminion = salt.cli.daemons.ProxyMinion()
         proxyminion.start()
         return
 
     # keep one minion subprocess running
+    supervisor_privileges_dropped = False
     while True:
         try:
             queue = multiprocessing.Queue()
@@ -362,6 +375,14 @@ def salt_proxy():
             target=proxy_minion_process, args=(queue,), name="ProxyMinion"
         )
         process.start()
+        # See the matching note in salt_minion(); the supervisor only
+        # needs root for the first fork's verify_env/pidfile setup, and
+        # leaving it as root afterwards is the bug described in #68115.
+        if not supervisor_privileges_dropped:
+            import salt.config
+
+            _supervisor_drop_privileges(salt.config.proxy_config, "proxy")
+            supervisor_privileges_dropped = True
         try:
             process.join()
             try:
@@ -415,7 +436,7 @@ def salt_key():
         _install_signal_handlers(client)
         client.run()
     except Exception as err:  # pylint: disable=broad-except
-        sys.stderr.write("Error: {}\n".format(err))
+        sys.stderr.write(f"Error: {err}\n")
 
 
 def salt_cp():
@@ -484,16 +505,14 @@ def salt_cloud():
     """
     The main function for salt-cloud
     """
-    # Define 'salt' global so we may use it after ImportError. Otherwise,
-    # UnboundLocalError will be raised.
-    global salt  # pylint: disable=W0602
-
     try:
         # Late-imports for CLI performance
         import salt.cloud
         import salt.cloud.cli
     except ImportError as e:
         # No salt cloud on Windows
+        import salt.defaults.exitcodes
+
         log.error("Error importing salt cloud: %s", e)
         print("salt-cloud is not available in this system")
         sys.exit(salt.defaults.exitcodes.EX_UNAVAILABLE)
@@ -573,7 +592,7 @@ def salt_unity():
     if len(sys.argv) < 2:
         msg = "Must pass in a salt command, available commands are:"
         for cmd in avail:
-            msg += "\n{}".format(cmd)
+            msg += f"\n{cmd}"
         print(msg)
         sys.exit(1)
     cmd = sys.argv[1]
@@ -582,9 +601,9 @@ def salt_unity():
         sys.argv[0] = "salt"
         s_fun = salt_main
     else:
-        sys.argv[0] = "salt-{}".format(cmd)
+        sys.argv[0] = f"salt-{cmd}"
         sys.argv.pop(1)
-        s_fun = getattr(sys.modules[__name__], "salt_{}".format(cmd))
+        s_fun = getattr(sys.modules[__name__], f"salt_{cmd}")
     s_fun()
 
 
@@ -608,11 +627,126 @@ def _pip_environment(env, extras):
     return new_env
 
 
-def salt_pip():
+def _get_onedir_env_path():
+    # This function only exists to simplify testing.
+    with contextlib.suppress(AttributeError):
+        return sys.RELENV
+    return None
+
+
+def _supervisor_config_dir():
+    """
+    Return the salt config directory to use when the keepalive supervisor
+    reads minion or proxy options.
+
+    Respects ``-c``/``--config-dir`` on the command line first, then the
+    ``SALT_CONFIG_DIR`` env var, then falls back to the compiled-in
+    default. Keeping this lookup simple and ``argparse``-free avoids
+    pulling in the full option parser (which the child process already
+    runs) and keeps the parent's privilege drop cheap.
+    """
+    import salt.syspaths
+
+    argv = sys.argv[1:]
+    skip_next = False
+    for idx, arg in enumerate(argv):
+        if skip_next:
+            skip_next = False
+            continue
+        if arg in ("-c", "--config-dir") and idx + 1 < len(argv):
+            return argv[idx + 1]
+        if arg.startswith("--config-dir="):
+            return arg.split("=", 1)[1]
+        if arg.startswith("-c") and len(arg) > 2:
+            return arg[2:]
+    env_dir = os.environ.get("SALT_CONFIG_DIR")
+    if env_dir:
+        return env_dir
+    return salt.syspaths.CONFIG_DIR
+
+
+def _supervisor_drop_privileges(config_loader, config_name):
+    """
+    Drop privileges in the salt-minion / salt-proxy keepalive supervisor.
+
+    The supervisor forks a child process that runs the actual minion;
+    only the child needs root to perform ``verify_env`` chowns and to
+    create the pidfile, and the child drops to the configured user via
+    ``salt.cli.daemons.Minion._real_start``. The parent only needs to
+    forward signals to the child and restart it on
+    ``SALT_KEEPALIVE``-flavoured exits -- neither requires privileges.
+
+    Leaving the parent as root meant an unprivileged minion process tree
+    still had a privileged root process at its head, defeating the
+    purpose of configuring ``user: <something other than root>``. See
+    issue #68115.
+
+    ``config_loader`` is ``salt.config.minion_config`` or
+    ``salt.config.proxy_config``; ``config_name`` is the corresponding
+    config file basename (``minion`` or ``proxy``).
+    """
+    import salt.utils.user
+    import salt.utils.verify
+
+    config_dir = _supervisor_config_dir()
+    config_file = os.path.join(config_dir, config_name)
+    try:
+        opts = config_loader(config_file)
+    except Exception:  # pylint: disable=broad-except
+        log.debug(
+            "Supervisor could not load %s config from %s; skipping privilege drop",
+            config_name,
+            config_file,
+            exc_info=True,
+        )
+        return
+    user = opts.get("user")
+    if not user:
+        return
+    if user == salt.utils.user.get_user():
+        return
+    salt.utils.verify.check_user(user)
+
+
+def salt_pip(config_dir=None):
     """
     Proxy to current python's pip
     """
-    extras = str(sys.RELENV / "extras-{}.{}".format(*sys.version_info))
+    import salt.config
+    import salt.utils.user
+    import salt.utils.verify
+
+    relenv_path = _get_onedir_env_path()
+    if relenv_path is None:
+        print(
+            "'salt-pip' is only meant to be used from a Salt onedir. You probably "
+            "want to use the system 'pip` binary.",
+            file=sys.stderr,
+            flush=True,
+        )
+        sys.exit(salt.defaults.exitcodes.EX_GENERIC)
+    else:
+        extras = str(relenv_path / "extras-{}.{}".format(*sys.version_info))
+
+    # Use provided config_dir, or SALT_CONFIG_DIR env var, or SALT_MINION_CONFIG env var, or fall back to default location
+    if config_dir:
+        config_file = os.path.join(config_dir, "minion")
+    elif os.environ.get("SALT_CONFIG_DIR"):
+        salt_config_dir = os.environ.get("SALT_CONFIG_DIR")
+        config_file = os.path.join(salt_config_dir, "minion")
+    elif os.environ.get("SALT_MINION_CONFIG"):
+        config_file = os.environ.get("SALT_MINION_CONFIG")
+    else:
+        config_file = salt.config.DEFAULT_MINION_OPTS["conf_file"]
+    opts = salt.config.minion_config(config_file)
+
+    user = opts.get("user")
+    current_user = salt.utils.user.get_user()
+
+    # Switch to the configured user if it's not root
+    if user and user != "root" and user != current_user:
+        salt.utils.verify.check_user(user)
+
     env = _pip_environment(os.environ.copy(), extras)
     args = _pip_args(sys.argv[1:], extras)
     command = [
@@ -622,18 +756,3 @@ def salt_pip():
     ] + _pip_args(sys.argv[1:], extras)
     ret = subprocess.run(command, shell=False, check=False, env=env)
     sys.exit(ret.returncode)
-
-
-def salt_support():
-    """
-    Run Salt Support that collects system data, logs etc for debug and support purposes.
-    :return:
-    """
-
-    import salt.cli.support.collector
-
-    if "" in sys.path:
-        sys.path.remove("")
-    client = salt.cli.support.collector.SaltSupport()
-    _install_signal_handlers(client)
-    client.run()

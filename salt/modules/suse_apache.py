@@ -19,7 +19,7 @@ def __virtual__():
     """
     Only load the module if apache is installed.
     """
-    if salt.utils.path.which("apachectl") and __grains__["os_family"] == "Suse":
+    if salt.utils.path.which("apache2ctl") and __grains__["os_family"] == "Suse":
         return __virtualname__
     return (False, "apache execution module not loaded: apache not installed.")
 
@@ -73,9 +73,9 @@ def a2enmod(mod):
     ret["Mod"] = mod
 
     if status == 1:
-        ret["Status"] = "Mod {} Not found".format(mod)
+        ret["Status"] = f"Mod {mod} Not found"
     elif status == 0:
-        ret["Status"] = "Mod {} enabled".format(mod)
+        ret["Status"] = f"Mod {mod} enabled"
     else:
         ret["Status"] = status
 
@@ -104,9 +104,9 @@ def a2dismod(mod):
     ret["Mod"] = mod
 
     if status == 256:
-        ret["Status"] = "Mod {} Not found".format(mod)
+        ret["Status"] = f"Mod {mod} Not found"
     elif status == 0:
-        ret["Status"] = "Mod {} disabled".format(mod)
+        ret["Status"] = f"Mod {mod} disabled"
     else:
         ret["Status"] = status
 

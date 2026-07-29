@@ -17,12 +17,18 @@ import pytest
 import salt.grains.extra
 import salt.modules.cmdmod as cmdmod
 import salt.utils.files
+import salt.utils.path
 import salt.utils.platform
 import salt.utils.stringutils
 from salt._logging import LOG_LEVELS
 from salt.exceptions import CommandExecutionError
 from tests.support.mock import MagicMock, Mock, MockTimedProc, mock_open, patch
 from tests.support.runtests import RUNTIME_VARS
+
+pytestmark = [
+    pytest.mark.core_test,
+    pytest.mark.windows_whitelisted,
+]
 
 DEFAULT_SHELL = "foo/bar"
 MOCK_SHELL_FILE = "# List of acceptable shells\n\n/bin/bash\n"
@@ -163,6 +169,112 @@ def test_run_runas_with_windows():
                         cmdmod._run("foo", "bar", runas="baz")
 
 
+def test_run_windows_preserves_cmd_string_quoting():
+    """
+    On Windows, shlex_split must NOT be called on the command string so that
+    Windows-style argument quoting (e.g. MYPROPERTY="C:\\path with space") is
+    preserved when the string is handed directly to CreateProcess.
+    Regression test for issue #68950.
+    """
+    mock_proc = MockTimedProc(stdout=b"", stderr=b"")
+    with patch("salt.utils.platform.is_windows", MagicMock(return_value=True)), patch(
+        "salt.utils.path.which",
+        MagicMock(return_value="C:\\Windows\\system32\\cmd.exe"),
+    ), patch(
+        "salt.utils.timed_subprocess.TimedProc", MagicMock(return_value=mock_proc)
+    ), patch(
+        "salt.utils.args.shlex_split"
+    ) as mock_shlex:
+        try:
+            cmdmod._run(
+                '"msiexec" /I "C:\\pkg.msi" MYPROPERTY="C:\\some file.txt"',
+                cwd="C:\\",
+                shell="C:\\Windows\\system32\\cmd.exe",
+                python_shell=False,
+            )
+        except Exception:  # pylint: disable=broad-except
+            pass
+        mock_shlex.assert_not_called()
+
+
+@pytest.mark.skip_unless_on_windows
+def test_run_windows_cmd_runas_passes_compound_to_cmd():
+    """
+    runas + cmd.exe must use prepend_cmd so the user string is one cmd /c
+    argument; otherwise shlex splits on & and the child never sees a compound
+    line (regression: cd ... & dir under runas).
+    """
+    win_runas_mock = MagicMock(
+        return_value={"pid": 1, "retcode": 0, "stdout": "ok", "stderr": ""}
+    )
+    cmd_str = r"cd /d C:\salt_test_dir & echo marker_compound_runas"
+    with patch("salt.modules.cmdmod._is_valid_shell", MagicMock(return_value=True)):
+        with patch("salt.utils.platform.is_windows", MagicMock(return_value=True)):
+            with patch("salt.modules.cmdmod.HAS_WIN_RUNAS", True):
+                with patch("salt.modules.cmdmod.win_runas", win_runas_mock):
+                    with patch(
+                        "salt.utils.path.which",
+                        return_value="C:\\Windows\\System32\\cmd.exe",
+                    ):
+                        with patch(
+                            "salt.utils.win_chcp.get_codepage_id",
+                            MagicMock(return_value=65001),
+                        ):
+                            cmdmod._run(
+                                cmd_str,
+                                cwd=tempfile.gettempdir(),
+                                runas="someuser",
+                                password="secret",
+                                shell="cmd",
+                                python_shell=False,
+                            )
+    passed = win_runas_mock.call_args[0][0]
+    # Full prepended line must reach win_runas as one string; shlex_split is
+    # skipped so paths with spaces are not broken and so & stays in the /c payload.
+    assert isinstance(passed, str)
+    assert "/c" in passed
+    assert "&" in passed
+    assert "marker_compound_runas" in passed
+
+
+@pytest.mark.skip_unless_on_windows
+def test_run_windows_cmd_runas_skips_shlex_split():
+    """
+    After ``prepend_cmd``, the full ``cmd.exe /c ...`` line must not be passed
+    through ``shlex_split`` or paths with spaces and ``&`` in the /c payload break.
+    """
+    shlex_split = MagicMock(
+        side_effect=AssertionError("shlex_split must not run for runas prepended line")
+    )
+    win_runas_mock = MagicMock(
+        return_value={"pid": 1, "retcode": 0, "stdout": "ok", "stderr": ""}
+    )
+    cmd_str = r"cd /d C:\salt_test_dir & echo skip_shlex_check"
+    with patch("salt.modules.cmdmod._is_valid_shell", MagicMock(return_value=True)):
+        with patch("salt.utils.platform.is_windows", MagicMock(return_value=True)):
+            with patch("salt.modules.cmdmod.HAS_WIN_RUNAS", True):
+                with patch("salt.modules.cmdmod.win_runas", win_runas_mock):
+                    with patch(
+                        "salt.utils.path.which",
+                        return_value="C:\\Windows\\System32\\cmd.exe",
+                    ):
+                        with patch(
+                            "salt.utils.win_chcp.get_codepage_id",
+                            MagicMock(return_value=65001),
+                        ):
+                            with patch("salt.utils.args.shlex_split", shlex_split):
+                                cmdmod._run(
+                                    cmd_str,
+                                    cwd=tempfile.gettempdir(),
+                                    runas="someuser",
+                                    password="secret",
+                                    shell="cmd",
+                                    python_shell=False,
+                                )
+    shlex_split.assert_not_called()
+    assert "skip_shlex_check" in win_runas_mock.call_args[0][0]
+
+
 def test_run_with_tuple():
     """
     Tests return when cmd is a tuple
@@ -277,6 +389,77 @@ def test_run_no_vt_io_error():
                         assert error.value.args[0].endswith(expected_error)
 
 
+# ---------------------------------------------------------------------------
+# Secret-leak guard for the OSError path above.
+#
+# When ``TimedProc`` raises ``OSError`` (typically ``ENOENT`` because the
+# binary does not exist) the handler builds a ``CommandExecutionError``
+# whose message is meant to help the operator debug. Historically the
+# entire ``new_kwargs`` dict was interpolated into that message, which
+# leaked two routinely-secret-bearing fields:
+#
+# * ``env`` — the run environment, set by callers via
+#   ``cmd.run env={'DB_PASSWORD': '...'}`` or by states that pass
+#   credentials through env vars.
+# * ``stdin`` — the bytes piped to the command, commonly used to feed
+#   a password to a CLI like ``mysql -p``.
+#
+# Both leak channels matter: the resulting ``CommandExecutionError`` ends
+# up in master/minion logs *and* in event-bus return data visible to the
+# API caller. ENOENT is not a rare condition; it fires on any typo in a
+# binary path. A typo should not exfiltrate credentials.
+# ---------------------------------------------------------------------------
+
+
+def test_run_oserror_message_does_not_leak_env_secrets():
+    """``cmd.run`` with an env-var holding a credential must not include
+    that credential in the ``CommandExecutionError`` raised when the
+    underlying ``TimedProc`` raises ``OSError`` (e.g. binary not
+    found)."""
+    secret_marker = "s3cr3t-do-not-log"
+    with patch("salt.modules.cmdmod._is_valid_shell", MagicMock(return_value=True)):
+        with patch("salt.utils.platform.is_windows", MagicMock(return_value=False)):
+            with patch("os.path.isfile", MagicMock(return_value=True)):
+                with patch("os.access", MagicMock(return_value=True)):
+                    with patch(
+                        "salt.utils.timed_subprocess.TimedProc",
+                        MagicMock(side_effect=OSError("no such file")),
+                    ):
+                        with pytest.raises(CommandExecutionError) as error:
+                            cmdmod.run(
+                                "foo",
+                                cwd="/",
+                                env={"DB_PASSWORD": secret_marker},
+                            )
+    assert secret_marker not in error.value.args[0], (
+        "CommandExecutionError raised on OSError leaks an env-var value "
+        "into its message; that message ends up in logs and in API "
+        "event-bus return data."
+    )
+
+
+def test_run_oserror_message_does_not_leak_stdin():
+    """``cmd.run`` with a password piped via ``stdin`` must not include
+    that stdin payload in the ``CommandExecutionError`` raised on
+    ``OSError``."""
+    stdin_marker = "stdin-secret-do-not-log"
+    with patch("salt.modules.cmdmod._is_valid_shell", MagicMock(return_value=True)):
+        with patch("salt.utils.platform.is_windows", MagicMock(return_value=False)):
+            with patch("os.path.isfile", MagicMock(return_value=True)):
+                with patch("os.access", MagicMock(return_value=True)):
+                    with patch(
+                        "salt.utils.timed_subprocess.TimedProc",
+                        MagicMock(side_effect=OSError("no such file")),
+                    ):
+                        with pytest.raises(CommandExecutionError) as error:
+                            cmdmod.run("foo", cwd="/", stdin=stdin_marker)
+    assert stdin_marker not in error.value.args[0], (
+        "CommandExecutionError raised on OSError leaks the stdin "
+        "payload into its message; stdin is a common channel for "
+        "passing a password to a child process."
+    )
+
+
 @pytest.mark.skip(reason="Test breaks unittests runs")
 @pytest.mark.skip_on_windows
 def test_run():
@@ -310,7 +493,7 @@ def test_powershell_empty():
     mock_run = {"pid": 1234, "retcode": 0, "stderr": "", "stdout": ""}
     with patch("salt.modules.cmdmod._run", return_value=mock_run):
         ret = cmdmod.powershell("Set-ExecutionPolicy RemoteSigned")
-        assert ret == {}
+        assert ret == ""
 
 
 def test_is_valid_shell_windows():
@@ -467,7 +650,7 @@ def test_shell_properly_handled_on_macOS():
                 )
 
                 assert re.search(
-                    "{} -l -c".format(user_default_shell), cmd_handler.cmd
+                    f"{user_default_shell} -l -c", cmd_handler.cmd
                 ), "cmd invokes right bash session on macOS"
 
             # User default shell is '/bin/zsh'
@@ -559,10 +742,6 @@ def test_run_all_binary_replace():
     with salt.utils.files.fopen(rand_bytes_file, "rb") as fp_:
         stdout_bytes = fp_.read()
 
-    # kitchen-salt uses unix2dos on all the files before copying them over
-    # to the vm that will be running the tests. It skips binary files though
-    # The file specified in `rand_bytes_file` is detected as binary so the
-    # Unix-style line ending remains. This should account for that.
     stdout_bytes = stdout_bytes.rstrip() + os.linesep.encode()
 
     # stdout with the non-decodable bits replaced with the unicode
@@ -669,11 +848,20 @@ def test_run_all_output_loglevel_debug(caplog):
     stdout = b"test"
     proc = MagicMock(return_value=MockTimedProc(stdout=stdout))
 
-    msg = "Executing command 'some' in directory"
+    # When we get back to having to specify a shell, we may need to change this
+    # back.
+    # if salt.utils.platform.is_windows():
+    #     run_cmd = salt.utils.path.which("cmd")
+    #     expected = f"Executing command '{run_cmd}' in directory"
+    # else:
+    #     expected = "Executing command 'some' in directory"
+    expected = "Executing command 'some' in directory"
+
     with patch("salt.utils.timed_subprocess.TimedProc", proc):
         with caplog.at_level(logging.DEBUG, logger="salt.modules.cmdmod"):
             ret = cmdmod.run_all("some command", output_loglevel="debug")
-        assert msg in caplog.text
+        result = caplog.text
+        assert expected.lower() in result.lower()
 
     assert ret["stdout"] == salt.utils.stringutils.to_unicode(stdout)
 
@@ -821,14 +1009,12 @@ def test_cmd_script_saltenv_from_config():
 def test_cmd_script_saltenv_from_config_windows():
     mock_cp_get_template = MagicMock()
     mock_cp_cache_file = MagicMock()
-    mock_run = MagicMock()
     with patch.dict(cmdmod.__opts__, {"saltenv": "base"}):
         with patch.dict(
             cmdmod.__salt__,
             {
                 "cp.cache_file": mock_cp_cache_file,
                 "cp.get_template": mock_cp_get_template,
-                "file.user_to_uid": MagicMock(),
                 "file.remove": MagicMock(),
             },
         ):
@@ -844,6 +1030,49 @@ def test_cmd_script_saltenv_from_config_windows():
                     assert mock_cp_get_template.call_args[0][3] == "base"
                     assert mock_run.call_count == 2
                     assert mock_run.call_args[1]["saltenv"] == "base"
+
+
+def test_cmd_script_runas_domain_user_windows_68578(tmp_path, caplog):
+    """
+    Regression test for #68578.
+
+    On Windows ``cmd.script`` used to abort with ``Invalid user: <runas>``
+    whenever the ``user.info`` precheck returned an empty dict. ``user.info``
+    (NetUserGetInfo) only sees local-machine accounts, so domain users
+    (``DOMAIN\\user``, ``user@DOMAIN``, SIDs) were rejected even though the
+    underlying ``win_runas`` machinery can authenticate them.
+
+    The precheck must not abort execution when ``user.info`` returns empty;
+    instead the script should proceed and let ``win_runas`` raise a precise
+    error if the user is truly invalid.
+    """
+    mock_cp_cache_file = MagicMock(return_value="fnord")
+    with patch.dict(cmdmod.__opts__, {"saltenv": "base", "cachedir": str(tmp_path)}):
+        with patch.dict(
+            cmdmod.__salt__,
+            {
+                "cp.cache_file": mock_cp_cache_file,
+                "file.remove": MagicMock(),
+                # user.info returns {} for domain users on Windows when the
+                # local SAM and DC lookups can't resolve the account; the
+                # precheck must not treat that as a fatal error.
+                "user.info": MagicMock(return_value={}),
+            },
+        ):
+            with patch("salt.utils.platform.is_windows", return_value=True):
+                with patch(
+                    "salt.utils.win_dacl.set_permissions", MagicMock(create=True)
+                ):
+                    with patch("salt.modules.cmdmod._run") as mock_run:
+                        mock_run.return_value = {
+                            "pid": 1,
+                            "retcode": 0,
+                            "stdout": "",
+                            "stderr": "",
+                        }
+                        with patch("shutil.copyfile", MagicMock()):
+                            cmdmod.script("salt://test.ps1", runas="DOMAIN\\someuser")
+                            assert mock_run.call_count == 1
 
 
 @pytest.mark.parametrize("bundled", [True, False])
@@ -911,9 +1140,7 @@ def test_runas_env_all_os(test_os, test_family, bundled):
                                             "-c",
                                         ]
                                     if test_os == "FreeBSD":
-                                        env_cmd.extend(
-                                            ["{} -c {}".format(shell, sys.executable)]
-                                        )
+                                        env_cmd.extend([f"{shell} -c {sys.executable}"])
                                     else:
                                         env_cmd.extend([sys.executable])
                                     assert popen_mock.call_args_list[0][0][0] == env_cmd
@@ -1058,57 +1285,134 @@ def test_runas_env_sudo_group(bundled):
                                         )
 
 
-def test_prep_powershell_cmd():
+@pytest.mark.skip_unless_on_windows
+def test__run_no_powershell():
+    with pytest.raises(CommandExecutionError):
+        cmdmod._run(shell="unk_bin", cmd="Some-Command", encoded_cmd=False)
+
+
+@pytest.mark.parametrize(
+    "cmd, parsed",
+    [
+        ("Write-Host foo", "Write-Host foo"),
+        ("& Write-Host foo", "& Write-Host foo"),
+        ("$PSVersionTable", "$PSVersionTable"),
+        ("try {this} catch {that}", "try {this} catch {that}"),
+        ("[bool]@{value = 0}", "[bool]@{value = 0}"),
+        (
+            "(Get-Date(Get-Date).ToUniversalTime() -UFormat %s)",
+            "(Get-Date(Get-Date).ToUniversalTime() -UFormat %s)",
+        ),
+        (
+            "if (1 -eq 1) { exit 0 } else { exit 1 }",
+            "if (1 -eq 1) { exit 0 } else { exit 1 }",
+        ),
+        (
+            "do { $count++; $a++; } while ($x[$a] -ne 0)",
+            "do { $count++; $a++; } while ($x[$a] -ne 0)",
+        ),
+        (
+            "while ($val -ne 3) { $val++; Write-Host $val }",
+            "while ($val -ne 3) { $val++; Write-Host $val }",
+        ),
+        (
+            "trap { 'Error found.' }",
+            "trap { 'Error found.' }",
+        ),
+        (
+            "for ($i=1; $i -le 10; $i++) { Write-Host $i }",
+            "for ($i=1; $i -le 10; $i++) { Write-Host $i }",
+        ),
+        (
+            "foreach ($file in Get-ChildItem) { Write-Host $file }",
+            "foreach ($file in Get-ChildItem) { Write-Host $file }",
+        ),
+        (
+            'data { if ($null) { "To get help for this cmdlet, type Get-Help New-Dictionary." } }',
+            'data { if ($null) { "To get help for this cmdlet, type Get-Help New-Dictionary." } }',
+        ),
+    ],
+)
+@pytest.mark.skip_unless_on_windows
+def test_prep_powershell_cmd(cmd, parsed):
     """
     Tests _prep_powershell_cmd returns correct cmd
     """
-    with patch("salt.utils.platform.is_windows", MagicMock(return_value=False)):
-        stack = [["", "", ""], ["", "", ""], ["", "", ""]]
-        ret = cmdmod._prep_powershell_cmd(
-            shell="powershell", cmd="$PSVersionTable", stack=stack, encoded_cmd=False
-        )
-        assert ret == 'powershell -NonInteractive -NoProfile -Command "$PSVersionTable"'
+    ret = cmdmod._prep_powershell_cmd(
+        win_shell="powershell.exe", cmd=cmd, encoded_cmd=False
+    )
+    expected = [
+        "powershell.exe",
+        "-NonInteractive",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-Command",
+        parsed,
+    ]
+    assert ret == expected
 
-        ret = cmdmod._prep_powershell_cmd(
-            shell="powershell", cmd="$PSVersionTable", stack=stack, encoded_cmd=True
-        )
-        assert (
-            ret
-            == "powershell -NonInteractive -NoProfile -EncodedCommand $PSVersionTable"
-        )
 
-        stack = [["", "", ""], ["", "", "script"], ["", "", ""]]
-        ret = cmdmod._prep_powershell_cmd(
-            shell="powershell", cmd="$PSVersionTable", stack=stack, encoded_cmd=False
-        )
-        assert (
-            ret
-            == "powershell -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command $PSVersionTable"
-        )
+@pytest.mark.skip_unless_on_windows
+def test_prep_powershell_cmd_encoded():
+    """
+    Tests _prep_powershell_cmd returns correct cmd when encoded_cmd=True
+    """
+    # This is the encoded command for 'Write-Host "Encoded HOLO"'
+    e_cmd = "VwByAGkAdABlAC0ASABvAHMAdAAgACIARQBuAGMAbwBkAGUAZAAgAEgATwBMAE8AIgA="
+    ret = cmdmod._prep_powershell_cmd(
+        win_shell="powershell.exe", cmd=e_cmd, encoded_cmd=True
+    )
+    expected = [
+        "powershell.exe",
+        "-NonInteractive",
+        "-NoProfile",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        e_cmd,
+    ]
+    assert ret == expected
 
-    with patch("salt.utils.platform.is_windows", MagicMock(return_value=True)):
-        stack = [["", "", ""], ["", "", ""], ["", "", ""]]
 
+@pytest.mark.skip_unless_on_windows
+def test_prep_powershell_cmd_script():
+    """
+    Tests _prep_powershell_cmd returns correct cmd when called from cmd.script
+    """
+    stack = [["", "", ""], ["", "", "script"], ["", "", ""], ["", "", ""]]
+    with patch("traceback.extract_stack", return_value=stack), patch(
+        "salt.utils.path.which", return_value="powershell.exe"
+    ):
+        script = r"C:\some\script.ps1"
         ret = cmdmod._prep_powershell_cmd(
-            shell="powershell", cmd="$PSVersionTable", stack=stack, encoded_cmd=False
+            win_shell="powershell.exe", cmd=[script], encoded_cmd=False
         )
-        assert (
-            ret == '"powershell" -NonInteractive -NoProfile -Command "$PSVersionTable"'
-        )
+        expected = [
+            "powershell.exe",
+            "-NonInteractive",
+            "-NoProfile",
+            "-ExecutionPolicy",
+            "Bypass",
+            "-File",
+            script,
+        ]
+        assert ret == expected
 
-        ret = cmdmod._prep_powershell_cmd(
-            shell="powershell", cmd="$PSVersionTable", stack=stack, encoded_cmd=True
-        )
-        assert (
-            ret
-            == '"powershell" -NonInteractive -NoProfile -EncodedCommand $PSVersionTable'
-        )
 
-        stack = [["", "", ""], ["", "", "script"], ["", "", ""]]
-        ret = cmdmod._prep_powershell_cmd(
-            shell="powershell", cmd="$PSVersionTable", stack=stack, encoded_cmd=False
-        )
-        assert (
-            ret
-            == '"powershell" -NonInteractive -NoProfile -ExecutionPolicy Bypass -Command $PSVersionTable'
-        )
+@pytest.mark.parametrize(
+    "text, expected",
+    [
+        ("", '""'),  # Should quote an empty string
+        ("Foo", '"Foo"'),  # Should quote a string
+        ('["foo", "bar"]', '["foo", "bar"]'),  # Should leave unchanged
+        ('{"foo": "bar"}', '{"foo": "bar"}'),  # Should leave unchanged
+    ],
+)
+@pytest.mark.skip_unless_on_windows
+def test_prep_powershell_json(text, expected):
+    """
+    Make sure the output is valid json
+    """
+    result = cmdmod._prep_powershell_json(text)
+    assert result == expected

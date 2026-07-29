@@ -8,14 +8,10 @@ log = logging.getLogger(__name__)
 
 
 @pytest.mark.skip_unless_on_linux
-@pytest.mark.skip_if_not_root
 def test_dns_change(master, minion, salt_cli, etc_hosts, caplog, master_alive_interval):
     """
     Verify a minion will pick up a master's dns change if it's been disconnected.
     """
-
-    if not master.ip_addr_set:
-        pytest.skip("Unable to set additional IP address for master")
 
     etc_hosts.write_text(f"{etc_hosts.orig_text}\n172.16.0.1    master.local")
 

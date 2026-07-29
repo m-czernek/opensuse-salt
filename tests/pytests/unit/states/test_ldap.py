@@ -7,6 +7,7 @@ was an ugly second implementation.
 I'm leaving it for now, but this should really be gutted and replaced
 with something sensible.
 """
+
 import copy
 import logging
 
@@ -240,20 +241,24 @@ def _test_helper(init_db, expected_ret, replace, delete_others=False, attrlist=N
         "changes",
         {
             dn: {
-                "old": {
-                    attr: vals
-                    for attr, vals in old[dn].items()
-                    if vals != new.get(dn, {}).get(attr, ())
-                }
-                if dn in old
-                else None,
-                "new": {
-                    attr: vals
-                    for attr, vals in new[dn].items()
-                    if vals != old.get(dn, {}).get(attr, ())
-                }
-                if dn in new
-                else None,
+                "old": (
+                    {
+                        attr: vals
+                        for attr, vals in old[dn].items()
+                        if vals != new.get(dn, {}).get(attr, ())
+                    }
+                    if dn in old
+                    else None
+                ),
+                "new": (
+                    {
+                        attr: vals
+                        for attr, vals in new[dn].items()
+                        if vals != old.get(dn, {}).get(attr, ())
+                    }
+                    if dn in new
+                    else None
+                ),
             }
             for dn in replace
             if old.get(dn, {}) != new.get(dn, {})
@@ -324,20 +329,24 @@ def _test_helper_add(db, expected_ret, add_items, delete_others=False, attrlist=
         "changes",
         {
             dn: {
-                "old": {
-                    attr: vals
-                    for attr, vals in old[dn].items()
-                    if vals != new.get(dn, {}).get(attr, ())
-                }
-                if dn in old
-                else None,
-                "new": {
-                    attr: vals
-                    for attr, vals in new[dn].items()
-                    if vals != old.get(dn, {}).get(attr, ())
-                }
-                if dn in new
-                else None,
+                "old": (
+                    {
+                        attr: vals
+                        for attr, vals in old[dn].items()
+                        if vals != new.get(dn, {}).get(attr, ())
+                    }
+                    if dn in old
+                    else None
+                ),
+                "new": (
+                    {
+                        attr: vals
+                        for attr, vals in new[dn].items()
+                        if vals != old.get(dn, {}).get(attr, ())
+                    }
+                    if dn in new
+                    else None
+                ),
             }
             for dn in add_items
             if old.get(dn, {}) != new.get(dn, {})

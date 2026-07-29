@@ -51,17 +51,19 @@ function Write-Result($result, $ForegroundColor="Green") {
 # Script Variables
 #-------------------------------------------------------------------------------
 
-$PROJECT_DIR   = $(git rev-parse --show-toplevel)
-$SCRIPT_DIR    = (Get-ChildItem "$($myInvocation.MyCommand.Definition)").DirectoryName
-$BUILD_DIR     = "$PROJECT_DIR\pkg\windows\build"
-$BUILDENV_DIR  = "$PROJECT_DIR\pkg\windows\buildenv"
-$INSTALLER_DIR = "$SCRIPT_DIR\installer"
-$SCRIPTS_DIR   = "$BUILDENV_DIR\Scripts"
-$PYTHON_BIN    = "$SCRIPTS_DIR\python.exe"
-$PY_VERSION    = [Version]((Get-Command $PYTHON_BIN).FileVersionInfo.ProductVersion)
-$PY_VERSION    = "$($PY_VERSION.Major).$($PY_VERSION.Minor)"
-$NSIS_BIN      = "$( ${env:ProgramFiles(x86)} )\NSIS\makensis.exe"
-$ARCH          = $(. $PYTHON_BIN -c "import platform; print(platform.architecture()[0])")
+$PROJECT_DIR    = $(git rev-parse --show-toplevel)
+$SCRIPT_DIR     = (Get-ChildItem "$($myInvocation.MyCommand.Definition)").DirectoryName
+$BUILD_DIR      = "$PROJECT_DIR\pkg\windows\build"
+$BUILDENV_DIR   = "$PROJECT_DIR\pkg\windows\buildenv"
+$INSTALLER_DIR  = "$SCRIPT_DIR\installer"
+$SCRIPTS_DIR    = "$BUILDENV_DIR\Scripts"
+$SITE_PKGS_DIR  = "$BUILDENV_DIR\Lib\site-packages"
+$BUILD_SALT_DIR = "$SITE_PKGS_DIR\salt"
+$PYTHON_BIN     = "$SCRIPTS_DIR\python.exe"
+$PY_VERSION     = [Version]((Get-Command $PYTHON_BIN).FileVersionInfo.ProductVersion)
+$PY_VERSION     = "$($PY_VERSION.Major).$($PY_VERSION.Minor)"
+$NSIS_BIN       = "$( ${env:ProgramFiles(x86)} )\NSIS\makensis.exe"
+$ARCH           = $(. $PYTHON_BIN -c "import platform; print(platform.architecture()[0])")
 
 if ( $ARCH -eq "64bit" ) {
     $ARCH = "AMD64"
@@ -132,6 +134,214 @@ if ( Test-Path -Path "$INSTALLER_DIR\salt.ico" ) {
     Write-Host "Failed to find salt.ico in build_env directory"
     exit 1
 }
+
+#-------------------------------------------------------------------------------
+# Remove Non-Windows Execution Modules
+#-------------------------------------------------------------------------------
+Write-Host "Removing Non-Windows Execution Modules: " -NoNewline
+$modules = "acme",
+           "aix",
+           "alternatives",
+           "apcups",
+           "apf",
+           "apt",
+           "arista",
+           "at",
+           "bcache",
+           "blockdev",
+           "bluez",
+           "bridge",
+           "bsd",
+           "btrfs",
+           "ceph",
+           "container_resource",
+           "cron",
+           "csf",
+           "daemontools",
+           "deb*",
+           "devmap",
+           "dpkg",
+           "ebuild",
+           "eix",
+           "eselect",
+           "ethtool",
+           "extfs",
+           "firewalld",
+           "freebsd",
+           "genesis",
+           "gentoo",
+           "glusterfs",
+           "gnomedesktop",
+           "groupadd",
+           "grub_legacy",
+           "guestfs",
+           "htpasswd",
+           "ilo",
+           "img",
+           "incron",
+           "inspector",
+           "ipset",
+           "iptables",
+           "iwtools",
+           "k8s",
+           "kapacitor",
+           "keyboard",
+           "keystone",
+           "kmod",
+           "layman",
+           "linux",
+           "localemod",
+           "locate",
+           "logadm",
+           "logrotate",
+           "lvs",
+           "lxc",
+           "mac",
+           "makeconf",
+           "mdadm",
+           "mdata",
+           "monit",
+           "moosefs",
+           "mount",
+           "napalm",
+           "netbsd",
+           "netscaler",
+           "neutron",
+           "nfs3",
+           "nftables",
+           "nova",
+           "nspawn",
+           "openbsd",
+           "openstack",
+           "openvswitch",
+           "opkg",
+           "pacman",
+           "parallels",
+           "parted",
+           "pcs",
+           "pkgin",
+           "pkgng",
+           "pkgutil",
+           "portage_config",
+           "postfix",
+           "poudriere",
+           "powerpath",
+           "pw_",
+           "qemu_",
+           "quota",
+           "redismod",
+           "restartcheck",
+           "rh_",
+           "riak",
+           "rpm",
+           "runit",
+           "s6",
+           "scsi",
+           "sensors",
+           "service",
+           "shadow",
+           "smartos",
+           "smf",
+           "snapper",
+           "solaris",
+           "solr",
+           "ssh_",
+           "supervisord",
+           "sysbench",
+           "sysfs",
+           "sysrc",
+           "system",
+           "test_virtual",
+           "timezone",
+           "trafficserver",
+           "tuned",
+           "udev",
+           "upstart",
+           "useradd",
+           "uswgi",
+           "varnish",
+           "vbox",
+           "virt.py",  # We don't want to remove virtualenv_mod.py
+           "xapi",
+           "xbpspkg",
+           "xfs",
+           "yum*",
+           "zfs",
+           "znc",
+           "zpool",
+           "zypper"
+$modules | ForEach-Object {
+    Remove-Item -Path "$BUILD_SALT_DIR\modules\$_*" -Recurse
+    if ( Test-Path -Path "$BUILD_SALT_DIR\modules\$_*" ) {
+        Write-Result "Failed" -ForegroundColor Red
+        Write-Host "Failed to remove: $BUILD_SALT_DIR\modules\$_"
+        exit 1
+    }
+}
+Write-Result "Success" -ForegroundColor Green
+
+#-------------------------------------------------------------------------------
+# Remove Non-Windows State Modules
+#-------------------------------------------------------------------------------
+Write-Host "Removing Non-Windows State Modules: " -NoNewline
+$states = "acme",
+          "alternatives",
+          "apt",
+          "at",
+          "blockdev",
+          "ceph",
+          "cron",
+          "csf",
+          "deb",
+          "eselect",
+          "ethtool",
+          "firewalld",
+          "glusterfs",
+          "gnome",
+          "htpasswd",
+          "incron",
+          "ipset",
+          "iptables",
+          "k8s",
+          "kapacitor",
+          "keyboard",
+          "keystone",
+          "kmod",
+          "layman",
+          "linux",
+          "lxc",
+          "mac",
+          "makeconf",
+          "mdadm",
+          "monit",
+          "mount",
+          "nftables",
+          "pcs",
+          "pkgng",
+          "portage",
+          "powerpath",
+          "quota",
+          "redismod",
+          "smartos",
+          "snapper",
+          "ssh",
+          "supervisord",
+          "sysrc",
+          "trafficserver",
+          "tuned",
+          "vbox",
+          "virt.py",
+          "zfs",
+          "zpool"
+$states | ForEach-Object {
+    Remove-Item -Path "$BUILD_SALT_DIR\states\$_*" -Recurse
+    if ( Test-Path -Path "$BUILD_SALT_DIR\states\$_*" ) {
+        Write-Result "Failed" -ForegroundColor Red
+        Write-Host "Failed to remove: $BUILD_SALT_DIR\states\$_"
+        exit 1
+    }
+}
+Write-Result "Success" -ForegroundColor Green
 
 #-------------------------------------------------------------------------------
 # Remove compiled files
@@ -213,20 +423,51 @@ if ( $estimated_size -gt 0 ) {
 # Build the Installer
 #-------------------------------------------------------------------------------
 
+# Create a short path junction to avoid NSIS hitting Windows MAX_PATH (260 chars)
+# when recursively adding files from the buildenv directory.
+$SHORT_DIR = "C:\salt"
+$NSIS_NSI_PATH = "$INSTALLER_DIR\Salt-Minion-Setup.nsi"
+if ( ! (Test-Path -Path "$SHORT_DIR") ) {
+    New-Item -ItemType Junction -Path "$SHORT_DIR" -Target "$PROJECT_DIR" -Force | Out-Null
+    if ( Test-Path -Path "$SHORT_DIR" ) {
+        $NSIS_NSI_PATH = "$SHORT_DIR\pkg\windows\nsis\installer\Salt-Minion-Setup.nsi"
+    }
+}
+
 Write-Host "Building the Installer: " -NoNewline
 $installer_name = "Salt-Minion-$Version-Py$($PY_VERSION.Split(".")[0])-$ARCH-Setup.exe"
-Start-Process -FilePath $NSIS_BIN `
+$nsis_stdout = "$env:TEMP\nsis_stdout.log"
+$nsis_stderr = "$env:TEMP\nsis_stderr.log"
+$nsis_proc = Start-Process -FilePath $NSIS_BIN `
               -ArgumentList "/DSaltVersion=$Version", `
                             "/DPythonArchitecture=$ARCH", `
                             "/DEstimatedSize=$estimated_size", `
-                            "$INSTALLER_DIR\Salt-Minion-Setup.nsi" `
-              -Wait -WindowStyle Hidden
+                            "$NSIS_NSI_PATH" `
+              -Wait -PassThru `
+              -RedirectStandardOutput $nsis_stdout `
+              -RedirectStandardError $nsis_stderr
 if ( Test-Path -Path "$INSTALLER_DIR\$installer_name" ) {
     Write-Result "Success" -ForegroundColor Green
 } else {
     Write-Result "Failed" -ForegroundColor Red
     Write-Host "Failed to find $installer_name in installer directory"
+    Write-Host "NSIS exit code: $($nsis_proc.ExitCode)"
+    Write-Host "CMD:"
+    Write-Host "`"$NSIS_BIN`" /DSaltVersion=$Version /DPythonArchitecture=$ARCH /DEstimatedSize=$estimated_size `"$NSIS_NSI_PATH`""
+    if ( Test-Path -Path $nsis_stdout ) {
+        Write-Host "--- NSIS stdout ---"
+        Get-Content $nsis_stdout
+    }
+    if ( Test-Path -Path $nsis_stderr ) {
+        Write-Host "--- NSIS stderr ---"
+        Get-Content $nsis_stderr
+    }
     exit 1
+}
+
+# Clean up the short path junction
+if ( Test-Path -Path "$SHORT_DIR" ) {
+    [System.IO.Directory]::Delete("$SHORT_DIR")
 }
 
 #-------------------------------------------------------------------------------

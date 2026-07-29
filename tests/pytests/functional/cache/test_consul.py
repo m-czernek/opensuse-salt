@@ -1,5 +1,4 @@
 import logging
-import os
 import socket
 import time
 
@@ -10,20 +9,14 @@ import salt.cache
 import salt.loader
 from tests.pytests.functional.cache.helpers import run_common_cache_tests
 
-pytest.importorskip(
-    "consul",
-    reason="Please install python-consul package to use consul data cache driver",
-)
-docker = pytest.importorskip("docker", minversion="4.0.0")
+docker = pytest.importorskip("docker")
 
 log = logging.getLogger(__name__)
 
-INSIDE_CONTAINER = os.getenv("HOSTNAME", "") == "salt-test-container"
-
 pytestmark = [
+    pytest.mark.skip_on_fips_enabled_platform,
     pytest.mark.slow_test,
     pytest.mark.skip_if_binaries_missing("dockerd"),
-    pytest.mark.skipif(INSIDE_CONTAINER, reason="Cannot run in a container"),
 ]
 
 

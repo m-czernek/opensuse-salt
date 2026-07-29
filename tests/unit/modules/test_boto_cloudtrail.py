@@ -22,6 +22,10 @@ try:
 except ImportError:
     HAS_BOTO = False
 
+pytestmark = [
+    pytest.mark.skip_on_fips_enabled_platform,
+]
+
 # pylint: enable=import-error,no-name-in-module,unused-import
 
 # the boto_cloudtrail module relies on the connect_to_region() method
@@ -184,7 +188,7 @@ class BotoCloudTrailTestCase(BotoCloudTrailTestCaseBase, BotoCloudTrailTestCaseM
         result = boto_cloudtrail.create(
             Name=trail_ret["Name"],
             S3BucketName=trail_ret["S3BucketName"],
-            **conn_parameters
+            **conn_parameters,
         )
 
         self.assertTrue(result["created"])
@@ -199,7 +203,7 @@ class BotoCloudTrailTestCase(BotoCloudTrailTestCaseBase, BotoCloudTrailTestCaseM
         result = boto_cloudtrail.create(
             Name=trail_ret["Name"],
             S3BucketName=trail_ret["S3BucketName"],
-            **conn_parameters
+            **conn_parameters,
         )
         self.assertEqual(
             result.get("error", {}).get("message"), error_message.format("create_trail")
@@ -330,7 +334,7 @@ class BotoCloudTrailTestCase(BotoCloudTrailTestCaseBase, BotoCloudTrailTestCaseM
         result = boto_cloudtrail.update(
             Name=trail_ret["Name"],
             S3BucketName=trail_ret["S3BucketName"],
-            **conn_parameters
+            **conn_parameters,
         )
 
         self.assertTrue(result["updated"])
@@ -345,7 +349,7 @@ class BotoCloudTrailTestCase(BotoCloudTrailTestCaseBase, BotoCloudTrailTestCaseM
         result = boto_cloudtrail.update(
             Name=trail_ret["Name"],
             S3BucketName=trail_ret["S3BucketName"],
-            **conn_parameters
+            **conn_parameters,
         )
         self.assertEqual(
             result.get("error", {}).get("message"), error_message.format("update_trail")

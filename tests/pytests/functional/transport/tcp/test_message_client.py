@@ -2,13 +2,18 @@ import logging
 
 import pytest
 
-import tornado.gen
-import tornado.iostream
-import tornado.tcpserver
+import salt.ext.tornado.gen
+import salt.ext.tornado.iostream
+import salt.ext.tornado.tcpserver
 import salt.transport.tcp
 import salt.utils.msgpack
 
 log = logging.getLogger(__name__)
+
+pytestmark = [
+    pytest.mark.windows_whitelisted,
+    pytest.mark.core_test,
+]
 
 
 @pytest.fixture
@@ -21,20 +26,22 @@ def config():
 
 @pytest.fixture
 def server(config):
-    class TestServer(tornado.tcpserver.TCPServer):
+    class TestServer(salt.ext.tornado.tcpserver.TCPServer):
         send = []
         disconnect = False
 
-        async def handle_stream(self, stream, address):
+        async def handle_stream(  # pylint: disable=invalid-overridden-method
+            self, stream, address
+        ):
             while self.disconnect is False:
                 for msg in self.send[:]:
                     msg = self.send.pop(0)
                     try:
                         await stream.write(msg)
-                    except tornado.iostream.StreamClosedError:
+                    except salt.ext.tornado.iostream.StreamClosedError:
                         break
                 else:
-                    await tornado.gen.sleep(1)
+                    await salt.ext.tornado.gen.sleep(1)
             stream.close()
 
     server = TestServer()
@@ -81,14 +88,14 @@ async def test_message_client_reconnect(io_loop, config, client, server):
     server.send.append(partial)
 
     while not received:
-        await tornado.gen.sleep(1)
+        await salt.ext.tornado.gen.sleep(1)
     assert received == [msg]
 
     # The message client has unpacked one msg and there is a partial msg left in
     # the unpacker. Closing the stream now leaves the unpacker in a bad state
     # since the rest of the partil message will never be received.
     server.disconnect = True
-    await tornado.gen.sleep(1)
+    await salt.ext.tornado.gen.sleep(1)
     server.disconnect = False
     received = []
 
@@ -97,5 +104,5 @@ async def test_message_client_reconnect(io_loop, config, client, server):
     # rest of this test would fail.
     server.send.append(pmsg)
     while not received:
-        await tornado.gen.sleep(1)
+        await salt.ext.tornado.gen.sleep(1)
     assert received == [msg, msg]

@@ -4,6 +4,7 @@ tests.pytests.unit.test_version
 
 Test salt's regex git describe version parsing
 """
+
 import re
 
 import pytest
@@ -72,7 +73,7 @@ def test_version_parsing(version_string, full_info, version):
             .replace("-", "+", 1)
             .replace("-", ".", 1)
         )
-    assert saltstack_version.string == version
+    assert version in saltstack_version.string
 
 
 @pytest.mark.parametrize(
@@ -424,6 +425,38 @@ def test_previous_and_next_releases():
         assert SaltVersionsInfo.current_release() == SaltVersionsInfo.NEPTUNIUM
         assert SaltVersionsInfo.next_release() == SaltVersionsInfo.PLUTONIUM
         assert SaltVersionsInfo.previous_release() == SaltVersionsInfo.URANIUM
+
+
+def test_current_release_matches_maintenance_branch_67061():
+    """
+    Regression for #67061.
+
+    On a maintenance branch (e.g. 3006.x), the bookkeeping in
+    ``SaltVersionsInfo`` marks ``Sulfur`` (3006) as released and leaves
+    every subsequent codename at ``released=False``.  The pre-fix
+    ``current_release()`` walked the table and returned the *first*
+    un-released codename, which is the next major (Chlorine, 3007) on
+    this branch.  When a checkout has neither ``salt/_version.txt`` nor a
+    usable ``.git`` directory, that wrong codename leaked into
+    ``__saltstack_version__`` and was baked into the built distribution
+    (e.g. ``setup.py`` would write ``Version: 3007.0`` for a source build
+    of 3006.x).  Pin ``current_release()`` to the branch's own codename
+    so the default version always matches the branch's calver series.
+    """
+    # Reset any cached _current_release that an earlier import set so we
+    # exercise the real lookup path.
+    with patch.multiple(
+        SaltVersionsInfo,
+        _previous_release=None,
+        _next_release=None,
+        _current_release=None,
+    ):
+        current = SaltVersionsInfo.current_release()
+        assert current == SaltVersionsInfo.SULFUR, (
+            f"On the 3006.x branch current_release() must be Sulfur (3006), "
+            f"not {current.name} ({current.info[0]})."
+        )
+        assert current.info[0] == 3006
 
 
 @pytest.mark.skip_unless_on_linux

@@ -5,7 +5,7 @@ import pytest
 
 import salt.transport.ipc
 import salt.utils.platform
-from tornado import locks
+from salt.ext.tornado import locks
 
 pytestmark = [
     # Windows does not support POSIX IPC
@@ -110,7 +110,7 @@ async def test_basic_send(channel):
 async def test_send_many(channel):
     msgs = []
     for i in range(0, 1000):
-        msgs.append("test_many_send_{}".format(i))
+        msgs.append(f"test_many_send_{i}")
 
     for msg in msgs:
         await channel.send(msg)

@@ -370,7 +370,6 @@ class HTTPServerTest(AsyncHTTPTestCase):
         self.assertEqual(200, response.code)
         self.assertEqual(json_decode(response.body), {})
 
-    @unittest.skip("Test broken after CVE-2025-47287.path")
     def test_malformed_body(self):
         # parse_qs is pretty forgiving, but it will fail on python 3
         # if the data is not utf8.  On python 2 parse_qs will work,
@@ -834,9 +833,9 @@ class GzipUnsupportedTest(GzipBaseTest, AsyncHTTPTestCase):
         # Gzip support is opt-in; without it the server fails to parse
         # the body (but parsing form bodies is currently just a log message,
         # not a fatal error).
-        with ExpectLog(gen_log, ".*Unsupported Content-Encoding"):
+        with ExpectLog(gen_log, "Unsupported Content-Encoding"):
             response = self.post_gzip('foo=bar')
-        self.assertEqual(response.code, 400)
+        self.assertEquals(json_decode(response.body), {})
 
 
 class StreamingChunkSizeTest(AsyncHTTPTestCase):

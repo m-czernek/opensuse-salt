@@ -125,6 +125,13 @@ REDIS_POOL = None
 # Define the module's virtual name
 __virtualname__ = "redis"
 
+# Allow this returner to also be referenced by its file name. The module is
+# named ``redis_return.py`` and the docs (and ``--return redis_return``
+# examples) refer to it as ``redis_return`` even though ``__virtualname__``
+# loads it as ``redis``. Without an alias, ``master_job_cache: redis_return``
+# fails with ``KeyError: redis_return.prep_jid`` in ``salt/utils/job.py``.
+__virtual_aliases__ = ("redis_return",)
+
 
 def __virtual__():
     """
@@ -152,6 +159,7 @@ def _get_options(ret=None):
         "port": "port",
         "unix_socket_path": "unix_socket_path",
         "db": "db",
+        "password": "password",
         "cluster_mode": "cluster_mode",
         "startup_nodes": "cluster.startup_nodes",
         "skip_full_coverage_check": "cluster.skip_full_coverage_check",
@@ -163,6 +171,7 @@ def _get_options(ret=None):
             "port": __opts__.get("redis.port", 6379),
             "unix_socket_path": __opts__.get("redis.unix_socket_path", None),
             "db": __opts__.get("redis.db", "0"),
+            "password": __opts__.get("redis.password", None),
             "cluster_mode": __opts__.get("redis.cluster_mode", False),
             "startup_nodes": __opts__.get("redis.cluster.startup_nodes", {}),
             "skip_full_coverage_check": __opts__.get(
@@ -188,6 +197,7 @@ def _get_serv(ret=None):
         REDIS_POOL = StrictRedisCluster(
             startup_nodes=_options.get("startup_nodes"),
             skip_full_coverage_check=_options.get("skip_full_coverage_check"),
+            password=_options.get("password"),
             decode_responses=True,
         )
     else:
@@ -196,6 +206,7 @@ def _get_serv(ret=None):
             port=_options.get("port"),
             unix_socket_path=_options.get("unix_socket_path", None),
             db=_options.get("db"),
+            password=_options.get("password"),
             decode_responses=True,
         )
     return REDIS_POOL
@@ -212,9 +223,13 @@ def returner(ret):
     serv = _get_serv(ret)
     pipeline = serv.pipeline(transaction=False)
     minion, jid = ret["id"], ret["jid"]
-    pipeline.hset("ret:{}".format(jid), minion, salt.utils.json.dumps(ret))
-    pipeline.expire("ret:{}".format(jid), _get_ttl())
-    pipeline.set("{}:{}".format(minion, ret["fun"]), jid)
+    pipeline.hset(f"ret:{jid}", minion, salt.utils.json.dumps(ret))
+    pipeline.expire(f"ret:{jid}", _get_ttl())
+    # Apply the same TTL to the ``<minion>:<fun>`` last-jid pointer.
+    # Without ``ex=`` the key was written with no expiry and never
+    # cleaned up, so any (minion, fun) pair that stopped running stuck
+    # in Redis indefinitely.
+    pipeline.set("{}:{}".format(minion, ret["fun"]), jid, ex=_get_ttl())
     pipeline.sadd("minions", minion)
     pipeline.execute()
 
@@ -224,7 +239,7 @@ def save_load(jid, load, minions=None):
     Save the load to the specified jid
     """
     serv = _get_serv(ret=None)
-    serv.setex("load:{}".format(jid), _get_ttl(), salt.utils.json.dumps(load))
+    serv.setex(f"load:{jid}", _get_ttl(), salt.utils.json.dumps(load))
 
 
 def save_minions(jid, minions, syndic_id=None):  # pylint: disable=unused-argument
@@ -238,7 +253,7 @@ def get_load(jid):
     Return the load data that marks a specified jid
     """
     serv = _get_serv(ret=None)
-    data = serv.get("load:{}".format(jid))
+    data = serv.get(f"load:{jid}")
     if data:
         return salt.utils.json.loads(data)
     return {}
@@ -250,7 +265,7 @@ def get_jid(jid):
     """
     serv = _get_serv(ret=None)
     ret = {}
-    for minion, data in serv.hgetall("ret:{}".format(jid)).items():
+    for minion, data in serv.hgetall(f"ret:{jid}").items():
         if data:
             ret[minion] = salt.utils.json.loads(data)
     return ret
@@ -263,14 +278,19 @@ def get_fun(fun):
     serv = _get_serv(ret=None)
     ret = {}
     for minion in serv.smembers("minions"):
-        ind_str = "{}:{}".format(minion, fun)
+        ind_str = f"{minion}:{fun}"
         try:
             jid = serv.get(ind_str)
         except Exception:  # pylint: disable=broad-except
             continue
         if not jid:
             continue
-        data = serv.get("{}:{}".format(minion, jid))
+        # The return data lives as a field of the ``ret:<jid>`` hash
+        # (written by ``returner`` via ``hset``), not under a
+        # ``<minion>:<jid>`` key (no such key is ever written by this
+        # module). Reading the hash field is what ``get_jid`` already
+        # does.
+        data = serv.hget(f"ret:{jid}", minion)
         if data:
             ret[minion] = salt.utils.json.loads(data)
     return ret
@@ -282,7 +302,13 @@ def get_jids():
     """
     serv = _get_serv(ret=None)
     ret = {}
-    for s in serv.mget(serv.keys("load:*")):
+    # ``SCAN`` walks the keyspace incrementally and never blocks the
+    # Redis server, unlike ``KEYS``. Order is not guaranteed but the
+    # returner does not rely on it.
+    load_keys = list(serv.scan_iter(match="load:*"))
+    if not load_keys:
+        return ret
+    for s in serv.mget(load_keys):
         if s is None:
             continue
         load = salt.utils.json.loads(s)
@@ -309,14 +335,18 @@ def clean_old_jobs():
     do manually cleaning here.
     """
     serv = _get_serv(ret=None)
-    ret_jids = serv.keys("ret:*")
-    living_jids = set(serv.keys("load:*"))
+    # ``SCAN`` walks the keyspace incrementally; ``KEYS`` blocks the
+    # Redis server until it has scanned every key. ``clean_old_jobs``
+    # is invoked from the master scheduler, so the cumulative load of
+    # blocking the server twice (``ret:*`` and ``load:*``) on every
+    # tick is avoided here.
+    living_jids = set(serv.scan_iter(match="load:*"))
     to_remove = []
-    for ret_key in ret_jids:
+    for ret_key in serv.scan_iter(match="ret:*"):
         load_key = ret_key.replace("ret:", "load:", 1)
         if load_key not in living_jids:
             to_remove.append(ret_key)
-    if len(to_remove) != 0:
+    if to_remove:
         serv.delete(*to_remove)
         log.debug("clean old jobs: %s", to_remove)
 

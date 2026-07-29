@@ -138,9 +138,7 @@ def request(
                 csr = csr_file.read()
             request = CertificateRequest(csr=csr, common_name=dns_name)
         except Exception as e:
-            raise Exception(
-                "Unable to open file {file}: {excp}".format(file=csr_path, excp=e)
-            )
+            raise Exception(f"Unable to open file {csr_path}: {e}")
     conn.request_cert(request, zone)
 
     # TODO: add timeout parameter here
@@ -160,13 +158,11 @@ def request(
                 with salt.utils.files.fopen(pkey_path) as pkey_file:
                     private_key = pkey_file.read()
             except Exception as e:
-                raise Exception(
-                    "Unable to open file {file}: {excp}".format(file=pkey_path, excp=e)
-                )
+                raise Exception(f"Unable to open file {pkey_path}: {e}")
         else:
             private_key = None
 
-    cache = salt.cache.Cache(__opts__, syspaths.CACHE_DIR)
+    cache = salt.cache.Cache(__opts__, __opts__.get("cachedir", syspaths.CACHE_DIR))
     data = {
         "minion_id": minion_id,
         "cert": cert.cert,
@@ -186,7 +182,7 @@ def _id_map(minion_id, dns_name):
     Maintain a relationship between a minion and a DNS name
     """
 
-    cache = salt.cache.Cache(__opts__, syspaths.CACHE_DIR)
+    cache = salt.cache.Cache(__opts__, __opts__.get("cachedir", syspaths.CACHE_DIR))
     dns_names = cache.fetch(CACHE_BANK_NAME, minion_id)
     if not isinstance(dns_names, list):
         dns_names = []
@@ -206,7 +202,7 @@ def show_cert(dns_name):
         salt-run venafi.show_cert example.com
     """
 
-    cache = salt.cache.Cache(__opts__, syspaths.CACHE_DIR)
+    cache = salt.cache.Cache(__opts__, __opts__.get("cachedir", syspaths.CACHE_DIR))
     domain_data = cache.fetch(CACHE_BANK_NAME, dns_name) or {}
     cert = domain_data.get("cert")
     return cert
@@ -222,7 +218,7 @@ def list_domain_cache():
 
         salt-run venafi.list_domain_cache
     """
-    cache = salt.cache.Cache(__opts__, syspaths.CACHE_DIR)
+    cache = salt.cache.Cache(__opts__, __opts__.get("cachedir", syspaths.CACHE_DIR))
     return cache.list("venafi/domains")
 
 
@@ -236,7 +232,7 @@ def del_cached_domain(domains):
 
         salt-run venafi.del_cached_domain domain1.example.com,domain2.example.com
     """
-    cache = salt.cache.Cache(__opts__, syspaths.CACHE_DIR)
+    cache = salt.cache.Cache(__opts__, __opts__.get("cachedir", syspaths.CACHE_DIR))
     if isinstance(domains, str):
         domains = domains.split(",")
     if not isinstance(domains, list):

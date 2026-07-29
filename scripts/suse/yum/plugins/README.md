@@ -11,7 +11,7 @@ Configuration files are going to:
 
 Plugin itself goes to:
 
-	`/usr/share/yum-plugins/[name].py`
+	`/usr/share/yum-plugins/[name].conf`
 
 ## Permissions
 

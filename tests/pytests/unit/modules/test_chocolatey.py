@@ -2,7 +2,6 @@
 Test for the chocolatey module
 """
 
-
 import os
 
 import pytest
@@ -25,10 +24,15 @@ def choco_path():
 
 
 @pytest.fixture(scope="module")
-def choco_path_pd():
+def chocolatey_path_pd():
     return os.path.join(
         os.environ.get("ProgramData"), "Chocolatey", "bin", "chocolatey.exe"
     )
+
+
+@pytest.fixture(scope="module")
+def choco_path_pd():
+    return os.path.join(os.environ.get("ProgramData"), "Chocolatey", "bin", "choco.exe")
 
 
 @pytest.fixture(scope="module")
@@ -133,12 +137,28 @@ def test__find_chocolatey_which(choco_path):
         assert chocolatey.__context__["chocolatey._path"] == expected
 
 
-def test__find_chocolatey_programdata(mock_false, mock_true, choco_path_pd):
+def test__find_chocolatey_programdata(mock_false, mock_true, chocolatey_path_pd):
     """
-    Test _find_chocolatey when found in ProgramData
+    Test _find_chocolatey when found in ProgramData and named chocolatey.exe
     """
     with patch.dict(chocolatey.__salt__, {"cmd.which": mock_false}), patch(
         "os.path.isfile", mock_true
+    ):
+        result = chocolatey._find_chocolatey()
+        expected = chocolatey_path_pd
+        # Does it return the correct path
+        assert result == expected
+        # Does it populate __context__
+        assert chocolatey.__context__["chocolatey._path"] == expected
+
+
+def test__find_choco_programdata(mock_false, choco_path_pd):
+    """
+    Test _find_chocolatey when found in ProgramData and named choco.exe
+    """
+    mock_is_file = MagicMock(side_effect=[False, True])
+    with patch.dict(chocolatey.__salt__, {"cmd.which": mock_false}), patch(
+        "os.path.isfile", mock_is_file
     ):
         result = chocolatey._find_chocolatey()
         expected = choco_path_pd
@@ -153,7 +173,7 @@ def test__find_chocolatey_systemdrive(mock_false, choco_path_sd):
     Test _find_chocolatey when found on SystemDrive (older versions)
     """
     with patch.dict(chocolatey.__salt__, {"cmd.which": mock_false}), patch(
-        "os.path.isfile", MagicMock(side_effect=[False, True])
+        "os.path.isfile", MagicMock(side_effect=[False, False, True])
     ):
         result = chocolatey._find_chocolatey()
         expected = choco_path_sd
@@ -169,7 +189,7 @@ def test_version_check_remote_false():
     """
     list_return_value = {"ack": ["3.1.1"]}
     with patch.object(chocolatey, "list_", return_value=list_return_value):
-        expected = {"ack": ["3.1.1"]}
+        expected = {"ack": {"installed": ["3.1.1"]}}
         result = chocolatey.version("ack", check_remote=False)
         assert result == expected
 
@@ -181,6 +201,20 @@ def test_version_check_remote_true():
     list_side_effect = [
         {"ack": ["3.1.1"]},
         {"ack": ["3.1.1"], "Wolfpack": ["3.0.17"], "blackbird": ["1.0.79.3"]},
+    ]
+    with patch.object(chocolatey, "list_", side_effect=list_side_effect):
+        expected = {"ack": {"available": ["3.1.1"], "installed": ["3.1.1"]}}
+        result = chocolatey.version("ack", check_remote=True)
+        assert result == expected
+
+
+def test_version_check_remote_true_capitalization():
+    """
+    Test version when remote is True
+    """
+    list_side_effect = [
+        {"Ack": ["3.1.1"]},
+        {"Ack": ["3.1.1"], "Wolfpack": ["3.0.17"], "blackbird": ["1.0.79.3"]},
     ]
     with patch.object(chocolatey, "list_", side_effect=list_side_effect):
         expected = {"ack": {"available": ["3.1.1"], "installed": ["3.1.1"]}}
@@ -241,3 +275,115 @@ def test_add_source(choco_path):
             "source_name", "source_location", priority="priority"
         )
         cmd_run_all_mock.assert_called_with(expected_call, python_shell=False)
+
+
+def test_install_virus_check_true():
+    mock_version = MagicMock(return_value="2.0.1")
+    mock_find = MagicMock(return_value=choco_path)
+    mock_run = MagicMock(return_value={"stdout": "No packages", "retcode": 0})
+    with patch.object(chocolatey, "chocolatey_version", mock_version), patch.object(
+        chocolatey, "_find_chocolatey", mock_find
+    ), patch.dict(chocolatey.__salt__, {"cmd.run_all": mock_run}):
+        chocolatey.install("busybox", virus_check=True)
+        # --no-progress and --yes populated from separate functions within the module.
+        expected_call = [
+            choco_path,
+            "install",
+            "busybox",
+            "--viruscheck",
+            "--no-progress",
+            "--yes",
+        ]
+        mock_run.assert_called_with(expected_call, python_shell=False)
+
+
+def test_install_virus_check_false():
+    mock_version = MagicMock(return_value="2.0.1")
+    mock_find = MagicMock(return_value=choco_path)
+    mock_run = MagicMock(return_value={"stdout": "No packages", "retcode": 0})
+    with patch.object(chocolatey, "chocolatey_version", mock_version), patch.object(
+        chocolatey, "_find_chocolatey", mock_find
+    ), patch.dict(chocolatey.__salt__, {"cmd.run_all": mock_run}):
+        chocolatey.install("busybox", virus_check=False)
+        # --no-progress and --yes populated from separate functions within the module.
+        expected_call = [
+            choco_path,
+            "install",
+            "busybox",
+            "--skipviruscheck",
+            "--no-progress",
+            "--yes",
+        ]
+        mock_run.assert_called_with(expected_call, python_shell=False)
+
+
+def test_list_pre_2_0_0():
+    mock_version = MagicMock(return_value="1.2.1")
+    mock_find = MagicMock(return_value=choco_path)
+    mock_run = MagicMock(return_value={"stdout": "No packages", "retcode": 0})
+    with patch.object(chocolatey, "chocolatey_version", mock_version), patch.object(
+        chocolatey, "_find_chocolatey", mock_find
+    ), patch.dict(chocolatey.__salt__, {"cmd.run_all": mock_run}):
+        chocolatey.list_()
+        expected_call = [choco_path, "list", "--limit-output"]
+        mock_run.assert_called_with(expected_call, python_shell=False)
+
+
+def test_list_post_2_0_0():
+    mock_version = MagicMock(return_value="2.0.1")
+    mock_find = MagicMock(return_value=choco_path)
+    mock_run = MagicMock(return_value={"stdout": "No packages", "retcode": 0})
+    with patch.object(chocolatey, "chocolatey_version", mock_version), patch.object(
+        chocolatey, "_find_chocolatey", mock_find
+    ), patch.dict(chocolatey.__salt__, {"cmd.run_all": mock_run}):
+        chocolatey.list_()
+        expected_call = [choco_path, "search", "--limit-output"]
+        mock_run.assert_called_with(expected_call, python_shell=False)
+
+
+def test_list_webpi_pre_2_0_0():
+    mock_version = MagicMock(return_value="1.2.1")
+    mock_find = MagicMock(return_value=choco_path)
+    mock_run = MagicMock(return_value={"stdout": "No packages", "retcode": 0})
+    with patch.object(chocolatey, "chocolatey_version", mock_version), patch.object(
+        chocolatey, "_find_chocolatey", mock_find
+    ), patch.dict(chocolatey.__salt__, {"cmd.run_all": mock_run}):
+        chocolatey.list_webpi()
+        expected_call = [choco_path, "list", "--source", "webpi"]
+        mock_run.assert_called_with(expected_call, python_shell=False)
+
+
+def test_list_webpi_post_2_0_0():
+    mock_version = MagicMock(return_value="2.0.1")
+    mock_find = MagicMock(return_value=choco_path)
+    mock_run = MagicMock(return_value={"stdout": "No packages", "retcode": 0})
+    with patch.object(chocolatey, "chocolatey_version", mock_version), patch.object(
+        chocolatey, "_find_chocolatey", mock_find
+    ), patch.dict(chocolatey.__salt__, {"cmd.run_all": mock_run}):
+        chocolatey.list_webpi()
+        expected_call = [choco_path, "search", "--source", "webpi"]
+        mock_run.assert_called_with(expected_call, python_shell=False)
+
+
+def test_list_windowsfeatures_pre_2_0_0():
+    mock_version = MagicMock(return_value="1.2.1")
+    mock_find = MagicMock(return_value=choco_path)
+    mock_run = MagicMock(return_value={"stdout": "No packages", "retcode": 0})
+    with patch.object(chocolatey, "chocolatey_version", mock_version), patch.object(
+        chocolatey, "_find_chocolatey", mock_find
+    ), patch.dict(chocolatey.__salt__, {"cmd.run_all": mock_run}):
+        chocolatey.list_windowsfeatures()
+        expected_call = [choco_path, "list", "--source", "windowsfeatures"]
+        mock_run.assert_called_with(expected_call, python_shell=False)
+
+
+def test_list_windowsfeatures_post_2_0_0():
+    mock_version = MagicMock(return_value="2.0.1")
+    mock_find = MagicMock(return_value=choco_path)
+    mock_run = MagicMock(return_value={"stdout": "No packages", "retcode": 0})
+    with patch.object(chocolatey, "chocolatey_version", mock_version), patch.object(
+        chocolatey, "_find_chocolatey", mock_find
+    ), patch.dict(chocolatey.__salt__, {"cmd.run_all": mock_run}):
+        chocolatey.list_windowsfeatures()
+        expected_call = [choco_path, "search", "--source", "windowsfeatures"]
+        mock_run.assert_called_with(expected_call, python_shell=False)

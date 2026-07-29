@@ -1,8 +1,39 @@
+import logging
 import os
+import shutil
 
 import pytest
 
 import salt.version
+from tests.conftest import CODE_DIR
+
+log = logging.getLogger(__name__)
+
+
+@pytest.fixture(autouse=True)
+def _install_salt_extension(shell):
+    if os.environ.get("ONEDIR_TESTRUN", "0") == "0":
+        yield
+    else:
+        script_name = "salt-pip"
+        if salt.utils.platform.is_windows():
+            script_name += ".exe"
+
+        script_path = CODE_DIR / "artifacts" / "salt" / script_name
+        assert script_path.exists()
+        try:
+            ret = shell.run(
+                str(script_path), "install", "salt-analytics-framework==0.1.0"
+            )
+            assert ret.returncode == 0
+            log.info(ret)
+            yield
+        finally:
+            ret = shell.run(
+                str(script_path), "uninstall", "-y", "salt-analytics-framework"
+            )
+            log.info(ret)
+            shutil.rmtree(script_path.parent / "extras-3.10", ignore_errors=True)
 
 
 @pytest.mark.windows_whitelisted
@@ -28,7 +59,7 @@ def test_versions_report(salt_cli):
     ret_lines = [line.strip() for line in ret_lines]
 
     for header in expected:
-        assert "{}:".format(header) in ret_lines
+        assert f"{header}:" in ret_lines
 
     ret_dict = {}
     expected_keys = set()
@@ -52,5 +83,23 @@ def test_versions_report(salt_cli):
             assert key in expected_keys
             expected_keys.remove(key)
     assert not expected_keys
-    if os.environ.get("ONEDIR_TESTRUN", "0") == "1":
-        assert "relenv" in ret_dict["Dependency Versions"]
+    if os.environ.get("ONEDIR_TESTRUN", "0") == "0":
+        # Stop any more testing
+        return
+
+    assert "relenv" in ret_dict["Dependency Versions"]
+    assert "Salt Extensions" in ret_dict
+    assert "salt-analytics-framework" in ret_dict["Salt Extensions"]
+
+
+def test_help_log(salt_cli):
+    """
+    Test to ensure when we pass in `--help` the insecure
+    log warning is included.
+    """
+    ret = salt_cli.run("--help")
+    count = 0
+    # This can be dependent on COLUMNS environment variable
+    assert "sensitive data: all, debug, garbage, profile, trace" in " ".join(
+        ret.stdout.split()
+    )

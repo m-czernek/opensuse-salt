@@ -3,14 +3,17 @@ Tests for the x509_v2 module
 """
 
 import base64
+import json
 import logging
 import shutil
+import time
 from pathlib import Path
 
 import pytest
 from saltfactories.utils import random_string
 
-x509util = pytest.importorskip("salt.utils.x509")
+import salt.utils.x509 as x509util
+from tests.conftest import FIPS_TESTRUN
 
 try:
     import cryptography
@@ -33,6 +36,7 @@ log = logging.getLogger(__name__)
 
 pytestmark = [
     pytest.mark.slow_test,
+    pytest.mark.timeout_unless_on_windows(120),
     pytest.mark.skipif(HAS_LIBS is False, reason="Needs cryptography library"),
 ]
 
@@ -44,6 +48,65 @@ def x509_pkidir(tmp_path_factory):
         yield _x509_pkidir
     finally:
         shutil.rmtree(str(_x509_pkidir), ignore_errors=True)
+
+
+@pytest.fixture(params=[{}])
+def existing_privkey(x509_salt_call_cli, request, tmp_path):
+    pk_file = tmp_path / "priv.key"
+    pk_args = {"name": str(pk_file)}
+    pk_args.update(request.param)
+    ret = x509_salt_call_cli.run("state.single", "x509.private_key_managed", **pk_args)
+    assert ret.returncode == 0
+    assert pk_file.exists()
+    yield pk_args["name"]
+
+
+def test_file_managed_does_not_run_in_test_mode_after_x509_v2_invocation_without_changes(
+    x509_salt_master, x509_salt_call_cli, tmp_path, existing_privkey
+):
+    """
+    The x509_v2 state module tries to workaround issue #62590 (Test mode does
+    not propagate to __states__ when using prereq) by invoking the ``state.single``
+    execution module with an explicit test parameter. In some cases, this seems
+    to trigger another bug: The file module always runs in test mode afterwards.
+    This seems to be the case when the x509_v2 state module does not report changes
+    after having been invoked at least once before, until another x509_v2 call results
+    in a ``file.managed`` call without test mode.
+    Issue #64195.
+    """
+    new_privkey = tmp_path / "new_privkey"
+    new_file = tmp_path / "new_file"
+    assert not new_file.exists()
+    state = f"""
+    # The result of this call is irrelevant, just that it exists
+    Some private key is present:
+      x509.private_key_managed:
+        - name: {new_privkey}
+    # This single call without changes does not trigger the bug on its own
+    Another private key is (already) present:
+      x509.private_key_managed:
+        - name: {existing_privkey}
+    Subsequent file.managed call should not run in test mode:
+      file.managed:
+        - name: {new_file}
+        - contents: foo
+        - require:
+          - Another private key is (already) present
+    """
+    with x509_salt_master.state_tree.base.temp_file("file_managed_test.sls", state):
+        ret = x509_salt_call_cli.run("state.apply", "file_managed_test")
+        assert ret.returncode == 0
+        assert ret.data
+        x509_res = next(ret.data[x] for x in ret.data if x.startswith("x509_|-Another"))
+        assert x509_res["result"] is True
+        assert not x509_res["changes"]
+        file_res = next(
+            ret.data[x] for x in ret.data if x.startswith("file_|-Subsequent")
+        )
+        assert file_res["result"] is True
+        assert file_res["changes"]
+        assert new_file.exists()
+        assert new_file.read_text() == "foo\n"
 
 
 @pytest.fixture(scope="module", autouse=True)
@@ -63,8 +126,14 @@ def x509_data(
 
 @pytest.fixture(scope="module")
 def x509_salt_master(salt_factories, ca_minion_id, x509_master_config):
+    config_overrides = {
+        "fips_mode": FIPS_TESTRUN,
+        "publish_signing_algorithm": (
+            "PKCS1v15-SHA224" if FIPS_TESTRUN else "PKCS1v15-SHA1"
+        ),
+    }
     factory = salt_factories.salt_master_daemon(
-        "x509-master", defaults=x509_master_config
+        "x509-master", defaults=x509_master_config, overrides=config_overrides
     )
     with factory.started():
         yield factory
@@ -124,9 +193,15 @@ def ca_minion_config(x509_minion_id, ca_cert, ca_key_enc, rsa_privkey, ca_new_ce
 @pytest.fixture(scope="module", autouse=True)
 def x509ca_salt_minion(x509_salt_master, ca_minion_id, ca_minion_config):
     assert x509_salt_master.is_running()
+    config_overrides = {
+        "fips_mode": FIPS_TESTRUN,
+        "encryption_algorithm": "OAEP-SHA224" if FIPS_TESTRUN else "OAEP-SHA1",
+        "signing_algorithm": "PKCS1v15-SHA224" if FIPS_TESTRUN else "PKCS1v15-SHA1",
+    }
     factory = x509_salt_master.salt_minion_daemon(
         ca_minion_id,
         defaults=ca_minion_config,
+        overrides=config_overrides,
     )
     with factory.started():
         # Sync All
@@ -139,6 +214,11 @@ def x509ca_salt_minion(x509_salt_master, ca_minion_id, ca_minion_config):
 @pytest.fixture(scope="module")
 def x509_salt_minion(x509_salt_master, x509_minion_id):
     assert x509_salt_master.is_running()
+    config_overrides = {
+        "fips_mode": FIPS_TESTRUN,
+        "encryption_algorithm": "OAEP-SHA224" if FIPS_TESTRUN else "OAEP-SHA1",
+        "signing_algorithm": "PKCS1v15-SHA224" if FIPS_TESTRUN else "PKCS1v15-SHA1",
+    }
     factory = x509_salt_master.salt_minion_daemon(
         x509_minion_id,
         defaults={
@@ -146,6 +226,7 @@ def x509_salt_minion(x509_salt_master, x509_minion_id):
             "features": {"x509_v2": True},
             "grains": {"testgrain": "foo"},
         },
+        overrides=config_overrides,
     )
     with factory.started():
         # Sync All
@@ -195,13 +276,6 @@ Certificate:
     """
     with x509_salt_master.state_tree.base.temp_file("manage_cert.sls", state):
         ret = x509_salt_call_cli.run("state.apply", "manage_cert")
-        if (
-            ret.returncode == 1
-            and "NotImplementedError: ECDSA keys with unnamed curves" in ret.stdout
-        ):
-            pytest.skip(
-                "The version of OpenSSL doesn't support ECDSA keys with unnamed curves"
-            )
         assert ret.returncode == 0
         assert ret.data[next(iter(ret.data))]["changes"]
         assert (tmp_path / "priv.key").exists()
@@ -218,27 +292,29 @@ Private key:
     - algo: ec
     - backup: true
     - new: true
-    - encoding: pkcs12
+    - encoding: pem
+    - pkcs12_encryption_compat: true
     {{% if salt['file.file_exists']('{tmp_path}/priv.key') -%}}
     - prereq:
-      - x509: {tmp_path}/cert.pem
+      - x509: {tmp_path}/cert.p12
     {{%- endif %}}
 
 Certificate:
   x509.certificate_managed:
-    - name: {tmp_path}/cert
+    - name: {tmp_path}/cert.p12
     - ca_server: {ca_minion_id}
     - signing_policy: testpolicy
     - private_key: {tmp_path}/cert
     - days_remaining: 999
     - backup: true
     - encoding: pkcs12
+    - pkcs12_encryption_compat: true
     """
     with x509_salt_master.state_tree.base.temp_file("manage_cert.sls", state):
         ret = x509_salt_call_cli.run("state.apply", "manage_cert")
         assert ret.returncode == 0
         assert ret.data[next(iter(ret.data))]["changes"]
-        assert (tmp_path / "cert").exists()
+        assert (tmp_path / "cert.p12").exists()
         yield
 
 
@@ -599,6 +675,71 @@ def test_certificate_managed_remote_renew(x509_salt_call_cli, cert_args):
     assert cert_new.serial_number != cert_cur.serial_number
 
 
+def test_certificate_managed_works_with_queued_state_application(
+    x509_salt_master, x509_salt_call_cli, x509_salt_minion, cert_args
+):
+    sleep_tpl = """
+    Sleep to allow queueing state run:
+      module.run:
+        - test.sleep:
+          - length: {}
+    """
+    cert_state = (
+        sleep_tpl.format("3")
+        + f"""
+    Some private key is present:
+      x509.certificate_managed:
+        - name: {json.dumps(cert_args['name'])}
+        - ca_server: {cert_args['ca_server']}
+        - signing_policy: {cert_args['signing_policy']}
+        - private_key: {json.dumps(cert_args['private_key'])}
+    """
+    )
+    tgt = Path(cert_args["name"])
+    salt_cli = x509_salt_master.salt_cli()
+
+    def jobwait(jid, exp):
+        cnt = 0
+        while (
+            bool(
+                x509_salt_call_cli.run(
+                    "saltutil.find_job", jid, minion_tgt=x509_salt_minion.id
+                ).data
+            )
+            is not exp
+        ):
+            cnt += 1
+            if cnt > 100:
+                raise AssertionError(
+                    f"Timeout waiting for jid {jid} to {exp and 'start' or 'finish'}"
+                )
+            time.sleep(0.1)
+
+    with x509_salt_master.state_tree.base.temp_file(
+        "queued_staterun_test.sls", cert_state
+    ), x509_salt_master.state_tree.base.temp_file("sleep.sls", sleep_tpl.format("0.1")):
+        res = salt_cli.run(
+            "state.apply",
+            "queued_staterun_test",
+            "--async",
+            minion_tgt=x509_salt_minion.id,
+        )
+        job_id = res.stdout.rsplit("ID: ", maxsplit=1)[-1].strip()
+        jobwait(job_id, True)  # ensure scheduling order
+        salt_cli.run(
+            "state.apply",
+            "sleep",
+            "queue=true",
+            "--async",
+            minion_tgt=x509_salt_minion.id,
+        )
+        assert not tgt.exists()
+        jobwait(job_id, False)
+
+    assert tgt.exists()
+    assert _get_cert(tgt)
+
+
 @pytest.mark.usefixtures("privkey_new")
 def test_privkey_new_with_prereq(x509_salt_call_cli, tmp_path):
     cert_cur = _get_cert(tmp_path / "cert.pem")
@@ -614,21 +755,50 @@ def test_privkey_new_with_prereq(x509_salt_call_cli, tmp_path):
     assert not _belongs_to(cert_new, pk_cur)
 
 
+@pytest.mark.skip_on_fips_enabled_platform
 @pytest.mark.usefixtures("privkey_new_pkcs12")
 @pytest.mark.skipif(
     CRYPTOGRAPHY_VERSION[0] < 36,
     reason="Complete PKCS12 deserialization requires cryptography v36+",
 )
-def test_privkey_new_with_prereq_pkcs12(x509_salt_call_cli, tmp_path):
-    cert_cur = _get_cert(tmp_path / "cert", encoding="pkcs12").cert.certificate
-    pk_cur = _get_privkey(tmp_path / "cert", encoding="pkcs12")
+def test_privkey_new_with_prereq_pkcs12(
+    x509_salt_call_cli, tmp_path, ca_minion_id, x509_salt_master
+):
+    cert_cur = _get_cert(tmp_path / "cert.p12", encoding="pkcs12").cert.certificate
+    pk_cur = _get_privkey(tmp_path / "cert.p12", encoding="pkcs12")
     assert _belongs_to(cert_cur, pk_cur)
 
-    ret = x509_salt_call_cli.run("state.apply", "manage_cert")
-    assert ret.returncode == 0
-    assert ret.data[next(iter(ret.data))]["changes"]
-    cert_new = _get_cert(tmp_path / "cert", encoding="pkcs12").cert.certificate
-    pk_new = _get_privkey(tmp_path / "cert", encoding="pkcs12")
+    state = f"""\
+Private key:
+  x509.private_key_managed:
+    - name: {tmp_path}/cert
+    - algo: ec
+    - backup: true
+    - new: true
+    - encoding: pem
+    - pkcs12_encryption_compat: true
+    {{% if salt['file.file_exists']('{tmp_path}/cert') -%}}
+    - prereq:
+      - x509: {tmp_path}/cert.p12
+    {{%- endif %}}
+
+Certificate:
+  x509.certificate_managed:
+    - name: {tmp_path}/cert.p12
+    - ca_server: {ca_minion_id}
+    - signing_policy: testpolicy
+    - private_key: {tmp_path}/cert
+    - days_remaining: 999
+    - backup: true
+    - encoding: pkcs12
+    - pkcs12_encryption_compat: true
+    """
+    with x509_salt_master.state_tree.base.temp_file("manage_cert.sls", state):
+        ret = x509_salt_call_cli.run("state.apply", "manage_cert")
+        assert ret.returncode == 0
+        assert ret.data[next(iter(ret.data))]["changes"]
+    cert_new = _get_cert(tmp_path / "cert.p12", encoding="pkcs12").cert.certificate
+    pk_new = _get_privkey(tmp_path / "cert.p12", encoding="pkcs12")
     assert _belongs_to(cert_new, pk_new)
     assert not _belongs_to(cert_new, pk_cur)
 

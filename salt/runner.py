@@ -38,6 +38,36 @@ class RunnerClient(mixins.SyncClientMixin, mixins.AsyncClientMixin):
     client = "runner"
     tag_prefix = "run"
 
+    def __init__(self, opts, context=None):
+        mixins.SyncClientMixin.__init__(self, opts, context=context)
+        mixins.AsyncClientMixin.__init__(self, opts, context=context)
+        self.opts = opts
+        self.context = context or {}
+        self.event = None
+        self.salt_user = salt.utils.user.get_specific_user()
+        self.event = salt.utils.event.get_event(
+            "master", self.opts["sock_dir"], opts=self.opts, listen=False
+        )
+
+    def destroy(self):
+        if self.event is not None:
+            self.event.destroy()
+            self.event = None
+        if hasattr(self, "_functions") and self._functions is not None:
+            if hasattr(self._functions, "destroy"):
+                self._functions.destroy()
+            self._functions = {}
+        if hasattr(self, "utils") and self.utils is not None:
+            if hasattr(self.utils, "destroy"):
+                self.utils.destroy()
+            self.utils = {}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.destroy()
+
     @property
     def functions(self):
         if not hasattr(self, "_functions"):
@@ -196,6 +226,17 @@ class Runner(RunnerClient):
         self.returners = salt.loader.returners(opts, self.functions, context=context)
         self.outputters = salt.loader.outputters(opts)
 
+    def destroy(self):
+        if hasattr(self, "returners") and self.returners is not None:
+            if hasattr(self.returners, "destroy"):
+                self.returners.destroy()
+            self.returners = {}
+        if hasattr(self, "outputters") and self.outputters is not None:
+            if hasattr(self.outputters, "destroy"):
+                self.outputters.destroy()
+            self.outputters = {}
+        super().destroy()
+
     def print_docs(self):
         """
         Print out the documentation!
@@ -203,11 +244,11 @@ class Runner(RunnerClient):
         arg = self.opts.get("fun", None)
         docs = super().get_docs(arg)
         for fun in sorted(docs):
-            display_output("{}:".format(fun), "text", self.opts)
+            display_output(f"{fun}:", "text", self.opts)
             print(docs[fun])
 
     # TODO: move to mixin whenever we want a salt-wheel cli
-    def run(self):
+    def run(self, full_return=False):
         """
         Execute the runner sequence
         """
@@ -306,19 +347,20 @@ class Runner(RunnerClient):
                         tag=async_pub["tag"],
                         jid=async_pub["jid"],
                         daemonize=False,
+                        full_return=full_return,
                     )
             except salt.exceptions.SaltException as exc:
                 with salt.utils.event.get_event("master", opts=self.opts) as evt:
                     evt.fire_event(
                         {
                             "success": False,
-                            "return": "{}".format(exc),
+                            "return": f"{exc}",
                             "retcode": 254,
                             "fun": self.opts["fun"],
                             "fun_args": fun_args,
                             "jid": self.jid,
                         },
-                        tag="salt/run/{}/ret".format(self.jid),
+                        tag=f"salt/run/{self.jid}/ret",
                     )
                 # Attempt to grab documentation
                 if "fun" in low:
@@ -329,7 +371,7 @@ class Runner(RunnerClient):
                 # If we didn't get docs returned then
                 # return the `not availble` message.
                 if not ret:
-                    ret = "{}".format(exc)
+                    ret = f"{exc}"
                 if not self.opts.get("quiet", False):
                     display_output(ret, "nested", self.opts)
             else:

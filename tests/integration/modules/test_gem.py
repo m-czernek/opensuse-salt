@@ -2,10 +2,10 @@
 Integration tests for Ruby Gem module
 """
 
-import subprocess
 import pytest
 
-from tornado.httpclient import HTTPClient
+import salt.utils.platform
+from salt.ext.tornado.httpclient import HTTPClient
 from tests.support.case import ModuleCase
 
 
@@ -19,6 +19,7 @@ def check_status():
         return False
 
 
+@pytest.mark.timeout_unless_on_windows(120)
 @pytest.mark.skip_if_binaries_missing("gem")
 @pytest.mark.windows_whitelisted
 @pytest.mark.destructive_test
@@ -31,11 +32,12 @@ class GemModuleTest(ModuleCase):
         if check_status() is False:
             self.skipTest("External resource 'https://rubygems.org' is not available")
 
+        self.GEM_BIN = "gem.cmd" if salt.utils.platform.is_windows() else "gem"
         self.GEM = "tidy"
         self.GEM_VER = "1.1.2"
         self.OLD_GEM = "brass"
         self.OLD_VERSION = "1.0.0"
-        self.NEW_VERSION = "1.2.1"
+        self.NEW_VERSION = "1.3.0"
         self.GEM_LIST = [self.GEM, self.OLD_GEM]
         for name in (
             "GEM",
@@ -53,6 +55,20 @@ class GemModuleTest(ModuleCase):
                 self.run_function("gem.uninstall", [self.GEM])
 
         self.addCleanup(uninstall_gem)
+
+        def uninstall_old_gem():
+            if self.run_function("gem.list", [self.OLD_GEM]):
+                self.run_function("gem.uninstall", [self.OLD_GEM])
+
+        # Ensure OLD_GEM is not installed before the test (handles leftover state
+        # from a previously failed run that skipped its own cleanup).
+        uninstall_old_gem()
+        self.addCleanup(uninstall_old_gem)
+
+    def run_function(self, function, *args, **kwargs):
+        """Override run_function to use the gem binary"""
+        kwargs["gem_bin"] = self.GEM_BIN
+        return super().run_function(function, *args, **kwargs)
 
     @pytest.mark.slow_test
     def test_install_uninstall(self):
@@ -80,22 +96,11 @@ class GemModuleTest(ModuleCase):
         self.run_function("gem.uninstall", [self.GEM])
         self.assertFalse(self.run_function("gem.list", [self.GEM]))
 
-    def _get_ruby_version(self):
-        try:
-            output = subprocess.check_output(["ruby", "-v"]).decode("utf-8")
-            version_str = output.split()[1]
-            major_version = int(version_str.split('.')[0])
-            return major_version
-        except (IndexError, subprocess.CalledProcessError, FileNotFoundError):
-            return 0
-
     @pytest.mark.slow_test
     def test_list(self):
         """
         gem.list
         """
-        if self._get_ruby_version() < 3:
-            self.skipTest("Cannot install brass, skipping")
         self.run_function("gem.install", [" ".join(self.GEM_LIST)])
 
         all_ret = self.run_function("gem.list")

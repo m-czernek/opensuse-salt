@@ -1,6 +1,8 @@
 """
 Set up the version of Salt
 """
+
+import argparse
 import operator
 import os
 import platform
@@ -57,7 +59,7 @@ class SaltVersionsInfo(type):
     _previous_release = None
     _next_release = None
 
-    # pylint: disable=bad-whitespace,multiple-spaces-before-operator
+    # pylint: disable=bad-whitespace
     # ----- Please refrain from fixing whitespace ---------------------------------->
     # The idea is to keep this readable.
     # -------------------------------------------------------------------------------
@@ -183,7 +185,7 @@ class SaltVersionsInfo(type):
     # <---- Please refrain from fixing whitespace -----------------------------------
     # The idea is to keep this readable.
     # -------------------------------------------------------------------------------
-    # pylint: enable=bad-whitespace,multiple-spaces-before-operator
+    # pylint: enable=bad-whitespace
     # fmt: on
 
     @classmethod
@@ -198,10 +200,17 @@ class SaltVersionsInfo(type):
     @classmethod
     def current_release(cls):
         if cls._current_release is None:
+            # On a maintenance branch (e.g. 3006.x) every codename past the
+            # branch's own series is left at the default ``released=False``.
+            # Returning the *first* un-released codename in that case
+            # selects the next major (Chlorine on 3006.x) and produces a
+            # wrong default version when a checkout has neither
+            # ``_version.txt`` nor a usable ``.git`` directory.  Pick the
+            # *last* released codename instead so the default tracks the
+            # branch's own calver series.  See #67061.
             for version in cls.versions():
-                if version.released is False:
+                if version.released is True:
                     cls._current_release = version
-                    break
         return cls._current_release
 
     @classmethod
@@ -354,15 +363,13 @@ class SaltStackVersion:
         )
         match = cls.git_describe_regex.match(vstr)
         if not match:
-            raise ValueError(
-                "Unable to parse version string: '{}'".format(version_string)
-            )
+            raise ValueError(f"Unable to parse version string: '{version_string}'")
         return cls(*match.groups())
 
     @classmethod
     def from_name(cls, name):
         if name.lower() not in cls.LNAMES:
-            raise ValueError("Named version '{}' is not known".format(name))
+            raise ValueError(f"Named version '{name}' is not known")
         return cls(*cls.LNAMES[name.lower()])
 
     @classmethod
@@ -445,22 +452,22 @@ class SaltStackVersion:
     @property
     def string(self):
         if self.new_version(self.major):
-            version_string = "{}".format(self.major)
+            version_string = f"{self.major}"
             if self.minor:
-                version_string = "{}.{}".format(self.major, self.minor)
+                version_string = f"{self.major}.{self.minor}"
             if not self.minor and self.can_have_dot_zero(self.major):
-                version_string = "{}.{}".format(self.major, self.minor)
+                version_string = f"{self.major}.{self.minor}"
         else:
-            version_string = "{}.{}.{}".format(self.major, self.minor, self.bugfix)
+            version_string = f"{self.major}.{self.minor}.{self.bugfix}"
         if self.mbugfix:
-            version_string += ".{}".format(self.mbugfix)
+            version_string += f".{self.mbugfix}"
         if self.pre_type:
-            version_string += "{}{}".format(self.pre_type, self.pre_num)
-        if self.noc and self.sha:
+            version_string += f"{self.pre_type}{self.pre_num}"
+        if self.noc is not None and self.sha:
             noc = self.noc
             if noc < 0:
                 noc = "0na"
-            version_string += "+{}.{}".format(noc, self.sha)
+            version_string += f"+{noc}.{self.sha}"
         return version_string
 
     @property
@@ -479,7 +486,7 @@ class SaltStackVersion:
         else:
             rmatch_key = (self.major, self.minor)
         if rmatch_key in self.RMATCH:
-            version_string += " ({})".format(self.RMATCH[rmatch_key])
+            version_string += f" ({self.RMATCH[rmatch_key]})"
         return version_string
 
     @property
@@ -503,7 +510,7 @@ class SaltStackVersion:
                 other = SaltStackVersion(*other)
             else:
                 raise ValueError(
-                    "Cannot instantiate Version from type '{}'".format(type(other))
+                    f"Cannot instantiate Version from type '{type(other)}'"
                 )
         pre_type = self.pre_index
         other_pre_type = other.pre_index
@@ -552,24 +559,24 @@ class SaltStackVersion:
     def __repr__(self):
         parts = []
         if self.name:
-            parts.append("name='{}'".format(self.name))
-        parts.extend(["major={}".format(self.major), "minor={}".format(self.minor)])
+            parts.append(f"name='{self.name}'")
+        parts.extend([f"major={self.major}", f"minor={self.minor}"])
 
         if self.new_version(self.major):
             if not self.can_have_dot_zero(self.major) and not self.minor:
                 parts.remove("".join([x for x in parts if re.search("^minor*", x)]))
         else:
-            parts.extend(["bugfix={}".format(self.bugfix)])
+            parts.extend([f"bugfix={self.bugfix}"])
 
         if self.mbugfix:
-            parts.append("minor-bugfix={}".format(self.mbugfix))
+            parts.append(f"minor-bugfix={self.mbugfix}")
         if self.pre_type:
-            parts.append("{}={}".format(self.pre_type, self.pre_num))
+            parts.append(f"{self.pre_type}={self.pre_num}")
         noc = self.noc
         if noc == -1:
             noc = "0na"
         if noc and self.sha:
-            parts.extend(["noc={}".format(noc), "sha={}".format(self.sha)])
+            parts.extend([f"noc={noc}", f"sha={self.sha}"])
         return "<{} {}>".format(self.__class__.__name__, " ".join(parts))
 
 
@@ -616,7 +623,7 @@ def __discover_version(saltstack_version):
                 "v[0-9]*",
                 "--always",
             ],
-            **kwargs
+            **kwargs,
         )
 
         out, err = process.communicate()
@@ -697,6 +704,7 @@ def dependency_information(include_salt_cloud=False):
         ("msgpack-pure", "msgpack_pure", "version"),
         ("pycrypto", "Crypto", "__version__"),
         ("pycryptodome", "Cryptodome", "version_info"),
+        ("cryptography", "cryptography", "__version__"),
         ("PyYAML", "yaml", "__version__"),
         ("PyZMQ", "zmq", "__version__"),
         ("ZMQ", "zmq", "zmq_version"),
@@ -717,7 +725,6 @@ def dependency_information(include_salt_cloud=False):
         ("docker-py", "docker", "__version__"),
         ("packaging", "packaging", "__version__"),
         ("looseversion", "looseversion", None),
-        ("contextvars", "contextvars", None),
         ("relenv", "relenv", "__version__"),
     ]
 
@@ -812,7 +819,7 @@ def system_information():
                 # ie: R2
                 if re.match(r"^R\d+$", item):
                     release = item
-            release = "{}Server{}".format(version, release)
+            release = f"{version}Server{release}"
         else:
             for item in product_name.split(" "):
                 # If it's a number, decimal number, Thin or Vista, then it's the
@@ -864,7 +871,7 @@ def versions_information(include_salt_cloud=False, include_extensions=True):
     Report the versions of dependent software.
     """
     py_info = [
-        ("Python", sys.version.rsplit("\n")[0].strip()),
+        ("Python", sys.version.rsplit("\n", maxsplit=1)[0].strip()),
     ]
     salt_info = list(salt_information())
     lib_info = list(dependency_information(include_salt_cloud))
@@ -912,7 +919,7 @@ def versions_report(include_salt_cloud=False, include_extensions=True):
         if ver_type == "Salt Extensions" and ver_type not in ver_info:
             # No salt Extensions to report
             continue
-        info.append("{}:".format(ver_type))
+        info.append(f"{ver_type}:")
         # List dependencies in alphabetical, case insensitive order
         for name in sorted(ver_info[ver_type], key=lambda x: x.lower()):
             ver = fmt.format(
@@ -924,5 +931,27 @@ def versions_report(include_salt_cloud=False, include_extensions=True):
     yield from info
 
 
+def _parser():
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--next-release", help="Return the next release", action="store_true"
+    )
+    parser.add_argument("--parse", help="Parse the passed string as a salt version")
+    # When pip installing we pass in other args to this script.
+    # This allows us to catch those args but not use them
+    parser.add_argument("unknown", nargs=argparse.REMAINDER)
+    return parser.parse_args()
+
+
 if __name__ == "__main__":
-    print(__version__)
+    args = _parser()
+    if args.next_release:
+        print(__saltstack_version__.next_release())
+    elif args.parse:
+        try:
+            print(SaltStackVersion.parse(args.parse))
+        except Exception as exc:  # pylint: disable=broad-except
+            print(f"Failed to parse '{args.parse}' as a salt version: {exc}")
+            sys.exit(1)
+    else:
+        print(__version__)

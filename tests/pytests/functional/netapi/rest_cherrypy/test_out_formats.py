@@ -1,6 +1,6 @@
 import pytest
 
-from tornado.httpclient import HTTPError
+from salt.ext.tornado.httpclient import HTTPError
 
 
 @pytest.fixture

@@ -73,6 +73,15 @@ def test_remove_key(salt_master, salt_key_cli):
             os.unlink(key)
 
 
+def test_remove_all_keys_with_arg(salt_key_cli):
+    """
+    test salt-key -D usage with args
+    """
+    # Remove Key
+    ret = salt_key_cli.run("-D", "junk")
+    assert "Delete all takes no arguments" in ret.stderr
+
+
 @pytest.mark.skip_if_not_root
 @pytest.mark.destructive_test
 @pytest.mark.skip_on_windows(reason="PAM is not supported on Windows")
@@ -138,7 +147,7 @@ def test_list_accepted_args(salt_key_cli, key_type):
     assert ret.returncode == 0
     assert "error:" not in ret.stdout
     # Should throw an error now
-    ret = salt_key_cli.run("-l", "foo-{}".format(key_type))
+    ret = salt_key_cli.run("-l", f"foo-{key_type}")
     assert ret.returncode != 0
     assert "error:" in ret.stderr
 
@@ -292,6 +301,13 @@ def test_keys_generation(salt_key_cli, tmp_path):
             filename.chmod(0o700)
 
 
+def test_gen_keys_dir_without_gen_keys(salt_key_cli, tmp_path):
+    gen_keys_path = tmp_path / "temp-gen-keys-path"
+    ret = salt_key_cli.run("--gen-keys-dir", str(gen_keys_path))
+    assert ret.returncode == 0
+    assert not gen_keys_path.exists()
+
+
 def test_keys_generation_keysize_min(salt_key_cli, tmp_path):
     ret = salt_key_cli.run(
         "--gen-keys", "minibar", "--gen-keys-dir", str(tmp_path), "--keysize", "1024"
@@ -323,7 +339,7 @@ def test_accept_bad_key(salt_master, salt_key_cli):
         # Check Key
         ret = salt_key_cli.run("-y", "-a", min_name)
         assert ret.returncode == 0
-        assert "invalid key for {}".format(min_name) in ret.stderr
+        assert f"invalid key for {min_name}" in ret.stderr
     finally:
         if os.path.exists(key):
             os.remove(key)

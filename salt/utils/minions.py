@@ -3,7 +3,6 @@ This module contains routines used to verify the matcher against the minions
 expected to return
 """
 
-
 import fnmatch
 import logging
 import os
@@ -108,11 +107,11 @@ def get_minion_data(minion, opts):
         cache = salt.cache.factory(opts)
         if minion is None:
             for id_ in cache.list("minions"):
-                data = cache.fetch("minions/{}".format(id_), "data")
+                data = cache.fetch(f"minions/{id_}", "data")
                 if data is None:
                     continue
         else:
-            data = cache.fetch("minions/{}".format(minion), "data")
+            data = cache.fetch(f"minions/{minion}", "data")
         if data is not None:
             grains = data.get("grains", None)
             pillar = data.get("pillar", None)
@@ -289,10 +288,18 @@ class CkMinions:
         self, expr, delimiter, greedy, search_type, regex_match=False, exact_match=False
     ):
         """
-        Helper function to search for minions in master caches If 'greedy',
-        then return accepted minions matched by the condition or those absent
-        from the cache.  If not 'greedy' return the only minions have cache
-        data and matched by the condition.
+        Helper function to search for minions in master caches.
+
+        Return only minions whose cached ``search_type`` data exists and
+        matches the expression. Minions with no cache entry are excluded
+        from the result regardless of ``greedy`` — otherwise grain/pillar
+        targeting silently matches any offline minion whose cache directory
+        has been pruned (#68976).
+
+        ``greedy`` still controls which minions are *considered*: when
+        greedy, every accepted minion key is considered (and any without
+        cached data is dropped); when not greedy, only minions that already
+        have a cache entry are considered.
         """
         cache_enabled = self.opts.get("minion_data_cache", False)
 
@@ -319,15 +326,20 @@ class CkMinions:
             else:
                 cminions = minions
             if not cminions:
-                return {"minions": minions, "missing": []}
+                return {"minions": [], "missing": []}
             minions = set(minions)
+            # Track which accepted minions have cache data we can evaluate.
+            # Any accepted minion not present in ``cminions`` has no cache
+            # entry and must be excluded; otherwise grain/pillar targeting
+            # would match every minion whose cache dir is missing (#68976).
+            evaluated = set()
             for id_ in cminions:
-                if greedy and id_ not in minions:
+                if id_ not in minions:
                     continue
-                mdata = self.cache.fetch("minions/{}".format(id_), "data")
+                evaluated.add(id_)
+                mdata = self.cache.fetch(f"minions/{id_}", "data")
                 if mdata is None:
-                    if not greedy:
-                        minions.remove(id_)
+                    minions.discard(id_)
                     continue
                 search_results = mdata.get(search_type)
                 if not salt.utils.data.subdict_match(
@@ -337,7 +349,9 @@ class CkMinions:
                     regex_match=regex_match,
                     exact_match=exact_match,
                 ):
-                    minions.remove(id_)
+                    minions.discard(id_)
+            # Drop minions that were never evaluated (no cache entry at all).
+            minions &= evaluated
             minions = list(minions)
         return {"minions": minions, "missing": []}
 
@@ -409,11 +423,11 @@ class CkMinions:
                 except Exception:  # pylint: disable=broad-except
                     log.error("Invalid IP/CIDR target: %s", tgt)
                     return {"minions": [], "missing": []}
-            proto = "ipv{}".format(tgt.version)
+            proto = f"ipv{tgt.version}"
 
             minions = set(minions)
             for id_ in cminions:
-                mdata = self.cache.fetch("minions/{}".format(id_), "data")
+                mdata = self.cache.fetch(f"minions/{id_}", "data")
                 if mdata is None:
                     if not greedy:
                         minions.remove(id_)
@@ -650,7 +664,7 @@ class CkMinions:
                 search = subset
             for id_ in search:
                 try:
-                    mdata = self.cache.fetch("minions/{}".format(id_), "data")
+                    mdata = self.cache.fetch(f"minions/{id_}", "data")
                 except SaltCacheError:
                     # If a SaltCacheError is explicitly raised during the fetch operation,
                     # permission was denied to open the cached data.p file. Continue on as
@@ -703,7 +717,7 @@ class CkMinions:
         try:
             if expr is None:
                 expr = ""
-            check_func = getattr(self, "_check_{}_minions".format(tgt_type), None)
+            check_func = getattr(self, f"_check_{tgt_type}_minions", None)
             if tgt_type in (
                 "grain",
                 "grain_pcre",
@@ -727,6 +741,7 @@ class CkMinions:
                 if ssh_minions:
                     _res["minions"].extend(ssh_minions)
                     _res["ssh_minions"] = True
+                roster.destroy()
         except Exception:  # pylint: disable=broad-except
             log.exception(
                 "Failed matching available minions with %s pattern: %s", tgt_type, expr
@@ -1049,11 +1064,7 @@ class CkMinions:
         for ind in auth_list:
             if isinstance(ind, str):
                 if ind[0] == "@":
-                    if (
-                        ind[1:] == mod_name
-                        or ind[1:] == form
-                        or ind == "@{}s".format(form)
-                    ):
+                    if ind[1:] == mod_name or ind[1:] == form or ind == f"@{form}s":
                         return True
             elif isinstance(ind, dict):
                 if len(ind) != 1:
@@ -1065,7 +1076,7 @@ class CkMinions:
                             ind[valid], fun_name, args.get("arg"), args.get("kwarg")
                         ):
                             return True
-                    if valid[1:] == form or valid == "@{}s".format(form):
+                    if valid[1:] == form or valid == f"@{form}s":
                         if self.__fun_check(
                             ind[valid], fun, args.get("arg"), args.get("kwarg")
                         ):

@@ -291,8 +291,8 @@ Setup
 
 import logging
 
-import tornado.gen
-import tornado.websocket
+import salt.ext.tornado.gen
+import salt.ext.tornado.websocket
 import salt.netapi
 import salt.utils.json
 
@@ -306,14 +306,13 @@ log = logging.getLogger(__name__)
 
 
 class AllEventsHandler(
-    tornado.websocket.WebSocketHandler
+    salt.ext.tornado.websocket.WebSocketHandler
 ):  # pylint: disable=W0223,W0232
     """
     Server side websocket handler.
     """
 
     # pylint: disable=W0221
-    @tornado.gen.coroutine
     def get(self, token):
         """
         Check the token, returns a 401 if the token is invalid.
@@ -327,7 +326,7 @@ class AllEventsHandler(
             log.debug("Refusing websocket connection, bad token!")
             self.send_error(401)
             return
-        yield super().get(token)
+        super().get(token)
 
     def open(self, token):  # pylint: disable=W0221
         """
@@ -336,7 +335,7 @@ class AllEventsHandler(
         """
         self.connected = False
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def on_message(self, message):
         """Listens for a "websocket client ready" message.
         Once that message is received an asynchronous job
@@ -388,7 +387,7 @@ class AllEventsHandler(
 
 
 class FormattedEventsHandler(AllEventsHandler):  # pylint: disable=W0223,W0232
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def on_message(self, message):
         """Listens for a "websocket client ready" message.
         Once that message is received an asynchronous job

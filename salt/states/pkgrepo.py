@@ -117,7 +117,6 @@ Using ``aptkey: False`` with ``keyserver`` and ``keyid``:
         - aptkey: False
 """
 
-
 import os
 import sys
 
@@ -125,6 +124,7 @@ import salt.utils.data
 import salt.utils.files
 import salt.utils.pkg.deb
 import salt.utils.pkg.rpm
+import salt.utils.stringutils
 import salt.utils.versions
 from salt.exceptions import CommandExecutionError, SaltInvocationError
 from salt.state import STATE_INTERNAL_KEYWORDS as _STATE_INTERNAL_KEYWORDS
@@ -366,15 +366,15 @@ def managed(name, ppa=None, copr=None, aptkey=True, **kwargs):
 
     if "key_url" in kwargs and ("keyid" in kwargs or "keyserver" in kwargs):
         ret["result"] = False
-        ret[
-            "comment"
-        ] = 'You may not use both "keyid"/"keyserver" and "key_url" argument.'
+        ret["comment"] = (
+            'You may not use both "keyid"/"keyserver" and "key_url" argument.'
+        )
 
     if "key_text" in kwargs and ("keyid" in kwargs or "keyserver" in kwargs):
         ret["result"] = False
-        ret[
-            "comment"
-        ] = 'You may not use both "keyid"/"keyserver" and "key_text" argument.'
+        ret["comment"] = (
+            'You may not use both "keyid"/"keyserver" and "key_text" argument.'
+        )
     if "key_text" in kwargs and ("key_url" in kwargs):
         ret["result"] = False
         ret["comment"] = 'You may not use both "key_url" and "key_text" argument.'
@@ -410,14 +410,14 @@ def managed(name, ppa=None, copr=None, aptkey=True, **kwargs):
             )
         else:
             ret["result"] = False
-            ret[
-                "comment"
-            ] = "Cannot have 'key_url' using http with 'allow_insecure_key' set to True"
+            ret["comment"] = (
+                "Cannot have 'key_url' using http with 'allow_insecure_key' set to True"
+            )
             return ret
 
-    repo = name
+    kwargs["name"] = repo = name
 
-    if __grains__["os_family"] == "Debian":
+    if __grains__["os"] in ("Ubuntu", "Mint"):
         if ppa is not None:
             # overload the name/repo value for PPAs cleanly
             # this allows us to have one code-path for PPAs
@@ -440,9 +440,6 @@ def managed(name, ppa=None, copr=None, aptkey=True, **kwargs):
 
         if "humanname" in kwargs:
             kwargs["name"] = kwargs.pop("humanname")
-        if "name" not in kwargs:
-            # Fall back to the repo name if humanname not provided
-            kwargs["name"] = repo
 
         kwargs["enabled"] = (
             not salt.utils.data.is_true(disabled)
@@ -484,7 +481,38 @@ def managed(name, ppa=None, copr=None, aptkey=True, **kwargs):
     else:
         sanitizedkwargs = kwargs
 
-    if pre:
+    # Issue #68208: when ``clean_file`` is requested the user expects the
+    # managed file to be truncated and re-populated with *only* the desired
+    # repo line. If the file currently contains any other non-blank, non-
+    # comment line the state is out-of-sync even though ``pkg.get_repo``
+    # found a matching definition; force the clean + reconfigure path in
+    # that case. When the file is already exactly the desired line (the
+    # common steady-state case) the "already configured" short-circuit
+    # below is still hit and ``test=True`` correctly reports no changes.
+    clean_file_needs_reconfigure = False
+    if (
+        pre
+        and kwargs.get("clean_file", False)
+        and kwargs.get("file")
+        and os.path.isfile(kwargs["file"])
+    ):
+        try:
+            with salt.utils.files.fopen(kwargs["file"], "r") as _cf:
+                _stale = [
+                    _line
+                    for _line in (
+                        salt.utils.stringutils.to_unicode(_raw).strip() for _raw in _cf
+                    )
+                    if _line and not _line.startswith("#") and _line != name.strip()
+                ]
+            if _stale:
+                clean_file_needs_reconfigure = True
+        except OSError:
+            # If we cannot read the file, fall through to the normal flow;
+            # downstream code will surface the real error.
+            pass
+
+    if pre and not clean_file_needs_reconfigure:
         # 22412: Remove file attribute in case same repo is set up multiple times but with different files
         pre.pop("file", None)
         sanitizedkwargs.pop("file", None)
@@ -501,10 +529,7 @@ def managed(name, ppa=None, copr=None, aptkey=True, **kwargs):
                     else:
                         break
                 else:
-                    if kwarg in ("comps", "key_url"):
-                        break
-                    else:
-                        continue
+                    break
             elif kwarg in ("comps", "key_url"):
                 if sorted(sanitizedkwargs[kwarg]) != sorted(pre[kwarg]):
                     break
@@ -552,23 +577,6 @@ def managed(name, ppa=None, copr=None, aptkey=True, **kwargs):
             ret["result"] = True
             ret["comment"] = f"Package repo '{name}' already configured"
             return ret
-
-    if __grains__["os_family"] == "Debian":
-        if (
-            "uri" not in kwargs
-            and "uri" in sanitizedkwargs
-            and "uri" in pre
-            and pre["uri"] != sanitizedkwargs["uri"]
-        ):
-            kwargs["uri"] = sanitizedkwargs["uri"]
-        if (
-            "uris" not in kwargs
-            and "uris" in sanitizedkwargs
-            and "uris" in pre
-            and sanitizedkwargs["uris"]
-            and sanitizedkwargs["uris"][0] not in pre["uris"]
-        ):
-            kwargs["uris"] = sanitizedkwargs["uris"]
 
     if __opts__["test"]:
         ret["comment"] = (
@@ -788,211 +796,5 @@ def absent(name, **kwargs):
     else:
         ret["result"] = False
         ret["comment"] = f"Failed to remove repo {name}"
-
-    return ret
-
-
-def _normalize_repo(repo):
-    """Normalize the get_repo information"""
-    # `pkg.get_repo()` specific virtual module implementation is
-    # parsing the information directly from the repository
-    # configuration file, and can be different from the ones that
-    # `pkg.mod_repo()` accepts
-
-    # If the field is not present will be dropped
-    suse = {
-        # "alias": "repo",
-        "name": "humanname",
-        "priority": "priority",
-        "enabled": "enabled",
-        "autorefresh": "refresh",
-        "gpgcheck": "gpgcheck",
-        "keepackages": "cache",
-        "baseurl": "url",
-    }
-    translator = {
-        "Suse": suse,
-    }
-    table = translator.get(__grains__["os_family"], {})
-    return {table[k]: v for k, v in repo.items() if k in table}
-
-
-def _normalize_key(key):
-    """Normalize the info_gpg_key information"""
-
-    # If the field is not present will be dropped
-    rpm = {
-        "Description": "key",
-    }
-    translator = {
-        "Suse": rpm,
-        "RedHat": rpm,
-    }
-    table = translator.get(__grains__["os_family"], {})
-    return {table[k]: v for k, v in key.items() if k in table}
-
-
-def _repos_keys_migrate_drop(root, keys, drop):
-    """Helper function to calculate repost and key migrations"""
-
-    def _d2s(d):
-        """Serialize a dict and store in a set"""
-        return {
-            (k, tuple((_k, _v) for _k, _v in sorted(v.items())))
-            for k, v in sorted(d.items())
-        }
-
-    src_repos = _d2s(
-        {k: _normalize_repo(v) for k, v in __salt__["pkg.list_repos"]().items()}
-    )
-    # There is no guarantee that the target repository is even initialized
-    try:
-        tgt_repos = _d2s(
-            {
-                k: _normalize_repo(v)
-                for k, v in __salt__["pkg.list_repos"](root=root).items()
-            }
-        )
-    except Exception:  # pylint: disable=broad-except
-        tgt_repos = set()
-
-    src_keys = set()
-    tgt_keys = set()
-    if keys:
-        src_keys = _d2s(
-            {
-                k: _normalize_key(v)
-                for k, v in __salt__["lowpkg.list_gpg_keys"](info=True).items()
-            }
-        )
-        try:
-            tgt_keys = _d2s(
-                {
-                    k: _normalize_key(v)
-                    for k, v in __salt__["lowpkg.list_gpg_keys"](
-                        info=True, root=root
-                    ).items()
-                }
-            )
-        except Exception:  # pylint: disable=broad-except
-            pass
-
-    repos_to_migrate = src_repos - tgt_repos
-    repos_to_drop = tgt_repos - src_repos if drop else set()
-
-    keys_to_migrate = src_keys - tgt_keys
-    keys_to_drop = tgt_keys - src_keys if drop else set()
-
-    return (repos_to_migrate, repos_to_drop, keys_to_migrate, keys_to_drop)
-
-
-def _copy_repository_to(root):
-    repo = {
-        "Suse": ["/etc/zypp/repos.d"],
-        "RedHat": ["/etc/yum.conf", "/etc/yum.repos.d"],
-    }
-    for src in repo.get(__grains__["os_family"], []):
-        dst = os.path.join(root, os.path.relpath(src, os.path.sep))
-        __salt__["file.copy"](src=src, dst=dst, recurse=True)
-
-
-def migrated(name, keys=True, drop=False, method=None, **kwargs):
-    """Migrate a repository from one directory to another, including the
-    GPG keys if requested
-
-    .. versionadded:: TBD
-
-    name
-        Directory were to migrate the repositories. For example, if we
-        are booting from a USB key and we mounted the rootfs in
-        "/mnt", the repositories will live in "/mnt/etc/yum.repos.d"
-        or in "/etc/zypp/repos.d", depending on the system.  For both
-        cases the expected value for "name" would be "/mnt"
-
-    keys
-        If is is True, will migrate all the keys
-
-    drop
-        If True, the target repositories that do not exist in the
-        source will be dropped
-
-    method
-        If None or "salt", it will use the Salt API to migrate the
-        repositories, if "copy", it will copy the repository files
-        directly
-
-    """
-    ret = {"name": name, "result": False, "changes": {}, "comment": ""}
-
-    if __grains__["os_family"] not in ("Suse",):
-        ret["comment"] = "Migration not supported for this platform"
-        return ret
-
-    if keys and "lowpkg.import_gpg_key" not in __salt__:
-        ret["comment"] = "Keys cannot be migrated for this platform"
-        return ret
-
-    if method not in (None, "salt", "copy"):
-        ret["comment"] = "Migration method not supported"
-        return ret
-
-    (
-        repos_to_migrate,
-        repos_to_drop,
-        keys_to_migrate,
-        keys_to_drop,
-    ) = _repos_keys_migrate_drop(name, keys, drop)
-
-    if not any((repos_to_migrate, repos_to_drop, keys_to_migrate, keys_to_drop)):
-        ret["result"] = True
-        ret["comment"] = "Repositories are already migrated"
-        return ret
-
-    if __opts__["test"]:
-        ret["result"] = None
-        ret["comment"] = "There are keys or repositories to migrate or drop"
-        ret["changes"] = {
-            "repos to migrate": [repo for repo, _ in repos_to_migrate],
-            "repos to drop": [repo for repo, _ in repos_to_drop],
-            "keys to migrate": [key for key, _ in keys_to_migrate],
-            "keys to drop": [key for key, _ in keys_to_drop],
-        }
-        return ret
-
-    for repo, repo_info in repos_to_migrate:
-        if method == "copy":
-            _copy_repository_to(name)
-        else:
-            __salt__["pkg.mod_repo"](repo, **dict(repo_info), root=name)
-    for repo, _ in repos_to_drop:
-        __salt__["pkg.del_repo"](repo, root=name)
-
-    for _, key_info in keys_to_migrate:
-        __salt__["lowpkg.import_gpg_key"](dict(key_info)["key"], root=name)
-    for key, _ in keys_to_drop:
-        __salt__["lowpkg.remove_gpg_key"](key, root=name)
-
-    (
-        rem_repos_to_migrate,
-        rem_repos_to_drop,
-        rem_keys_to_migrate,
-        rem_keys_to_drop,
-    ) = _repos_keys_migrate_drop(name, keys, drop)
-
-    if any(
-        (rem_repos_to_migrate, rem_repos_to_drop, rem_keys_to_migrate, rem_keys_to_drop)
-    ):
-        ret["result"] = False
-        ret["comment"] = "Migration of repositories failed"
-        return ret
-
-    ret["result"] = True
-    ret["comment"] = "Repositories synchronized"
-    ret["changes"] = {
-        "repos migrated": [repo for repo, _ in repos_to_migrate],
-        "repos dropped": [repo for repo, _ in repos_to_drop],
-        "keys migrated": [key for key, _ in keys_to_migrate],
-        "keys dropped": [key for key, _ in keys_to_drop],
-    }
 
     return ret

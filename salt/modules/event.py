@@ -3,7 +3,6 @@ Use the :ref:`Salt Event System <events>` to fire events from the
 master to the minion and vice-versa.
 """
 
-
 import logging
 import os
 import sys
@@ -130,7 +129,7 @@ def send(
     with_grains=False,
     with_pillar=False,
     with_env_opts=False,
-    **kwargs
+    **kwargs,
 ):
     """
     Send an event to the Salt Master

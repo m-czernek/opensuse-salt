@@ -168,10 +168,9 @@ with a NTP server at a stratum level greater than 5.
 """
 
 import logging
-
-# Import Python std lib
 import re
 
+import salt.utils.beacons
 import salt.utils.napalm
 
 log = logging.getLogger(__name__)
@@ -299,7 +298,7 @@ def validate(config):
                 " dictionary".format(fun),
             )
         if fun not in __salt__:
-            return False, "Execution function {} is not availabe!".format(fun)
+            return False, f"Execution function {fun} is not availabe!"
     return True, "Valid configuration for the napal beacon!"
 
 
@@ -307,6 +306,9 @@ def beacon(config):
     """
     Watch napalm function and fire events.
     """
+    whitelist = []
+    config = salt.utils.beacons.remove_hidden_options(config, whitelist)
+
     log.debug("Executing napalm beacon with config:")
     log.debug(config)
     ret = []

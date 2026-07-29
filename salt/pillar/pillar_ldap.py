@@ -15,7 +15,7 @@ Configuring the LDAP ext_pillar
 ===============================
 
 The basic configuration is part of the `master configuration
-<master-configuration-ext-pillar>`_.
+<_master-configuration-ext-pillar>`_.
 
 .. code-block:: yaml
 
@@ -271,7 +271,7 @@ def _do_search(conf):
     """
     # Build LDAP connection args
     connargs = {}
-    for name in ["uri", "server", "port", "tls", "binddn", "bindpw", "anonymous"]:
+    for name in ["server", "port", "tls", "binddn", "bindpw", "anonymous"]:
         connargs[name] = _config(name, conf)
     if connargs["binddn"] and connargs["bindpw"]:
         connargs["anonymous"] = False

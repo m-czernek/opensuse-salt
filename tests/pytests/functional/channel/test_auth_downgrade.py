@@ -140,6 +140,8 @@ def functional_minion_opts(auth_pki_dir, functional_master_opts, channel_minion_
         "__role": "minion",
         "transport": "zeromq",
         "keysize": 4096,
+        "encryption_algorithm": salt.crypt.OAEP_SHA1,
+        "signing_algorithm": salt.crypt.PKCS1v15_SHA1,
         "master_port": 44506,
         "master_ip": "127.0.0.1",
     }
@@ -275,6 +277,8 @@ async def test_replay_attack_via_version_downgrade(
             "cmd": "_auth",
             "id": channel_minion_id,
             "pub": pub_key,
+            "enc_algo": salt.crypt.OAEP_SHA1,
+            "sig_algo": salt.crypt.PKCS1v15_SHA1,
         }
 
         # Add nonce for version 2+

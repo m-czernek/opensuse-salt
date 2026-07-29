@@ -1,15 +1,14 @@
 import base64
 import datetime
+from collections import OrderedDict
 
 import pytest
 
 import salt.exceptions
-from salt.utils.odict import OrderedDict
 
 try:
     import cryptography
     import cryptography.x509 as cx509
-    from cryptography.exceptions import UnsupportedAlgorithm
     from cryptography.hazmat.primitives import hashes
     from cryptography.hazmat.primitives.serialization import (
         load_pem_private_key,
@@ -24,7 +23,8 @@ except ImportError:
 CRYPTOGRAPHY_VERSION = tuple(int(x) for x in cryptography.__version__.split("."))
 
 pytestmark = [
-    pytest.mark.skipif(HAS_LIBS is False, reason="Needs cryptography library")
+    pytest.mark.skip_on_fips_enabled_platform,
+    pytest.mark.skipif(HAS_LIBS is False, reason="Needs cryptography library"),
 ]
 
 
@@ -677,19 +677,26 @@ def crl_revoked():
 
 
 @pytest.mark.parametrize("algo", ["rsa", "ec", "ed25519", "ed448"])
-def test_create_certificate_self_signed(x509, algo, request):
+def test_create_certificate_self_signed_algo(x509, algo, request):
     privkey = request.getfixturevalue(f"{algo}_privkey")
-    try:
-        res = x509.create_certificate(signing_private_key=privkey, CN="success")
-    except (UnsupportedAlgorithm, NotImplementedError):
-        pytest.skip(f"Algorithm '{algo}' is not supported on this OpenSSL version")
-    except salt.exceptions.CommandExecutionError as e:
-        if "Could not load PEM-encoded" in e.error:
-            pytest.skip(f"Algorithm '{algo}' is not supported on this OpenSSL version")
-        else:
-            raise e
+    res = x509.create_certificate(signing_private_key=privkey, CN="success")
     assert res.startswith("-----BEGIN CERTIFICATE-----")
     cert = _get_cert(res)
+    assert cert.subject.rfc4514_string() == "CN=success"
+
+
+@pytest.mark.parametrize("encoding", ("pem", "der", "pkcs7_der", "pkcs7_pem", "pkcs12"))
+def test_create_certificate_self_signed_encoding(x509, encoding, rsa_privkey):
+    res = x509.create_certificate(
+        signing_private_key=rsa_privkey, CN="success", encoding=encoding
+    )
+    cert = _get_cert(res, encoding=encoding)
+    if "pkcs7" in encoding:
+        cert = cert[0]
+    elif encoding == "pkcs12":
+        pk = load_pem_private_key(rsa_privkey.encode(), None)
+        assert pk.private_numbers() == cert.key.private_numbers()
+        cert = cert.cert.certificate
     assert cert.subject.rfc4514_string() == "CN=success"
 
 
@@ -752,20 +759,12 @@ def test_create_certificate_raw(x509, rsa_privkey):
 @pytest.mark.parametrize("algo", ["rsa", "ec", "ed25519", "ed448"])
 def test_create_certificate_from_privkey(x509, ca_key, ca_cert, algo, request):
     privkey = request.getfixturevalue(f"{algo}_privkey")
-    try:
-        res = x509.create_certificate(
-            signing_cert=ca_cert,
-            signing_private_key=ca_key,
-            private_key=privkey,
-            CN="success",
-        )
-    except (UnsupportedAlgorithm, NotImplementedError):
-        pytest.skip(f"Algorithm '{algo}' is not supported on this OpenSSL version")
-    except salt.exceptions.CommandExecutionError as e:
-        if "Could not load PEM-encoded" in e.error:
-            pytest.skip(f"Algorithm '{algo}' is not supported on this OpenSSL version")
-        else:
-            raise e
+    res = x509.create_certificate(
+        signing_cert=ca_cert,
+        signing_private_key=ca_key,
+        private_key=privkey,
+        CN="success",
+    )
     assert res.startswith("-----BEGIN CERTIFICATE-----")
     cert = _get_cert(res)
     assert cert.subject.rfc4514_string() == "CN=success"
@@ -805,20 +804,12 @@ def test_create_certificate_from_encrypted_privkey_with_encrypted_privkey(
 @pytest.mark.parametrize("algo", ["rsa", "ec", "ed25519", "ed448"])
 def test_create_certificate_from_pubkey(x509, ca_key, ca_cert, algo, request):
     pubkey = request.getfixturevalue(f"{algo}_pubkey")
-    try:
-        res = x509.create_certificate(
-            signing_cert=ca_cert,
-            signing_private_key=ca_key,
-            public_key=pubkey,
-            CN="success",
-        )
-    except (UnsupportedAlgorithm, NotImplementedError):
-        pytest.skip(f"Algorithm '{algo}' is not supported on this OpenSSL version")
-    except salt.exceptions.CommandExecutionError as e:
-        if "Could not load PEM-encoded" in e.error:
-            pytest.skip(f"Algorithm '{algo}' is not supported on this OpenSSL version")
-        else:
-            raise e
+    res = x509.create_certificate(
+        signing_cert=ca_cert,
+        signing_private_key=ca_key,
+        public_key=pubkey,
+        CN="success",
+    )
     assert res.startswith("-----BEGIN CERTIFICATE-----")
     cert = _get_cert(res)
     assert cert.subject.rfc4514_string() == "CN=success"
@@ -1354,15 +1345,7 @@ def test_create_crl_raw(x509, crl_args):
 @pytest.mark.parametrize("algo", ["rsa", "ec", "ed25519", "ed448"])
 def test_create_csr(x509, algo, request):
     privkey = request.getfixturevalue(f"{algo}_privkey")
-    try:
-        res = x509.create_csr(private_key=privkey)
-    except (UnsupportedAlgorithm, NotImplementedError):
-        pytest.skip(f"Algorithm '{algo}' is not supported on this OpenSSL version")
-    except salt.exceptions.CommandExecutionError as e:
-        if "Could not load PEM-encoded" in e.error:
-            pytest.skip(f"Algorithm '{algo}' is not supported on this OpenSSL version")
-        else:
-            raise e
+    res = x509.create_csr(private_key=privkey)
     assert res.startswith("-----BEGIN CERTIFICATE REQUEST-----")
 
 
@@ -1389,6 +1372,14 @@ def test_create_csr_with_extensions(x509, rsa_privkey):
         "tlsfeature": "status_request",
     }
     res = x509.create_csr(private_key=rsa_privkey, **extensions)
+    assert res.startswith("-----BEGIN CERTIFICATE REQUEST-----")
+
+
+def test_create_csr_with_wildcard_san(x509, rsa_privkey):
+    """
+    Test that wildcards in SAN extension are supported. Issue #65072
+    """
+    res = x509.create_csr(private_key=rsa_privkey, subjectAltName="DNS:*.salt.ca")
     assert res.startswith("-----BEGIN CERTIFICATE REQUEST-----")
 
 
@@ -1420,10 +1411,7 @@ def test_create_csr_raw(x509, rsa_privkey):
 @pytest.mark.slow_test
 @pytest.mark.parametrize("algo", ["rsa", "ec", "ed25519", "ed448"])
 def test_create_private_key(x509, algo):
-    try:
-        res = x509.create_private_key(algo=algo)
-    except (UnsupportedAlgorithm, NotImplementedError):
-        pytest.skip(f"Algorithm '{algo}' is not supported on this OpenSSL version")
+    res = x509.create_private_key(algo=algo)
     assert res.startswith("-----BEGIN PRIVATE KEY-----")
 
 
@@ -1431,10 +1419,7 @@ def test_create_private_key(x509, algo):
 @pytest.mark.parametrize("algo", ["rsa", "ec", "ed25519", "ed448"])
 def test_create_private_key_with_passphrase(x509, algo):
     passphrase = "hunter2"
-    try:
-        res = x509.create_private_key(algo=algo, passphrase=passphrase)
-    except (UnsupportedAlgorithm, NotImplementedError):
-        pytest.skip(f"Algorithm '{algo}' is not supported on this OpenSSL version")
+    res = x509.create_private_key(algo=algo, passphrase=passphrase)
     assert res.startswith("-----BEGIN ENCRYPTED PRIVATE KEY-----")
     # ensure it can be loaded
     x509.get_private_key_size(res, passphrase=passphrase)
@@ -1442,32 +1427,31 @@ def test_create_private_key_with_passphrase(x509, algo):
 
 @pytest.mark.slow_test
 def test_create_private_key_der(x509):
-    try:
-        res = x509.create_private_key(algo="ec", encoding="der")
-    except NotImplementedError:
-        pytest.skip("Algorithm 'ec' is not supported on this OpenSSL version")
+    res = x509.create_private_key(algo="ec", encoding="der")
     assert base64.b64decode(res)
 
 
 @pytest.mark.slow_test
 @pytest.mark.parametrize("passphrase", [None, "hunter2"])
 def test_create_private_key_pkcs12(x509, passphrase):
-    try:
-        res = x509.create_private_key(
-            algo="ec", encoding="pkcs12", passphrase=passphrase
-        )
-    except NotImplementedError:
-        pytest.skip("Algorithm 'ec' is not supported on this OpenSSL version")
+    res = x509.create_private_key(algo="ec", encoding="pkcs12", passphrase=passphrase)
     assert base64.b64decode(res)
 
 
 @pytest.mark.parametrize("encoding", ["pem", "der"])
 def test_create_private_key_write_to_path(x509, encoding, tmp_path):
-    tgt = tmp_path / "csr"
+    tgt = tmp_path / "pk"
     x509.create_private_key(encoding=encoding, path=str(tgt))
     assert tgt.exists()
     if encoding == "pem":
         assert tgt.read_text().startswith("-----BEGIN PRIVATE KEY-----")
+
+
+def test_create_private_key_write_to_path_encrypted(x509, tmp_path):
+    tgt = tmp_path / "pk"
+    x509.create_private_key(path=str(tgt), passphrase="hunter1")
+    assert tgt.exists()
+    assert tgt.read_text().startswith("-----BEGIN ENCRYPTED PRIVATE KEY-----")
 
 
 @pytest.mark.parametrize("encoding", ["pem", "der"])
@@ -1491,15 +1475,7 @@ def test_create_private_key_raw(x509):
 )
 def test_get_private_key_size(x509, algo, expected, request):
     privkey = request.getfixturevalue(f"{algo}_privkey")
-    try:
-        res = x509.get_private_key_size(privkey)
-    except (UnsupportedAlgorithm, NotImplementedError):
-        pytest.skip(f"Algorithm '{algo}' is not supported on this OpenSSL version")
-    except salt.exceptions.CommandExecutionError as e:
-        if "Could not load PEM-encoded" in e.error:
-            pytest.skip(f"Algorithm '{algo}' is not supported on this OpenSSL version")
-        else:
-            raise e
+    res = x509.get_private_key_size(privkey)
     assert res == expected
 
 
@@ -1636,17 +1612,38 @@ def test_verify_crl(x509, crl, ca_cert):
     assert x509.verify_crl(crl, ca_cert) is True
 
 
-def test_verify_private_key(x509, ca_key, ca_cert):
-    assert x509.verify_private_key(ca_key, ca_cert) is True
+def test_encode_private_key(x509, rsa_privkey):
+    pk = x509.create_private_key()
+    res = x509.encode_private_key(pk)
+    assert res.strip() == pk.strip()
+
+
+def test_encode_private_key_encrypted(x509, ca_key, ca_key_enc):
+    pk = x509.create_private_key()
+    pk_enc = x509.encode_private_key(pk, passphrase="hunter1")
+    res = x509.encode_private_key(pk_enc, private_key_passphrase="hunter1")
+    assert res.strip() == pk.strip()
+
+
+@pytest.mark.parametrize("privkey,expected", [("ca_key", True), ("rsa_privkey", False)])
+def test_verify_private_key(x509, request, privkey, expected, ca_cert):
+    pk = request.getfixturevalue(privkey)
+    assert x509.verify_private_key(pk, ca_cert) is expected
+
+
+def test_verify_private_key_with_passphrase(x509, ca_key_enc, ca_cert):
+    assert (
+        x509.verify_private_key(
+            ca_key_enc, ca_cert, passphrase="correct horse battery staple"
+        )
+        is True
+    )
 
 
 @pytest.mark.parametrize("algo", ["rsa", "ec", "ed25519", "ed448"])
 def test_verify_signature(x509, algo, request):
     wrong_privkey = request.getfixturevalue(f"{algo}_privkey")
-    try:
-        privkey = x509.create_private_key(algo=algo)
-    except (UnsupportedAlgorithm, NotImplementedError):
-        pytest.skip(f"Algorithm '{algo}' is not supported on this OpenSSL version")
+    privkey = x509.create_private_key(algo=algo)
     cert = x509.create_certificate(signing_private_key=privkey)
     assert x509.verify_signature(cert, privkey)
     assert not x509.verify_signature(cert, wrong_privkey)

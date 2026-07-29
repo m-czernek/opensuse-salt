@@ -14,13 +14,16 @@ from tests.support.unit import TestCase
 
 # pylint: disable=import-error,no-name-in-module
 try:
-    import boto
     import boto3
     from botocore.exceptions import ClientError
 
     HAS_BOTO = True
 except ImportError:
     HAS_BOTO = False
+
+pytestmark = [
+    pytest.mark.skip_on_fips_enabled_platform,
+]
 
 
 # pylint: enable=import-error,no-name-in-module
@@ -328,7 +331,7 @@ class BotoCognitoIdentityTestCase(
         result = boto_cognitoidentity.delete_identity_pools(
             IdentityPoolName=first_pool_name,
             IdentityPoolId="no_such_pool_id",
-            **conn_parameters
+            **conn_parameters,
         )
         mock_calls = self.conn.mock_calls
         self.assertIs(result.get("deleted"), False)
@@ -463,7 +466,7 @@ class BotoCognitoIdentityTestCase(
             result = boto_cognitoidentity.set_identity_pool_roles(
                 IdentityPoolId="some_id",
                 AuthenticatedRole="my_auth_role",
-                **conn_parameters
+                **conn_parameters,
             )
             mock_calls = self.conn.mock_calls
             self.assertTrue(result.get("set"))
@@ -490,7 +493,7 @@ class BotoCognitoIdentityTestCase(
             result = boto_cognitoidentity.set_identity_pool_roles(
                 IdentityPoolId="some_id",
                 UnauthenticatedRole="my_unauth_role",
-                **conn_parameters
+                **conn_parameters,
             )
             mock_calls = self.conn.mock_calls
             self.assertTrue(result.get("set"))
@@ -520,7 +523,7 @@ class BotoCognitoIdentityTestCase(
                 IdentityPoolId="some_id",
                 AuthenticatedRole="arn:aws:iam:my_auth_role",
                 UnauthenticatedRole="my_unauth_role",
-                **conn_parameters
+                **conn_parameters,
             )
             mock_calls = self.conn.mock_calls
             self.assertTrue(result.get("set"))
@@ -540,7 +543,7 @@ class BotoCognitoIdentityTestCase(
             result = boto_cognitoidentity.set_identity_pool_roles(
                 IdentityPoolId="some_id",
                 AuthenticatedRole="no_such_auth_role",
-                **conn_parameters
+                **conn_parameters,
             )
             mock_calls = self.conn.mock_calls
             self.assertIs(result.get("set"), False)
@@ -561,7 +564,7 @@ class BotoCognitoIdentityTestCase(
                 IdentityPoolId="some_id",
                 AuthenticatedRole="arn:aws:iam:my_auth_role",
                 UnauthenticatedRole="no_such_unauth_role",
-                **conn_parameters
+                **conn_parameters,
             )
             mock_calls = self.conn.mock_calls
             self.assertIs(result.get("set"), False)
@@ -618,7 +621,7 @@ class BotoCognitoIdentityTestCase(
         result = boto_cognitoidentity.update_identity_pool(
             IdentityPoolId=second_pool_id,
             IdentityPoolName=second_pool_name_updated,
-            **conn_parameters
+            **conn_parameters,
         )
         self.assertTrue(result.get("updated"))
         self.assertEqual(result.get("identity_pool"), second_pool_updated_ret)
@@ -662,7 +665,7 @@ class BotoCognitoIdentityTestCase(
         result = boto_cognitoidentity.update_identity_pool(
             IdentityPoolId=first_pool_id,
             OpenIdConnectProviderARNs=[],
-            **conn_parameters
+            **conn_parameters,
         )
         self.assertTrue(result.get("updated"))
         self.assertEqual(result.get("identity_pool"), first_pool_updated_ret)
@@ -684,7 +687,7 @@ class BotoCognitoIdentityTestCase(
         result = boto_cognitoidentity.update_identity_pool(
             IdentityPoolId=first_pool_id,
             DeveloperProviderName="this should not change",
-            **conn_parameters
+            **conn_parameters,
         )
         self.assertTrue(result.get("updated"))
         self.assertEqual(result.get("identity_pool"), first_pool_ret)
@@ -705,7 +708,7 @@ class BotoCognitoIdentityTestCase(
         result = boto_cognitoidentity.update_identity_pool(
             IdentityPoolId=second_pool_id,
             DeveloperProviderName="added_developer_provider",
-            **conn_parameters
+            **conn_parameters,
         )
         self.assertTrue(result.get("updated"))
         self.assertEqual(result.get("identity_pool"), second_pool_updated_ret)
@@ -724,7 +727,7 @@ class BotoCognitoIdentityTestCase(
         result = boto_cognitoidentity.update_identity_pool(
             IdentityPoolId=second_pool_id,
             DeveloperProviderName="added_developer_provider",
-            **conn_parameters
+            **conn_parameters,
         )
         self.assertIs(result.get("updated"), False)
         self.assertEqual(

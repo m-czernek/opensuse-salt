@@ -110,7 +110,7 @@ def _call_brew(*cmd, failhard=True):
     runas = user if user != __opts__["user"] else None
     _cmd = []
     if runas:
-        _cmd = ["sudo -i -n -H -u {} -- ".format(runas)]
+        _cmd = [f"sudo -i -n -H -u {runas} -- "]
     _cmd = _cmd + [salt.utils.path.which("brew")] + list(cmd)
     _cmd = " ".join(_cmd)
 
@@ -181,6 +181,8 @@ def list_pkgs(versions_as_list=False, **kwargs):
 
     for package in package_info["casks"]:
         pkg_version = package["installed"]
+        if pkg_version is None:
+            pkg_version = ""
         pkg_names = {package["full_token"], package["token"]}
         pkg_tap = package.get("tap", None)
         # The following name is appended to maintain backward compatibility
@@ -190,7 +192,7 @@ def list_pkgs(versions_as_list=False, **kwargs):
             # Tap is null when the package is from homebrew/cask.
             pkg_tap = "homebrew/cask"
         pkg_names.add("/".join([pkg_tap, package["token"]]))
-        for pkg_name in pkg_names:
+        for pkg_name in [pkg for pkg in pkg_names if pkg is not None]:
             __salt__["pkg_resource.add_pkg"](ret, pkg_name, pkg_version)
 
     __salt__["pkg_resource.sort_pkglist"](ret)
@@ -496,7 +498,7 @@ def list_upgrades(refresh=True, include_casks=False, **kwargs):  # pylint: disab
     try:
         data = salt.utils.json.loads(res["stdout"])
     except ValueError as err:
-        msg = 'unable to interpret output from "brew outdated": {}'.format(err)
+        msg = f'unable to interpret output from "brew outdated": {err}'
         log.error(msg)
         raise CommandExecutionError(msg)
 
@@ -637,11 +639,11 @@ def hold(name=None, pkgs=None, sources=None, **kwargs):  # pylint: disable=W0613
         ret[target] = {"name": target, "changes": {}, "result": False, "comment": ""}
 
         if target not in installed:
-            ret[target]["comment"] = "Package {} does not have a state.".format(target)
+            ret[target]["comment"] = f"Package {target} does not have a state."
         elif target not in pinned:
             if "test" in __opts__ and __opts__["test"]:
                 ret[target].update(result=None)
-                ret[target]["comment"] = "Package {} is set to be held.".format(target)
+                ret[target]["comment"] = f"Package {target} is set to be held."
             else:
                 result = _pin(target)
                 if result:
@@ -652,7 +654,7 @@ def hold(name=None, pkgs=None, sources=None, **kwargs):  # pylint: disable=W0613
                     )
                 else:
                     ret[target].update(result=False)
-                    ret[target]["comment"] = "Unable to hold package {}.".format(target)
+                    ret[target]["comment"] = f"Unable to hold package {target}."
         else:
             ret[target].update(result=True)
             ret[target]["comment"] = "Package {} is already set to be held.".format(
@@ -713,7 +715,7 @@ def unhold(name=None, pkgs=None, sources=None, **kwargs):  # pylint: disable=W06
         ret[target] = {"name": target, "changes": {}, "result": False, "comment": ""}
 
         if target not in installed:
-            ret[target]["comment"] = "Package {} does not have a state.".format(target)
+            ret[target]["comment"] = f"Package {target} does not have a state."
         elif target in pinned:
             if "test" in __opts__ and __opts__["test"]:
                 ret[target].update(result=None)
@@ -727,7 +729,7 @@ def unhold(name=None, pkgs=None, sources=None, **kwargs):  # pylint: disable=W06
                     ret[target].update(changes=changes, result=True)
                     ret[target][
                         "comment"
-                    ] = "Package {} is no longer being held.".format(target)
+                    ] = f"Package {target} is no longer being held."
                 else:
                     ret[target].update(result=False)
                     ret[target]["comment"] = "Unable to unhold package {}.".format(

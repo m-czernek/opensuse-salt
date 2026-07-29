@@ -1,6 +1,9 @@
 """
 unit tests for the slack engine
 """
+
+from collections import deque
+
 import pytest
 
 import salt.engines.slack_bolt_engine as slack_bolt_engine
@@ -327,7 +330,13 @@ def test_run_commands_from_slack_async(slack_client):
     #
     # test with control as True and fire_all as False
     #
-    with patch_slack_client_run_until, patch_slack_client_run_command_async, patch_slack_client_get_jobs_from_runner, patch_app_client_files_upload as app_client_files_upload, patch_app_client_chat_postMessage as app_client_chat_postMessage:
+    with (
+        patch_slack_client_run_until
+    ), (
+        patch_slack_client_run_command_async
+    ), (
+        patch_slack_client_get_jobs_from_runner
+    ), patch_app_client_files_upload as app_client_files_upload, patch_app_client_chat_postMessage as app_client_chat_postMessage:
         slack_client.run_commands_from_slack_async(
             message_generator=message_generator,
             fire_all=False,
@@ -389,7 +398,15 @@ def test_run_commands_from_slack_async(slack_client):
             },
         )
     ]
-    with patch_slack_client_run_until, patch_slack_client_run_command_async, patch_slack_client_get_jobs_from_runner, patch_event_send, patch_app_client_files_upload as app_client_files_upload, patch_app_client_chat_postMessage as app_client_chat_postMessage:
+    with (
+        patch_slack_client_run_until
+    ), (
+        patch_slack_client_run_command_async
+    ), (
+        patch_slack_client_get_jobs_from_runner
+    ), (
+        patch_event_send
+    ), patch_app_client_files_upload as app_client_files_upload, patch_app_client_chat_postMessage as app_client_chat_postMessage:
         slack_client.run_commands_from_slack_async(
             message_generator=message_generator,
             fire_all=True,
@@ -399,6 +416,80 @@ def test_run_commands_from_slack_async(slack_client):
         app_client_files_upload.asser_has_calls(upload_calls)
         app_client_chat_postMessage.asser_has_calls(chat_postMessage_calls)
         mock_event_send.asser_has_calls(event_send_calls)
+
+
+def test_generate_triggered_messages_bot_message_68105(slack_client):
+    """
+    Regression test for issue #68105.
+
+    A Slack workflow that posts to a channel produces a message with
+    ``subtype: 'bot_message'`` and no ``user`` field (it carries ``bot_id``
+    and ``username`` instead). Previously this raised
+    ``UnboundLocalError: local variable 'user_id' referenced before assignment``
+    inside ``just_data`` and crashed the engine. The engine must now handle
+    these bot messages gracefully.
+    """
+
+    # A workflow-posted message: ``subtype: bot_message`` with no ``user``
+    # field. The text does not start with the trigger string so the engine
+    # should simply yield it back without dispatching a command.
+    bot_msg = {
+        "subtype": "bot_message",
+        "text": "hello from a workflow",
+        "username": "Salt Run",
+        "type": "message",
+        "ts": "1750761076.971029",
+        "bot_id": "B092CEC63HV",
+        "app_id": "A092TF7N4R2",
+        "channel": "C02QY11UQ",
+        "event_ts": "1750761076.971029",
+        "channel_type": "group",
+    }
+
+    slack_client.msg_queue = deque([bot_msg])
+
+    patch_run_until = patch.object(
+        slack_client, "_run_until", MagicMock(side_effect=[True, False])
+    )
+    patch_get_users = patch.object(
+        slack_client,
+        "get_slack_users",
+        MagicMock(return_value={"U02QY11UJ": "garethgreenaway"}),
+    )
+    patch_get_channels = patch.object(
+        slack_client,
+        "get_slack_channels",
+        MagicMock(return_value={"C02QY11UQ": "general"}),
+    )
+    patch_get_config_groups = patch.object(
+        slack_client,
+        "get_config_groups",
+        MagicMock(return_value={}),
+    )
+
+    with patch_run_until, patch_get_users, patch_get_channels, patch_get_config_groups:
+        # Consume the generator. The bug raised UnboundLocalError inside
+        # just_data, propagating out of the generator on the first ``next``.
+        results = list(
+            slack_client.generate_triggered_messages(
+                token="xoxb-test",
+                trigger_string="!",
+                groups={},
+                groups_pillar_name="",
+            )
+        )
+
+    # The generator must complete without raising. The bot message is
+    # yielded back as ``data`` (non-trigger path), then the final
+    # ``done`` sentinel.
+    assert any(item.get("done") for item in results)
+    yielded = [item for item in results if not item.get("done")]
+    assert len(yielded) == 1
+    # The bot identity is carried through in place of ``user_id`` /
+    # ``user_name`` so downstream code has something to log.
+    assert yielded[0]["user_id"] == "B092CEC63HV"
+    assert yielded[0]["user_name"] == "Salt Run"
+    assert yielded[0]["message_data"] is bot_msg
 
 
 def test_run_command_async(slack_client):
@@ -509,6 +600,8 @@ def test_run_command_async(slack_client):
             },
         )
     ]
-    with patch_runner_client, patch_runner_client_asynchronous as runner_client_asynchronous:
+    with (
+        patch_runner_client
+    ), patch_runner_client_asynchronous as runner_client_asynchronous:
         ret = slack_client.run_command_async(msg)
         runner_client_asynchronous.assert_has_calls(expected_calls)

@@ -13,14 +13,6 @@ from cryptography.hazmat.backends import default_backend
 from cryptography.hazmat.primitives import serialization
 from cryptography.x509.oid import NameOID
 
-try:
-    import vcert
-    from vcert.common import CertificateRequest
-
-    HAS_VCERT = True
-except ImportError:
-    HAS_VCERT = False
-
 from tests.support.case import ShellCase
 
 
@@ -44,7 +36,6 @@ def with_random_name(func):
     return wrapper
 
 
-@pytest.mark.skipif(HAS_VCERT is False, reason="The vcert module must be installed.")
 class VenafiTest(ShellCase):
     """
     Test the venafi runner
@@ -52,12 +43,9 @@ class VenafiTest(ShellCase):
 
     @with_random_name
     @pytest.mark.slow_test
+    @pytest.mark.skip_on_fips_enabled_platform
     def test_request(self, name):
-        cn = "{}.example.com".format(name)
-
-        # Provide python27 compatibility
-        if not isinstance(cn, str):
-            cn = cn.decode()
+        cn = f"{name}.example.com"
 
         ret = self.run_run_plus(
             fun="venafi.request",
@@ -95,6 +83,7 @@ class VenafiTest(ShellCase):
     @with_random_name
     @pytest.mark.slow_test
     def test_sign(self, name):
+
         csr_pem = """-----BEGIN CERTIFICATE REQUEST-----
 MIIFbDCCA1QCAQAwgbQxCzAJBgNVBAYTAlVTMQ0wCwYDVQQIDARVdGFoMRIwEAYD
 VQQHDAlTYWx0IExha2UxFDASBgNVBAoMC1ZlbmFmaSBJbmMuMRQwEgYDVQQLDAtJ
@@ -133,10 +122,6 @@ xlAKgaU6i03jOm5+sww5L2YVMi1eeBN+kx7o94ogpRemC/EUidvl1PUJ6+e7an9V
             f.flush()
             csr_path = f.name
             cn = "test-csr-32313131.venafi.example.com"
-
-            # Provide python27 compatibility
-            if not isinstance(cn, str):
-                cn = cn.decode()
 
             ret = self.run_run_plus(
                 fun="venafi.request", minion_id=cn, csr_path=csr_path, zone="fake"

@@ -1,6 +1,7 @@
 """
     :codeauthor: Mike Place <mp@saltstack.com>
 """
+
 import errno
 import logging
 import os
@@ -10,12 +11,12 @@ import pytest
 
 import salt.config
 import salt.exceptions
-import tornado.gen
-import tornado.ioloop
-import tornado.testing
+import salt.ext.tornado.gen
+import salt.ext.tornado.ioloop
+import salt.ext.tornado.testing
 import salt.transport.ipc
 import salt.utils.platform
-from tornado.iostream import StreamClosedError
+from salt.ext.tornado.iostream import StreamClosedError
 from tests.support.runtests import RUNTIME_VARS
 
 pytestmark = [
@@ -28,7 +29,7 @@ log = logging.getLogger(__name__)
 
 
 @pytest.mark.skip_on_windows(reason="Windows does not support Posix IPC")
-class IPCMessagePubSubCase(tornado.testing.AsyncTestCase):
+class IPCMessagePubSubCase(salt.ext.tornado.testing.AsyncTestCase):
     """
     Test all of the clear msg stuff
     """
@@ -103,8 +104,8 @@ class IPCMessagePubSubCase(tornado.testing.AsyncTestCase):
                 self.stop()
 
         # Now let both waiting data at once
-        client1.read_async()
-        client2.read_async()
+        client1.read_async(handler)
+        client2.read_async(handler)
         self.pub_channel.publish("TEST")
         self.wait()
         self.assertEqual(len(call_cnt), 2)
@@ -124,7 +125,7 @@ class IPCMessagePubSubCase(tornado.testing.AsyncTestCase):
         self.assertEqual(ret1, "TEST")
         self.assertEqual(ret2, "TEST")
 
-    @tornado.testing.gen_test
+    @salt.ext.tornado.testing.gen_test
     def test_async_reading_streamclosederror(self):
         client1 = self.sub_channel
         call_cnt = []
@@ -146,7 +147,7 @@ class IPCMessagePubSubCase(tornado.testing.AsyncTestCase):
             pass
 
         try:
-            ret1 = yield client1.read_async()
+            ret1 = yield client1.read_async(handler)
             self.wait()
         except StreamClosedError as ex:
             assert False, "StreamClosedError was raised inside the Future"

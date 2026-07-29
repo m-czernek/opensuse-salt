@@ -2,7 +2,6 @@
 Make me some salt!
 """
 
-
 import logging
 import os
 import warnings
@@ -226,8 +225,11 @@ class Minion(
     def _handle_signals(self, signum, sigframe):  # pylint: disable=unused-argument
         # escalate signal to the process manager processes
         if hasattr(self.minion, "stop"):
-            self.minion.stop(signum)
-        super()._handle_signals(signum, sigframe)
+            # If the minion has a stop method, call it - this is the case for
+            # MinionManager
+            self.minion.stop(signum, super()._handle_signals)
+        else:
+            super()._handle_signals(signum, sigframe)
 
     # pylint: disable=no-member
     def prepare(self):
@@ -263,6 +265,9 @@ class Minion(
                 v_dirs = [
                     self.config["pki_dir"],
                     self.config["cachedir"],
+                    os.path.join(
+                        self.config["cachedir"], "proc"
+                    ),  # Ensure proc dir is created before privilege drop
                     self.config["sock_dir"],
                     self.config["extension_modules"],
                     confd,
@@ -406,7 +411,7 @@ class ProxyMinion(
 
     def _handle_signals(self, signum, sigframe):  # pylint: disable=unused-argument
         # escalate signal to the process manager processes
-        self.minion.stop(signum)
+        self.minion.stop(signum, super()._handle_signals)
         super()._handle_signals(signum, sigframe)
 
     # pylint: disable=no-member
@@ -454,6 +459,9 @@ class ProxyMinion(
                 v_dirs = [
                     self.config["pki_dir"],
                     self.config["cachedir"],
+                    os.path.join(
+                        self.config["cachedir"], "proc"
+                    ),  # Ensure proc dir is created before privilege drop
                     self.config["sock_dir"],
                     self.config["extension_modules"],
                     confd,

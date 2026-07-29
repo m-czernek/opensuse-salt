@@ -4,6 +4,8 @@ import subprocess
 
 import pytest
 
+from tests.conftest import FIPS_TESTRUN
+
 log = logging.getLogger(__name__)
 
 
@@ -45,11 +47,7 @@ def etc_hosts():
 @pytest.fixture(scope="package")
 def master(request, salt_factories):
 
-    try:
-        subprocess.check_output(["ip", "addr", "add", "172.16.0.1/32", "dev", "lo"])
-        ip_addr_set = True
-    except subprocess.CalledProcessError:
-        ip_addr_set = False
+    subprocess.check_output(["ip", "addr", "add", "172.16.0.1/32", "dev", "lo"])
 
     config_defaults = {
         "open_mode": True,
@@ -57,6 +55,10 @@ def master(request, salt_factories):
     }
     config_overrides = {
         "interface": "0.0.0.0",
+        "fips_mode": FIPS_TESTRUN,
+        "publish_signing_algorithm": (
+            "PKCS1v15-SHA224" if FIPS_TESTRUN else "PKCS1v15-SHA1"
+        ),
     }
     factory = salt_factories.salt_master_daemon(
         "master",
@@ -64,7 +66,6 @@ def master(request, salt_factories):
         overrides=config_overrides,
         extra_cli_arguments_after_first_start_failure=["--log-level=info"],
     )
-    factory.ip_addr_set = ip_addr_set
     with factory.started(start_timeout=180):
         yield factory
 
@@ -89,6 +90,9 @@ def minion(master, master_alive_interval):
         "master": f"master.local:{port}",
         "publish_port": master.config["publish_port"],
         "master_alive_interval": master_alive_interval,
+        "fips_mode": FIPS_TESTRUN,
+        "encryption_algorithm": "OAEP-SHA224" if FIPS_TESTRUN else "OAEP-SHA1",
+        "signing_algorithm": "PKCS1v15-SHA224" if FIPS_TESTRUN else "PKCS1v15-SHA1",
     }
     factory = master.salt_minion_daemon(
         "minion",

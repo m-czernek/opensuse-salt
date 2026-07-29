@@ -10,6 +10,19 @@ import salt.utils.path
 from tests.support.runtests import RUNTIME_VARS
 from tests.unit.modules.test_zcbuildout import KNOWN_VIRTUALENV_BINARY_NAMES, Base
 
+pytestmark = [
+    pytest.mark.skip(
+        reason="Buildout no longer supports v2 or lower, resources removed"
+    ),
+    pytest.mark.skip_on_fips_enabled_platform,
+    pytest.mark.skip_on_windows(
+        reason=(
+            "Special steps are required for proper SSL validation because "
+            "`easy_install` is too old(and deprecated)."
+        )
+    ),
+]
+
 
 @pytest.mark.skip_if_binaries_missing(*KNOWN_VIRTUALENV_BINARY_NAMES, check_all=False)
 @pytest.mark.requires_network
@@ -48,7 +61,6 @@ class BuildoutTestCase(Base):
         self.assertFalse(ret["result"])
 
     @pytest.mark.slow_test
-    @pytest.mark.skip(reason="TODO this test should probably be fixed")
     def test_installed(self):
         if salt.modules.virtualenv_mod.virtualenv_ver(self.ppy_st) >= (20, 0, 0):
             self.skipTest(

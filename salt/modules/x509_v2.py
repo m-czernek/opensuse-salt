@@ -118,6 +118,14 @@ or compound matcher (for the latter, see the notes above).
 
 Breaking changes versus the previous ``x509`` modules
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+* The ``public_key`` parameter to ``x509.certificate_managed`` (and corresponding
+  ``x509.create_certificate``) used to accept a private key.
+  The new modules require an actual public key if this parameter is specified.
+  You can pass a private key in the ``private_key`` parameter instead.
+
+  Failing to ensure it really is a public key you are passing as ``public_key`` fails
+  with ``Could not load PEM-encoded public key.``.
+
 * The output format has changed for all ``read_*`` functions as well as the state return dict.
 * The formatting of some extension definitions might have changed, but should
   be stable for most basic use cases.
@@ -132,14 +140,15 @@ Note that when a ``ca_server`` is involved, both peers must use the updated modu
 
 .. _x509-setup:
 """
+
 import base64
 import copy
-import datetime
 import glob
 import logging
 import os.path
 import re
 import sys
+from datetime import datetime, timedelta, timezone
 
 try:
     import cryptography.x509 as cx509
@@ -151,12 +160,12 @@ try:
 except ImportError:
     HAS_CRYPTOGRAPHY = False
 
+from collections import OrderedDict
+
 import salt.utils.dictupdate
 import salt.utils.files
 import salt.utils.stringutils
-import salt.utils.timeutil
 from salt.exceptions import CommandExecutionError, SaltInvocationError
-from salt.utils.odict import OrderedDict
 
 log = logging.getLogger(__name__)
 
@@ -256,8 +265,8 @@ def create_certificate(
         Instead of returning the certificate, write it to this file path.
 
     overwrite
-        If ``path`` is specified and the file exists, do not overwrite it.
-        Defaults to false.
+        If ``path`` is specified and the file exists, overwrite it.
+        Defaults to true.
 
     raw
         Return the encoded raw bytes instead of a string. Defaults to false.
@@ -266,33 +275,48 @@ def create_certificate(
         The hashing algorithm to use for the signature. Valid values are:
         sha1, sha224, sha256, sha384, sha512, sha512_224, sha512_256, sha3_224,
         sha3_256, sha3_384, sha3_512. Defaults to ``sha256``.
-        This will be ignored for ``ed25519`` and ``ed448`` key types.
+        Ignored for ``ed25519`` and ``ed448`` key types.
 
     private_key
-        The private key corresponding to the public key the certificate should
-        be issued for. This is one way of specifying the public key that will
-        be included in the certificate, the other ones being ``public_key`` and ``csr``.
+        A **private key**, which is used to derive the public key the certificate
+        is issued for. If unset, checks ``public_key`` or ``csr`` to derive it.
+
+        Ignored when creating self-signed certificates (missing ``signing_cert``).
+
+        .. hint::
+            When ``encoding`` is ``pkcs12``, this private key is embedded into
+            the resulting container.
 
     private_key_passphrase
         If ``private_key`` is specified and encrypted, the passphrase to decrypt it.
 
     public_key
-        The public key the certificate should be issued for. Other ways of passing
-        the required information are ``private_key`` and ``csr``. If neither are set,
-        the public key of the ``signing_private_key`` will be included, i.e.
-        a self-signed certificate is generated.
+        A **public key**, which is used as the public key the certificate is issued for,
+        but only if ``private_key`` is **not** specified.
+
+        If this is unset, checks ``csr`` to derive it.
+
+        Ignored when creating self-signed certificates (missing ``signing_cert``).
 
     csr
-        A certificate signing request to use as a base for generating the certificate.
-        The following information will be respected, depending on configuration:
-        * public key
-        * extensions, if not otherwise specified (arguments, signing_policy)
+        A **certificate signing request** to use as a base for generating the certificate:
+
+        - Extensions not otherwise specified (arguments, signing_policy) are copied.
+        - If ``private_key`` and ``public_key`` are both unspecified, copies the embedded
+          public key into the certificate. This step is skipped when creating self-signed
+          certificates (missing ``signing_cert``).
 
     signing_cert
         The CA certificate to be used for signing the issued certificate.
 
+        Leave empty to create a self-signed certificate.
+
     signing_private_key
-        The private key corresponding to the public key in ``signing_cert``. Required.
+        The private key to be used for signing the new certificate. Required.
+
+        Usually, this is the private key corresponding to the public key in ``signing_cert``.
+        When creating self-signed certificates (missing ``signing_cert``), derives
+        the new certificate's embedded public key from this private key.
 
     signing_private_key_passphrase
         If ``signing_private_key`` is encrypted, the passphrase to decrypt it.
@@ -384,10 +408,9 @@ def create_certificate(
 
             .. code-block:: yaml
 
-                # mind this being a list, not a dict
                 - subjectAltName:
-                    - email:me@example.com
-                    - DNS:example.com
+                    - email:me@example.com  # list items can be strings
+                    - dns: example.com      # or single-key dicts
 
         issuerAltName
             The syntax is the same as for ``subjectAltName``, except that the additional
@@ -506,13 +529,6 @@ def create_certificate(
         )
     if encoding == "der" and append_certs:
         raise SaltInvocationError("Cannot encode a certificate chain in DER")
-    if encoding == "pkcs12" and "private_key" not in kwargs:
-        # The creation will work, but it will be listed in additional certs, not
-        # as the main certificate. This might confuse other parts of the code.
-        raise SaltInvocationError(
-            "Creating a PKCS12-encoded certificate without embedded private key "
-            "is unsupported"
-        )
     if "signing_private_key" not in kwargs and not ca_server:
         raise SaltInvocationError(
             "Creating a certificate locally at least requires a signing private key."
@@ -531,6 +547,17 @@ def create_certificate(
         )
     else:
         x509util.merge_signing_policy(_get_signing_policy(signing_policy), kwargs)
+        if (
+            encoding == "pkcs12"
+            and "private_key" not in kwargs
+            and "signing_cert" in kwargs
+        ):
+            # The creation will work, but it will be listed in additional certs, not
+            # as the main certificate. This might confuse other parts of the code.
+            raise SaltInvocationError(
+                "Creating a PKCS12-encoded certificate without embedded private key "
+                "is unsupported"
+            )
         cert, private_key_loaded = _create_certificate_local(**kwargs)
 
     if encoding == "pkcs12":
@@ -615,7 +642,7 @@ def _create_certificate_local(
             path=os.path.join(copypath, f"{prepend}{cert.serial_number:x}.crt"),
             pem_type="CERTIFICATE",
         )
-    return builder.sign(signing_private_key, algorithm=algorithm), private_key_loaded
+    return cert, private_key_loaded
 
 
 def encode_certificate(
@@ -734,9 +761,11 @@ def encode_certificate(
             else:
                 cipher = serialization.BestAvailableEncryption(pkcs12_passphrase)
         crt_bytes = serialization.pkcs12.serialize_key_and_certificates(
-            name=salt.utils.stringutils.to_bytes(pkcs12_friendlyname)
-            if pkcs12_friendlyname
-            else None,
+            name=(
+                salt.utils.stringutils.to_bytes(pkcs12_friendlyname)
+                if pkcs12_friendlyname
+                else None
+            ),
             key=private_key,
             cert=cert,
             cas=append_certs,
@@ -843,7 +872,7 @@ def create_crl(
         The hashing algorithm to use for the signature. Valid values are:
         sha1, sha224, sha256, sha384, sha512, sha512_224, sha512_256, sha3_224,
         sha3_256, sha3_384, sha3_512. Defaults to ``sha256``.
-        This will be ignored for ``ed25519`` and ``ed448`` key types.
+        Ignored for ``ed25519`` and ``ed448`` key types.
 
     encoding
         Specify the encoding of the resulting certificate revocation list.
@@ -902,8 +931,11 @@ def create_crl(
             salt.utils.versions.kwargs_warn_until(["text"], "Potassium")
             kwargs.pop("text")
 
-        if kwargs:
-            raise SaltInvocationError(f"Unrecognized keyword arguments: {list(kwargs)}")
+        unknown = [kwarg for kwarg in kwargs if not kwarg.startswith("_")]
+        if unknown:
+            raise SaltInvocationError(
+                f"Unrecognized keyword arguments: {list(unknown)}"
+            )
 
     if days_valid is None:
         try:
@@ -1053,7 +1085,7 @@ def create_csr(
         The hashing algorithm to use for the signature. Valid values are:
         sha1, sha224, sha256, sha384, sha512, sha512_224, sha512_256, sha3_224,
         sha3_256, sha3_384, sha3_512. Defaults to ``sha256``.
-        This will be ignored for ``ed25519`` and ``ed448`` key types.
+        Ignored for ``ed25519`` and ``ed448`` key types.
 
     encoding
         Specify the encoding of the resulting certificate signing request.
@@ -1194,7 +1226,7 @@ def create_private_key(
     keysize
         For ``rsa``, specifies the bitlength of the private key (2048, 3072, 4096).
         For ``ec``, specifies the NIST curve to use (256, 384, 521).
-        Irrelevant for Edwards-curve schemes (`ed25519``, ``ed448``).
+        Irrelevant for Edwards-curve schemes (``ed25519``, ``ed448``).
         Defaults to 2048 for RSA and 256 for EC.
 
     passphrase
@@ -1236,13 +1268,15 @@ def create_private_key(
         for x in ignored_params:
             kwargs.pop(x)
 
-    if kwargs:
-        raise SaltInvocationError(f"Unrecognized keyword arguments: {list(kwargs)}")
+    unknown = [kwarg for kwarg in kwargs if not kwarg.startswith("_")]
+    if unknown:
+        raise SaltInvocationError(f"Unrecognized keyword arguments: {list(unknown)}")
 
     if encoding not in ["der", "pem", "pkcs12"]:
         raise CommandExecutionError(
             f"Invalid value '{encoding}' for encoding. Valid: der, pem, pkcs12"
         )
+
     out = encode_private_key(
         _generate_pk(algo=algo, keysize=keysize),
         encoding=encoding,
@@ -1255,7 +1289,9 @@ def create_private_key(
         return out
 
     if encoding == "pem":
-        return write_pem(out.decode(), path, pem_type="(?:RSA )?PRIVATE KEY")
+        return write_pem(
+            out.decode(), path, pem_type="(?:(RSA|ENCRYPTED) )?PRIVATE KEY"
+        )
     with salt.utils.files.fopen(path, "wb") as fp_:
         fp_.write(out)
     return
@@ -1265,6 +1301,7 @@ def encode_private_key(
     private_key,
     encoding="pem",
     passphrase=None,
+    private_key_passphrase=None,
     pkcs12_encryption_compat=False,
     raw=False,
 ):
@@ -1277,13 +1314,30 @@ def encode_private_key(
 
         salt '*' x509.encode_private_key /etc/pki/my.key der
 
-    csr
+    private_key
         The private key to encode.
 
     encoding
         Specify the encoding of the resulting private key. It can be returned
         as a ``pem`` string, base64-encoded ``der`` and base64-encoded ``pkcs12``.
         Defaults to ``pem``.
+
+    passphrase
+        If this is specified, the private key will be encrypted using this
+        passphrase. The encryption algorithm cannot be selected, it will be
+        determined automatically as the best available one.
+
+    private_key_passphrase
+        .. versionadded:: 3006.2
+
+        If the current ``private_key`` is encrypted, the passphrase to
+        decrypt it.
+
+    pkcs12_encryption_compat
+        Some operating systems are incompatible with the encryption defaults
+        for PKCS12 used since OpenSSL v3. This switch triggers a fallback to
+        ``PBESv1SHA1And3KeyTripleDESCBC``.
+        Please consider the `notes on PKCS12 encryption <https://cryptography.io/en/stable/hazmat/primitives/asymmetric/serialization/#cryptography.hazmat.primitives.serialization.pkcs12.serialize_key_and_certificates>`_.
 
     raw
         Return the encoded raw bytes instead of a string. Defaults to false.
@@ -1292,6 +1346,7 @@ def encode_private_key(
         raise CommandExecutionError(
             f"Invalid value '{encoding}' for encoding. Valid: der, pem, pkcs12"
         )
+    private_key = x509util.load_privkey(private_key, passphrase=private_key_passphrase)
     if passphrase is None:
         cipher = serialization.NoEncryption()
     else:
@@ -1348,10 +1403,12 @@ def expires(certificate, days=0):
         Defaults to ``0``, which checks for the current time.
     """
     cert = x509util.load_cert(certificate)
-    # dates are encoded in UTC/GMT, they are returned as a naive datetime object
-    return cert.not_valid_after <= salt.utils.timeutil.utcnow() + datetime.timedelta(
-        days=days
-    )
+    try:
+        not_after = cert.not_valid_after_utc
+    except AttributeError:
+        # naive datetime object, release <42 (it's always UTC)
+        not_after = cert.not_valid_after.replace(tzinfo=timezone.utc)
+    return not_after <= datetime.now(tz=timezone.utc) + timedelta(days=days)
 
 
 def expired(certificate):
@@ -1537,12 +1594,24 @@ def get_public_key(key, passphrase=None, asObj=None):
         return x509util.to_pem(
             x509util.load_cert(key, passphrase=passphrase).public_key()
         ).decode()
+    except x509util.InvalidPassword as err:
+        # This exception indicates that the data is a valid PKCS#12 container,
+        # but something is wrong with the password.
+        raise CommandExecutionError(str(err)) from err
     except (CommandExecutionError, SaltInvocationError):
         pass
     try:
         return x509util.to_pem(
             x509util.load_privkey(key, passphrase=passphrase).public_key()
         ).decode()
+    except (
+        x509util.InvalidPassword,
+        x509util.MissingPassword,
+        x509util.SuperfluousPassword,
+    ) as err:
+        # These exceptions indicate that the data is a valid private key,
+        # but something is wrong with the password.
+        raise CommandExecutionError(str(err)) from err
     except (CommandExecutionError, SaltInvocationError):
         pass
     try:
@@ -1550,7 +1619,7 @@ def get_public_key(key, passphrase=None, asObj=None):
     except SaltInvocationError:
         pass
     raise CommandExecutionError(
-        "Could not load key as certificate, public key, private key, CSR or CRL"
+        "Could not load key as certificate, public key, private key or CSR"
     )
 
 
@@ -1631,6 +1700,13 @@ def read_certificate(certificate):
     cert = x509util.load_cert(certificate)
     key_type = x509util.get_key_type(cert.public_key(), as_string=True)
 
+    try:
+        not_before = cert.not_valid_before_utc
+        not_after = cert.not_valid_after_utc
+    except AttributeError:
+        # naive datetime object, release <42 (it's always UTC)
+        not_before = cert.not_valid_before.replace(tzinfo=timezone.utc)
+        not_after = cert.not_valid_after.replace(tzinfo=timezone.utc)
     ret = {
         "version": cert.version.value + 1,  # 0-indexed
         "key_size": cert.public_key().key_size if key_type in ["ec", "rsa"] else None,
@@ -1646,8 +1722,8 @@ def read_certificate(certificate):
         "issuer": _parse_dn(cert.issuer),
         "issuer_hash": x509util.pretty_hex(_get_name_hash(cert.issuer)),
         "issuer_str": cert.issuer.rfc4514_string(),
-        "not_before": cert.not_valid_before.strftime(x509util.TIME_FMT),
-        "not_after": cert.not_valid_after.strftime(x509util.TIME_FMT),
+        "not_before": not_before.strftime(x509util.TIME_FMT),
+        "not_after": not_after.strftime(x509util.TIME_FMT),
         "public_key": get_public_key(cert),
         "extensions": _parse_extensions(cert.extensions),
     }
@@ -1713,10 +1789,16 @@ def read_crl(crl):
         The certificate revocation list to read.
     """
     crl = x509util.load_crl(crl)
+    try:
+        last_update = crl.last_update_utc
+        next_update = crl.next_update_utc
+    except AttributeError:
+        last_update = crl.last_update.replace(tzinfo=timezone.utc)
+        next_update = crl.next_update.replace(tzinfo=timezone.utc)
     ret = {
         "issuer": _parse_dn(crl.issuer),
-        "last_update": crl.last_update.strftime(x509util.TIME_FMT),
-        "next_update": crl.next_update.strftime(x509util.TIME_FMT),
+        "last_update": last_update.strftime(x509util.TIME_FMT),
+        "next_update": next_update.strftime(x509util.TIME_FMT),
         "revoked_certificates": {},
         "extensions": _parse_extensions(crl.extensions),
     }
@@ -1736,12 +1818,15 @@ def read_crl(crl):
         ret["signature_algorithm"] = crl.signature_algorithm_oid.dotted_string
 
     for revoked in crl:
+        try:
+            revocation_date = revoked.revocation_date_utc
+        except AttributeError:
+            # naive datetime object, release <42 (it's always UTC)
+            revocation_date = revoked.revocation_date.replace(tzinfo=timezone.utc)
         ret["revoked_certificates"].update(
             {
                 x509util.dec2hex(revoked.serial_number).replace(":", ""): {
-                    "revocation_date": revoked.revocation_date.strftime(
-                        x509util.TIME_FMT
-                    ),
+                    "revocation_date": revocation_date.strftime(x509util.TIME_FMT),
                     "extensions": _parse_crl_entry_extensions(revoked.extensions),
                 }
             }
@@ -1868,10 +1953,18 @@ def sign_remote_certificate(
 
 
 def _query_remote(ca_server, signing_policy, kwargs, get_signing_policy_only=False):
+    # Default publish.publish timeout is 5s; remote signing can exceed that on
+    # slow or heavily loaded CI hosts (e.g. ARM builders). Without a higher
+    # ceiling the requesting minion issues ``pub_ret`` before the ca_server's
+    # _return has reached the master's local job cache and gets back an empty
+    # publish result, which surfaces as the misleading "ca_server did not
+    # respond. Salt master must permit peers to call the
+    # sign_remote_certificate function." error.
     result = __salt__["publish.publish"](
         ca_server,
         "x509.sign_remote_certificate",
         arg=[signing_policy, kwargs, get_signing_policy_only],
+        timeout=60,
     )
 
     if not result:
@@ -1882,7 +1975,7 @@ def _query_remote(ca_server, signing_policy, kwargs, get_signing_policy_only=Fal
         )
     result = result[next(iter(result))]
     if not isinstance(result, dict) or "data" not in result:
-        log.error(f"Received invalid return value from ca_server: {result}")
+        log.error("Received invalid return value from ca_server: %s", result)
         raise CommandExecutionError(
             "Received invalid return value from ca_server. See minion log for details"
         )
@@ -1937,7 +2030,7 @@ def verify_private_key(private_key, public_key, passphrase=None):
     passphrase
         If ``private_key`` is encrypted, the passphrase to decrypt it.
     """
-    privkey = x509util.load_privkey(private_key, passphrase=None)
+    privkey = x509util.load_privkey(private_key, passphrase=passphrase)
     pubkey = x509util.load_pubkey(get_public_key(public_key))
     return x509util.is_pair(pubkey, privkey)
 
@@ -2180,7 +2273,12 @@ def _match_minions(test, minion):
         # certificates with the signing policy. Implementing a match runner
         # would plug that security hole somewhat, and fully if only pillars
         # are used.
-        match = __salt__["publish.publish"](tgt=minion, fun="match.compound", arg=test)
+        # See ``_query_remote`` for why we override the 5 s
+        # ``publish.publish`` default with a 60 s ceiling: the same
+        # round-trip latency on a heavily loaded CI host applies here.
+        match = __salt__["publish.publish"](
+            tgt=minion, fun="match.compound", arg=test, timeout=60
+        )
         if minion not in match:
             raise CommandExecutionError(
                 "Could not verify if minion matches compound matching expression. "

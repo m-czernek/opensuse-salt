@@ -61,9 +61,8 @@ import socket
 import ssl
 from collections import namedtuple
 
-import tornado.ioloop
-import tornado.iostream
-
+import salt.ext.tornado.ioloop
+import salt.ext.tornado.iostream
 import salt.utils.event
 
 log = logging.getLogger(__name__)
@@ -102,18 +101,18 @@ class IRCClient:
         self.allow_hosts = allow_hosts
         self.allow_nicks = allow_nicks
         self.disable_query = disable_query
-        self.io_loop = tornado.ioloop.IOLoop(make_current=False)
+        self.io_loop = salt.ext.tornado.ioloop.IOLoop(make_current=False)
         self.io_loop.make_current()
         self._connect()
 
     def _connect(self):
         _sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM, 0)
         if self.ssl is True:
-            self._stream = tornado.iostream.SSLIOStream(
+            self._stream = salt.ext.tornado.iostream.SSLIOStream(
                 _sock, ssl_options={"cert_reqs": ssl.CERT_NONE}
             )
         else:
-            self._stream = tornado.iostream.IOStream(_sock)
+            self._stream = salt.ext.tornado.iostream.IOStream(_sock)
         self._stream.set_close_callback(self.on_closed)
         self._stream.connect((self.host, self.port), self.on_connect)
 
@@ -174,16 +173,16 @@ class IRCClient:
                 event.source, nick, user, host, event.code, channel, command, line
             )
             if (self._allow_nick(nick) or self._allow_host(host)) and hasattr(
-                self, "_command_{}".format(command)
+                self, f"_command_{command}"
             ):
-                getattr(self, "_command_{}".format(command))(privevent)
+                getattr(self, f"_command_{command}")(privevent)
 
     def _command_echo(self, event):
-        message = "PRIVMSG {} :{}".format(event.channel, event.line)
+        message = f"PRIVMSG {event.channel} :{event.line}"
         self.send_message(message)
 
     def _command_ping(self, event):
-        message = "PRIVMSG {} :{}: pong".format(event.channel, event.nick)
+        message = f"PRIVMSG {event.channel} :{event.nick}: pong"
         self.send_message(message)
 
     def _command_event(self, event):
@@ -211,7 +210,7 @@ class IRCClient:
             payload = {"data": []}
 
         fire("salt/engines/ircbot/" + tag, payload)
-        message = "PRIVMSG {} :{}: TaDa!".format(event.channel, event.nick)
+        message = f"PRIVMSG {event.channel} :{event.nick}: TaDa!"
         self.send_message(message)
 
     def _message(self, raw):
@@ -219,11 +218,11 @@ class IRCClient:
         event = self._event(raw)
 
         if event.code == "PING":
-            tornado.ioloop.IOLoop.current().spawn_callback(
-                self.send_message, "PONG {}".format(event.line)
+            salt.ext.tornado.ioloop.IOLoop.current().spawn_callback(
+                self.send_message, f"PONG {event.line}"
             )
         elif event.code == "PRIVMSG":
-            tornado.ioloop.IOLoop.current().spawn_callback(
+            salt.ext.tornado.ioloop.IOLoop.current().spawn_callback(
                 self._privmsg, event
             )
         self.read_messages()
@@ -231,13 +230,13 @@ class IRCClient:
     def join_channel(self, channel):
         if not channel.startswith("#"):
             channel = "#" + channel
-        self.send_message("JOIN {}".format(channel))
+        self.send_message(f"JOIN {channel}")
 
     def on_connect(self):
         logging.info("on_connect")
         if self.sasl is True:
             self.send_message("CAP REQ :sasl")
-        self.send_message("NICK {}".format(self.nick))
+        self.send_message(f"NICK {self.nick}")
         self.send_message("USER saltstack 0 * :saltstack")
         if self.password:
             if self.sasl is True:
@@ -245,7 +244,7 @@ class IRCClient:
                     "{0}\x00{0}\x00{1}".format(self.username, self.password).encode()
                 )
                 self.send_message("AUTHENTICATE PLAIN")
-                self.send_message("AUTHENTICATE {}".format(authstring))
+                self.send_message(f"AUTHENTICATE {authstring}")
                 self.send_message("CAP END")
             else:
                 self.send_message(

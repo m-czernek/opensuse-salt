@@ -17,7 +17,7 @@ Management of Docker Containers
 .. _docker-py: https://pypi.python.org/pypi/docker-py
 .. _lxc-attach: https://linuxcontainers.org/lxc/manpages/man1/lxc-attach.1.html
 .. _nsenter: http://man7.org/linux/man-pages/man1/nsenter.1.html
-.. _docker-exec: http://docs.docker.com/reference/commandline/cli/#exec
+.. _docker-exec: https://docs.docker.com/reference/cli/docker/container/exec/
 .. _`docker-py Low-level API`: http://docker-py.readthedocs.io/en/stable/api.html
 .. _timelib: https://pypi.python.org/pypi/timelib
 .. _`trusted builds`: https://blog.docker.com/2013/11/introducing-trusted-builds/
@@ -201,19 +201,14 @@ import copy
 import fnmatch
 import functools
 import gzip
-import hashlib
 import json
 import logging
 import os
-import pathlib
 import re
 import shlex
 import shutil
 import string
 import subprocess
-import sys
-import tarfile
-import tempfile
 import time
 import uuid
 
@@ -227,6 +222,7 @@ import salt.utils.functools
 import salt.utils.json
 import salt.utils.path
 from salt.exceptions import CommandExecutionError, SaltInvocationError
+from salt.loader.dunder import __file_client__
 from salt.state import HighState
 
 __docformat__ = "restructuredtext en"
@@ -330,6 +326,18 @@ def __virtual__():
     return (False, "Could not import docker module, is docker-py installed?")
 
 
+def _file_client():
+    """
+    Return a file client
+
+    If the __file_client__ context is set return it, otherwize create a new
+    file client using __opts__.
+    """
+    if __file_client__:
+        return __file_client__.value()
+    return salt.fileclient.get_file_client(__opts__)
+
+
 class DockerJSONDecoder(json.JSONDecoder):
     def decode(self, s, _w=None):
         objs = []
@@ -391,7 +399,6 @@ def _get_client(timeout=NOTSET, **kwargs):
                     docker_machine_tls["ClientKeyPath"],
                 ),
                 ca_cert=docker_machine_tls["CaCertPath"],
-                assert_hostname=False,
                 verify=True,
             )
         except Exception as exc:  # pylint: disable=broad-except
@@ -530,11 +537,11 @@ def _clear_context():
             pass
 
 
-def _get_md5(name, path):
+def _get_sha256(name, path):
     """
-    Get the MD5 checksum of a file from a container
+    Get the sha256 checksum of a file from a container
     """
-    output = run_stdout(name, f"md5sum {shlex.quote(path)}", ignore_retcode=True)
+    output = run_stdout(name, f"sha256sum {shlex.quote(path)}", ignore_retcode=True)
     try:
         return output.split()[0]
     except IndexError:
@@ -682,9 +689,9 @@ def _client_wrapper(attr, *args, **kwargs):
             raise
     except docker.errors.DockerException as exc:
         # More general docker exception (catches InvalidVersion, etc.)
-        raise CommandExecutionError(exc.__str__())
+        raise CommandExecutionError(str(exc))
     except Exception as exc:  # pylint: disable=broad-except
-        err = exc.__str__()
+        err = str(exc)
     else:
         return ret
 
@@ -1325,9 +1332,25 @@ def compare_networks(first, second, ignore="Name,Id,Created,Containers"):
                 if bool(subval1) is bool(subval2) is False:
                     continue
                 elif subkey == "Config":
-                    kvsort = lambda x: (list(x.keys()), list(x.values()))
-                    config1 = sorted(val1["Config"], key=kvsort)
-                    config2 = sorted(val2.get("Config", []), key=kvsort)
+
+                    def kvsort(x):
+                        return (list(x.keys()), list(x.values()))
+
+                    def strip_empty(pool):
+                        # Newer Docker engines (29.x) emit empty-string
+                        # placeholder fields (e.g. ``IPRange: ""``) in IPAM
+                        # Config entries that older engines and Salt-built
+                        # desired configs omit. Treat empty/None values as
+                        # absent so the comparison stays semantic.
+                        return {k: v for k, v in pool.items() if v not in ("", None)}
+
+                    config1 = sorted(
+                        [strip_empty(p) for p in val1["Config"]], key=kvsort
+                    )
+                    config2 = sorted(
+                        [strip_empty(p) for p in val2.get("Config", [])],
+                        key=kvsort,
+                    )
                     if config1 != config2:
                         ret.setdefault("IPAM", {})["Config"] = {
                             "old": config1,
@@ -3304,7 +3327,7 @@ def create(
         except CommandExecutionError as exc:
             raise CommandExecutionError(
                 "Failed to start container after creation",
-                info={"response": response, "error": exc.__str__()},
+                info={"response": response, "error": str(exc)},
             )
         else:
             response["Started"] = True
@@ -3494,7 +3517,7 @@ def run_container(
                             f"Failed to auto_remove container: {rm_exc}"
                         )
                 # Raise original exception with additional info
-                raise CommandExecutionError(exc.__str__(), info=exc_info)
+                raise CommandExecutionError(str(exc), info=exc_info)
 
         # Start the container
         output = []
@@ -3546,7 +3569,7 @@ def run_container(
             # it to other_errors as a fallback.
             exc_info.setdefault("other_errors", []).append(exc.info)
         # Re-raise with all of the available additional info
-        raise CommandExecutionError(exc.__str__(), info=exc_info)
+        raise CommandExecutionError(str(exc), info=exc_info)
 
     return ret
 
@@ -3633,8 +3656,8 @@ def copy_from(name, source, dest, overwrite=False, makedirs=False):
             raise SaltInvocationError(f"Source file {source} does not exist")
 
     # Before we try to replace the file, compare checksums.
-    source_md5 = _get_md5(name, source)
-    if source_md5 == __salt__["file.get_sum"](dest, "md5"):
+    source_sha256 = _get_sha256(name, source)
+    if source_sha256 == __salt__["file.get_sum"](dest, "sha256"):
         log.debug("%s:%s and %s are the same file, skipping copy", name, source, dest)
         return True
 
@@ -3646,7 +3669,7 @@ def copy_from(name, source, dest, overwrite=False, makedirs=False):
         src_path = f"{name}:{source}"
     cmd = ["docker", "cp", src_path, dest_dir]
     __salt__["cmd.run"](cmd, python_shell=False)
-    return source_md5 == __salt__["file.get_sum"](dest, "md5")
+    return source_sha256 == __salt__["file.get_sum"](dest, "sha256")
 
 
 # Docker cp gets a file from the container, alias this to copy_from
@@ -3988,7 +4011,6 @@ def build(
     fileobj=None,
     dockerfile=None,
     buildargs=None,
-    logfile=None,
 ):
     """
     .. versionchanged:: 2018.3.0
@@ -4041,9 +4063,6 @@ def build(
 
     buildargs
         A dictionary of build arguments provided to the docker build process.
-
-    logfile
-        Path to log file. Output from build is written to this file if not None.
 
 
     **RETURN DATA**
@@ -4119,20 +4138,6 @@ def build(
     stream_data = []
     for line in response:
         stream_data.extend(salt.utils.json.loads(line, cls=DockerJSONDecoder))
-
-    if logfile:
-        try:
-            with salt.utils.files.fopen(logfile, "a") as f:
-                for item in stream_data:
-                    try:
-                        item_type = next(iter(item))
-                    except StopIteration:
-                        continue
-                    if item_type == "stream":
-                        f.write(item[item_type])
-        except OSError:
-            log.error("Unable to write logfile '%s'", logfile)
-
     errors = []
     # Iterate through API response and collect information
     for item in stream_data:
@@ -4296,7 +4301,7 @@ def dangling(prune=False, force=False):
         try:
             ret.setdefault(image, {})["Removed"] = rmi(image, force=force)
         except Exception as exc:  # pylint: disable=broad-except
-            err = exc.__str__()
+            err = str(exc)
             log.error(err)
             ret.setdefault(image, {})["Comment"] = err
             ret[image]["Removed"] = False
@@ -4499,9 +4504,9 @@ def load(path, repository=None, tag=None):
                 result = tag_(top_level_images[0], repository=repository, tag=tag)
                 ret["Image"] = tagged_image
             except IndexError:
-                ret[
-                    "Warning"
-                ] = "No top-level image layers were loaded, no image was tagged"
+                ret["Warning"] = (
+                    "No top-level image layers were loaded, no image was tagged"
+                )
             except Exception as exc:  # pylint: disable=broad-except
                 ret["Warning"] = "Failed to tag {} as {}: {}".format(
                     top_level_images[0], tagged_image, exc
@@ -4616,7 +4621,7 @@ def pull(
         except Exception as exc:  # pylint: disable=broad-except
             raise CommandExecutionError(
                 f"Unable to interpret API event: '{event}'",
-                info={"Error": exc.__str__()},
+                info={"Error": str(exc)},
             )
         try:
             event_type = next(iter(event))
@@ -4710,7 +4715,7 @@ def push(
         except Exception as exc:  # pylint: disable=broad-except
             raise CommandExecutionError(
                 f"Unable to interpret API event: '{event}'",
-                info={"Error": exc.__str__()},
+                info={"Error": str(exc)},
             )
         try:
             event_type = next(iter(event))
@@ -5506,7 +5511,7 @@ def disconnect_all_containers_from_network(network_id):
             disconnect_container_from_network(cname, network_id)
             ret.append(cname)
         except CommandExecutionError as exc:
-            msg = exc.__str__()
+            msg = str(exc)
             if "404" not in msg:
                 # If 404 was in the error, then the container no longer exists,
                 # so to avoid a race condition we won't consider 404 errors to
@@ -6656,7 +6661,7 @@ def _prepare_trans_tar(name, sls_opts, mods=None, pillar=None, extra_filerefs=""
     # reuse it from salt.ssh, however this function should
     # be somewhere else
     refs = salt.client.ssh.state.lowstate_file_refs(chunks, extra_filerefs)
-    with salt.fileclient.get_file_client(__opts__) as fileclient:
+    with _file_client() as fileclient:
         return salt.client.ssh.state.prep_trans_tar(
             fileclient, chunks, refs, pillar, name
         )
@@ -6686,111 +6691,6 @@ def _compile_state(sls_opts, mods=None):
 
         # Compile and verify the raw chunks
         return st_.state.compile_high_data(high_data)
-
-
-def gen_venv_tar(cachedir, venv_dest_dir, venv_name):
-    """
-    Generate tarball with the Salt Bundle if required and return the path to it
-    """
-    exec_path = pathlib.Path(sys.executable).parts
-    venv_dir_name = "venv-salt-minion"
-    if venv_dir_name not in exec_path:
-        return None
-
-    venv_tar = os.path.join(cachedir, "venv-salt.tgz")
-    venv_hash = os.path.join(cachedir, "venv-salt.hash")
-    venv_lock = os.path.join(cachedir, ".venv-salt.lock")
-
-    venv_path = os.path.join(*exec_path[0 : exec_path.index(venv_dir_name)])
-
-    with __utils__["files.flopen"](venv_lock, "w"):
-        start_dir = os.getcwd()
-        venv_hash_file = os.path.join(venv_path, venv_dir_name, "venv-hash.txt")
-        try:
-            with __utils__["files.fopen"](venv_hash_file, "r") as fh:
-                venv_hash_src = fh.readline().strip()
-        except Exception:  # pylint: disable=broad-except
-            # It makes no sense what caused the exception
-            # Just calculate the hash different way
-            for cmd in ("rpm -qi venv-salt-minion", "dpkg -s venv-salt-minion"):
-                ret = __salt__["cmd.run_all"](
-                    cmd,
-                    python_shell=True,
-                    clean_env=True,
-                    env={"LANG": "C", "LANGUAGE": "C", "LC_ALL": "C"},
-                )
-                if ret.get("retcode") == 0 and ret.get("stdout"):
-                    venv_hash_src = hashlib.sha256(
-                        "{}\n".format(ret.get("stdout")).encode()
-                    ).hexdigest()
-                    break
-        try:
-            with __utils__["files.fopen"](venv_hash, "r") as fh:
-                venv_hash_dest = fh.readline().strip()
-        except Exception:  # pylint: disable=broad-except
-            # It makes no sense what caused the exception
-            # Set the hash to impossible value to force new tarball creation
-            venv_hash_dest = "UNKNOWN"
-        if venv_hash_src == venv_hash_dest and os.path.isfile(venv_tar):
-            return venv_tar
-        try:
-            tfd, tmp_venv_tar = tempfile.mkstemp(
-                dir=cachedir,
-                prefix=".venv-",
-                suffix=os.path.splitext(venv_tar)[1],
-            )
-            os.close(tfd)
-
-            os.chdir(venv_path)
-            tfp = tarfile.open(tmp_venv_tar, "w:gz")
-
-            for root, dirs, files in salt.utils.path.os_walk(
-                venv_dir_name, followlinks=True
-            ):
-                for name in files:
-                    if name == "python" and pathlib.Path(root).parts == (
-                        venv_dir_name,
-                        "bin",
-                    ):
-                        tfd, tmp_python_file = tempfile.mkstemp(
-                            dir=cachedir,
-                            prefix=".python-",
-                        )
-                        os.close(tfd)
-                        try:
-                            with __utils__["files.fopen"](
-                                os.path.join(root, name), "r"
-                            ) as fh_in:
-                                with __utils__["files.fopen"](
-                                    tmp_python_file, "w"
-                                ) as fh_out:
-                                    rd_lines = fh_in.readlines()
-                                    rd_lines = [
-                                        'export VIRTUAL_ENV="{}"\n'.format(
-                                            os.path.join(venv_dest_dir, venv_name)
-                                        )
-                                        if line.startswith("export VIRTUAL_ENV=")
-                                        else line
-                                        for line in rd_lines
-                                    ]
-                                    fh_out.write("".join(rd_lines))
-                            os.chmod(tmp_python_file, 0o755)
-                            tfp.add(tmp_python_file, arcname=os.path.join(root, name))
-                            continue
-                        finally:
-                            if os.path.isfile(tmp_python_file):
-                                os.remove(tmp_python_file)
-                    if not name.endswith((".pyc", ".pyo")):
-                        tfp.add(os.path.join(root, name))
-
-            tfp.close()
-            shutil.move(tmp_venv_tar, venv_tar)
-            with __utils__["files.fopen"](venv_hash, "w") as fh:
-                fh.write("{}\n".format(venv_hash_src))
-        finally:
-            os.chdir(start_dir)
-
-    return venv_tar
 
 
 def call(name, function, *args, **kwargs):
@@ -6828,68 +6728,47 @@ def call(name, function, *args, **kwargs):
     if function is None:
         raise CommandExecutionError("Missing function parameter")
 
-    venv_dest_path = "/var/tmp"
-    venv_name = "venv-salt-minion"
-    venv_tar = gen_venv_tar(__opts__["cachedir"], venv_dest_path, venv_name)
+    # move salt into the container
+    thin_path = __utils__["thin.gen_thin"](
+        __opts__["cachedir"],
+        extra_mods=__salt__["config.option"]("thin_extra_mods", ""),
+        so_mods=__salt__["config.option"]("thin_so_mods", ""),
+    )
+    ret = copy_to(
+        name, thin_path, os.path.join(thin_dest_path, os.path.basename(thin_path))
+    )
 
-    if venv_tar is not None:
-        venv_python_bin = os.path.join(venv_dest_path, venv_name, "bin", "python")
-        dest_venv_tar = os.path.join(venv_dest_path, os.path.basename(venv_tar))
-        copy_to(name, venv_tar, dest_venv_tar, overwrite=True, makedirs=True)
-        run_all(
-            name,
-            subprocess.list2cmdline(
-                ["tar", "zxf", dest_venv_tar, "-C", venv_dest_path]
-            ),
-        )
-        run_all(name, subprocess.list2cmdline(["rm", "-f", dest_venv_tar]))
-        container_python_bin = venv_python_bin
-        thin_dest_path = os.path.join(venv_dest_path, venv_name)
-        thin_salt_call = os.path.join(thin_dest_path, "bin", "salt-call")
-    else:
-        # move salt into the container
-        thin_path = __utils__["thin.gen_thin"](
-            __opts__["cachedir"],
-            extra_mods=__salt__["config.option"]("thin_extra_mods", ""),
-            so_mods=__salt__["config.option"]("thin_so_mods", ""),
+    # figure out available python interpreter inside the container (only Python3)
+    pycmds = ("python3", "/usr/libexec/platform-python")
+    container_python_bin = None
+    for py_cmd in pycmds:
+        cmd = [py_cmd] + ["--version"]
+        ret = run_all(name, subprocess.list2cmdline(cmd))
+        if ret["retcode"] == 0:
+            container_python_bin = py_cmd
+            break
+    if not container_python_bin:
+        raise CommandExecutionError(
+            "Python interpreter cannot be found inside the container. Make sure Python is installed in the container"
         )
 
-        ret = copy_to(
-            name, thin_path, os.path.join(thin_dest_path, os.path.basename(thin_path))
-        )
-
-        # figure out available python interpreter inside the container (only Python3)
-        pycmds = ("python3", "/usr/libexec/platform-python")
-        container_python_bin = None
-        for py_cmd in pycmds:
-            cmd = [py_cmd] + ["--version"]
-            ret = run_all(name, subprocess.list2cmdline(cmd))
-            if ret["retcode"] == 0:
-                container_python_bin = py_cmd
-                break
-        if not container_python_bin:
-            raise CommandExecutionError(
-                "Python interpreter cannot be found inside the container. Make sure Python is installed in the container"
-            )
-
-        # untar archive
-        untar_cmd = [
-            container_python_bin,
-            "-c",
-            'import tarfile; tarfile.open("{0}/{1}").extractall(path="{0}")'.format(
-                thin_dest_path, os.path.basename(thin_path)
-            ),
-        ]
-        ret = run_all(name, subprocess.list2cmdline(untar_cmd))
-        if ret["retcode"] != 0:
-            return {"result": False, "comment": ret["stderr"]}
-        thin_salt_call = os.path.join(thin_dest_path, "salt-call")
+    # untar archive
+    untar_cmd = [
+        container_python_bin,
+        "-c",
+        'import tarfile; tarfile.open("{0}/{1}").extractall(path="{0}")'.format(
+            thin_dest_path, os.path.basename(thin_path)
+        ),
+    ]
+    ret = run_all(name, subprocess.list2cmdline(untar_cmd))
+    if ret["retcode"] != 0:
+        return {"result": False, "comment": ret["stderr"]}
 
     try:
         salt_argv = (
             [
                 container_python_bin,
-                thin_salt_call,
+                os.path.join(thin_dest_path, "salt-call"),
                 "--metadata",
                 "--local",
                 "--log-file",

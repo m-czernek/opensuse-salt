@@ -185,7 +185,6 @@ a return like::
 .. |500| replace:: internal server error
 """
 
-import cgi
 import fnmatch
 import logging
 import time
@@ -194,11 +193,12 @@ from copy import copy
 
 import salt.auth
 import salt.client
-import tornado.escape
-import tornado.gen
-import tornado.httpserver
-import tornado.ioloop
-import tornado.web
+import salt.ext.tornado.escape
+import salt.ext.tornado.gen
+import salt.ext.tornado.httpserver
+import salt.ext.tornado.httputil
+import salt.ext.tornado.ioloop
+import salt.ext.tornado.web
 import salt.netapi
 import salt.runner
 import salt.utils.args
@@ -211,7 +211,7 @@ from salt.exceptions import (
     AuthorizationError,
     EauthAuthenticationError,
 )
-from tornado.concurrent import Future
+from salt.ext.tornado.concurrent import Future
 from salt.utils.event import tagify
 
 _json = salt.utils.json.import_json()
@@ -277,7 +277,7 @@ class EventListener:
             opts["sock_dir"],
             opts=opts,
             listen=True,
-            io_loop=tornado.ioloop.IOLoop.current(),
+            io_loop=salt.ext.tornado.ioloop.IOLoop.current(),
         )
 
         # tag -> list of futures
@@ -302,7 +302,7 @@ class EventListener:
             self._timeout_future(tag, matcher, future)
             # remove the timeout
             if future in self.timeout_map:
-                tornado.ioloop.IOLoop.current().remove_timeout(
+                salt.ext.tornado.ioloop.IOLoop.current().remove_timeout(
                     self.timeout_map[future]
                 )
                 del self.timeout_map[future]
@@ -333,12 +333,12 @@ class EventListener:
         Get an event (asynchronous of course) return a future that will get it later
         """
         future = Future()
+        _loop = salt.ext.tornado.ioloop.IOLoop.current()
+        assert _loop
         if callback is not None:
 
             def handle_future(future):
-                tornado.ioloop.IOLoop.current().add_callback(
-                    callback, future
-                )  # pylint: disable=E1102
+                _loop.add_callback(callback, future)  # pylint: disable=not-callable
 
             future.add_done_callback(handle_future)
         # add this tag and future to the callbacks
@@ -346,7 +346,7 @@ class EventListener:
         self.request_map[request].append((tag, matcher, future))
 
         if timeout:
-            timeout_future = tornado.ioloop.IOLoop.current().call_later(
+            timeout_future = _loop.call_later(
                 timeout, self._timeout_future, tag, matcher, future
             )
             self.timeout_map[future] = timeout_future
@@ -391,21 +391,20 @@ class EventListener:
                 future.set_result({"data": data, "tag": mtag})
                 self.tag_map[(tag, matcher)].remove(future)
                 if future in self.timeout_map:
-                    tornado.ioloop.IOLoop.current().remove_timeout(
+                    salt.ext.tornado.ioloop.IOLoop.current().remove_timeout(
                         self.timeout_map[future]
                     )
                     del self.timeout_map[future]
 
+    def destroy(self):
+        self.event.destroy()
 
-class BaseSaltAPIHandler(tornado.web.RequestHandler):  # pylint: disable=W0223
+
+class BaseSaltAPIHandler(salt.ext.tornado.web.RequestHandler):  # pylint: disable=W0223
     ct_out_map = (
         ("application/json", _json_dumps),
         ("application/x-yaml", salt.utils.yaml.safe_dump),
     )
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._auto_finish = False
 
     def _verify_client(self, low):
         """
@@ -474,7 +473,8 @@ class BaseSaltAPIHandler(tornado.web.RequestHandler):  # pylint: disable=W0223
         accept_header = self.request.headers.get("Accept", "*/*")
         # Ignore any parameter, including q (quality) one
         parsed_accept_header = [
-            cgi.parse_header(h)[0] for h in accept_header.split(",")
+            salt.ext.tornado.httputil._parse_header(h)[0]
+            for h in accept_header.split(",")
         ]
 
         def find_acceptable_content_type(parsed_accept_header):
@@ -557,9 +557,11 @@ class BaseSaltAPIHandler(tornado.web.RequestHandler):  # pylint: disable=W0223
         }
 
         try:
-            # Use cgi.parse_header to correctly separate parameters from value
-            value, parameters = cgi.parse_header(self.request.headers["Content-Type"])
-            return ct_in_map[value](tornado.escape.native_str(data))
+            # Use _parse_header to correctly separate parameters from value
+            value, parameters = salt.ext.tornado.httputil._parse_header(
+                self.request.headers["Content-Type"]
+            )
+            return ct_in_map[value](salt.ext.tornado.escape.native_str(data))
         except KeyError:
             self.send_error(406)
         except ValueError:
@@ -663,7 +665,6 @@ class SaltAuthHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
         ret = {"status": "401 Unauthorized", "return": "Please log in"}
 
         self.write(self.serialize(ret))
-        self.finish()
 
     # TODO: make asynchronous? Underlying library isn't... and we ARE making disk calls :(
     def post(self):  # pylint: disable=arguments-differ
@@ -790,7 +791,6 @@ class SaltAuthHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
         }
 
         self.write(self.serialize(ret))
-        self.finish()
 
 
 class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
@@ -834,9 +834,8 @@ class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
         """
         ret = {"clients": list(self.saltclients.keys()), "return": "Welcome"}
         self.write(self.serialize(ret))
-        self.finish()
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.web.asynchronous
     def post(self):  # pylint: disable=arguments-differ
         """
         Send one or more Salt commands (lowstates) in the request body
@@ -914,7 +913,7 @@ class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
 
         self.disbatch()
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def disbatch(self):
         """
         Disbatch all lowstates to the appropriate clients
@@ -948,7 +947,7 @@ class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
                 ret.append("Failed to authenticate")
                 break
             except Exception as ex:  # pylint: disable=broad-except
-                ret.append("Unexpected exception while handling request: {}".format(ex))
+                ret.append(f"Unexpected exception while handling request: {ex}")
                 log.error("Unexpected exception while handling request:", exc_info=True)
 
         try:
@@ -957,7 +956,7 @@ class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
         except RuntimeError:
             pass  # Do we need any logging here?
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def get_minion_returns(
         self, events, is_finished, is_timed_out, min_wait_time, minions
     ):
@@ -987,11 +986,11 @@ class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
                 # When finished entire routine, cleanup other futures and return result
                 if f is is_finished or f is is_timed_out:
                     cancel_inflight_futures()
-                    raise tornado.gen.Return(chunk_ret)
+                    raise salt.ext.tornado.gen.Return(chunk_ret)
                 elif f is min_wait_time:
                     if not more_todo():
                         cancel_inflight_futures()
-                        raise tornado.gen.Return(chunk_ret)
+                        raise salt.ext.tornado.gen.Return(chunk_ret)
                     continue
 
                 f_result = f.result()
@@ -1007,7 +1006,7 @@ class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
                     # if there are no more minions to wait for, then we are done
                     if not more_todo() and min_wait_time.done():
                         cancel_inflight_futures()
-                        raise tornado.gen.Return(chunk_ret)
+                        raise salt.ext.tornado.gen.Return(chunk_ret)
 
             except TimeoutException:
                 pass
@@ -1015,7 +1014,7 @@ class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
                 if f in events:
                     events.remove(f)
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def _disbatch_local(self, chunk):
         """
         Dispatch local client commands
@@ -1064,7 +1063,7 @@ class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
                     future.set_result(None)
                 except Exception:  # pylint: disable=broad-except
                     pass
-            raise tornado.gen.Return(
+            raise salt.ext.tornado.gen.Return(
                 "No minions matched the target. No command was sent, no jid was"
                 " assigned."
             )
@@ -1085,19 +1084,19 @@ class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
 
         # wait syndic a while to avoid missing published events
         if self.application.opts["order_masters"]:
-            min_wait_time = tornado.gen.sleep(
+            min_wait_time = salt.ext.tornado.gen.sleep(
                 self.application.opts["syndic_wait"]
             )
 
         # To ensure job_not_running and all_return are terminated by each other, communicate using a future
-        is_finished = tornado.gen.Future()
-        is_timed_out = tornado.gen.sleep(
+        is_finished = salt.ext.tornado.gen.Future()
+        is_timed_out = salt.ext.tornado.gen.sleep(
             self.application.opts["gather_job_timeout"]
         )
 
         # ping until the job is not running, while doing so, if we see new minions returning
         # that they are running the job, add them to the list
-        tornado.ioloop.IOLoop.current().spawn_callback(
+        salt.ext.tornado.ioloop.IOLoop.current().spawn_callback(
             self.job_not_running,
             pub_data["jid"],
             chunk["tgt"],
@@ -1113,9 +1112,9 @@ class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
             min_wait_time=min_wait_time,
             minions=minions,
         )
-        raise tornado.gen.Return(result)
+        raise salt.ext.tornado.gen.Return(result)
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def job_not_running(self, jid, tgt, tgt_type, minions, is_finished):
         """
         Return a future which will complete once jid (passed in) is no longer
@@ -1140,11 +1139,11 @@ class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
                 if f is is_finished:
                     if not event.done():
                         event.set_result(None)
-                    raise tornado.gen.Return(True)
+                    raise salt.ext.tornado.gen.Return(True)
                 event = f.result()
             except TimeoutException:
                 if not minion_running or is_finished.done():
-                    raise tornado.gen.Return(True)
+                    raise salt.ext.tornado.gen.Return(True)
                 else:
                     ping_pub_data = yield self.saltclients["local"](
                         tgt, "saltutil.find_job", [jid], tgt_type=tgt_type
@@ -1160,7 +1159,7 @@ class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
                 minions[event["data"]["id"]] = False
             minion_running = True
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def _disbatch_local_async(self, chunk):
         """
         Disbatch local client_async commands
@@ -1171,9 +1170,9 @@ class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
             *f_call.get("args", ()), **f_call.get("kwargs", {})
         )
 
-        raise tornado.gen.Return(pub_data)
+        raise salt.ext.tornado.gen.Return(pub_data)
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def _disbatch_runner(self, chunk):
         """
         Disbatch runner client commands
@@ -1186,25 +1185,25 @@ class SaltAPIHandler(BaseSaltAPIHandler):  # pylint: disable=W0223
 
             # only return the return data
             ret = event if full_return else event["data"]["return"]
-            raise tornado.gen.Return(ret)
+            raise salt.ext.tornado.gen.Return(ret)
         except TimeoutException:
-            raise tornado.gen.Return("Timeout waiting for runner to execute")
+            raise salt.ext.tornado.gen.Return("Timeout waiting for runner to execute")
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def _disbatch_runner_async(self, chunk):
         """
         Disbatch runner client_async commands
         """
         pub_data = self.saltclients["runner"](chunk)
-        raise tornado.gen.Return(pub_data)
+        raise salt.ext.tornado.gen.Return(pub_data)
 
     # salt.utils.args.format_call doesn't work for functions having the
-    # annotation tornado.gen.coroutine
+    # annotation salt.ext.tornado.gen.coroutine
     def _format_call_run_job_async(self, chunk):
         f_call = salt.utils.args.format_call(
             salt.client.LocalClient.run_job, chunk, is_class_method=True
         )
-        f_call.get("kwargs", {})["io_loop"] = tornado.ioloop.IOLoop.current()
+        f_call.get("kwargs", {})["io_loop"] = salt.ext.tornado.ioloop.IOLoop.current()
         return f_call
 
 
@@ -1213,7 +1212,7 @@ class MinionSaltAPIHandler(SaltAPIHandler):  # pylint: disable=W0223
     A convenience endpoint for minion related functions
     """
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.web.asynchronous
     def get(self, mid=None):  # pylint: disable=W0221
         """
         A convenience URL for getting lists of minions or getting minion
@@ -1261,7 +1260,7 @@ class MinionSaltAPIHandler(SaltAPIHandler):  # pylint: disable=W0223
         self.lowstate = [{"client": "local", "tgt": mid or "*", "fun": "grains.items"}]
         self.disbatch()
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.web.asynchronous
     def post(self):
         """
         Start an execution command and immediately return the job id
@@ -1339,7 +1338,7 @@ class JobsSaltAPIHandler(SaltAPIHandler):  # pylint: disable=W0223
     A convenience endpoint for job cache data
     """
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.web.asynchronous
     def get(self, jid=None):  # pylint: disable=W0221
         """
         A convenience URL for getting lists of previously run jobs or getting
@@ -1439,7 +1438,7 @@ class RunSaltAPIHandler(SaltAPIHandler):  # pylint: disable=W0223
     Endpoint to run commands without normal session handling
     """
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.web.asynchronous
     def post(self):
         """
         Run commands bypassing the :ref:`normal session handling
@@ -1511,7 +1510,7 @@ class EventsSaltAPIHandler(SaltAPIHandler):  # pylint: disable=W0223
     .. seealso:: :ref:`events`
     """
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def get(self):
         r"""
         An HTTP stream of the Salt master event bus
@@ -1615,7 +1614,7 @@ class EventsSaltAPIHandler(SaltAPIHandler):  # pylint: disable=W0223
         self.set_header("Cache-Control", "no-cache")
         self.set_header("Connection", "keep-alive")
 
-        self.write("retry: {}\n".format(400))
+        self.write(f"retry: {400}\n")
         self.flush()
 
         while True:
@@ -1626,7 +1625,7 @@ class EventsSaltAPIHandler(SaltAPIHandler):  # pylint: disable=W0223
 
                 event = yield self.application.event_listener.get_event(self)
                 self.write("tag: {}\n".format(event.get("tag", "")))
-                self.write("data: {}\n\n".format(_json_dumps(event)))
+                self.write(f"data: {_json_dumps(event)}\n\n")
                 self.flush()
             except TimeoutException:
                 break
@@ -1797,7 +1796,6 @@ class WebhookSaltAPIHandler(SaltAPIHandler):  # pylint: disable=W0223
         )
 
         self.write(self.serialize({"success": ret}))
-        self.finish()
 
 
 def _check_cors_origin(origin, allowed_origins):

@@ -7,7 +7,6 @@ available and installed roles/features. Can install and remove roles/features.
 :depends:       PowerShell module ``ServerManager``
 """
 
-
 import logging
 import shlex
 
@@ -56,9 +55,9 @@ def _pshell_json(cmd, cwd=None):
     Execute the desired powershell command and ensure that it returns data
     in JSON format and load that into python
     """
-    cmd = "Import-Module ServerManager; {}".format(cmd)
+    cmd = f"Import-Module ServerManager; {cmd}"
     if "convertto-json" not in cmd.lower():
-        cmd = "{} | ConvertTo-Json".format(cmd)
+        cmd = f"{cmd} | ConvertTo-Json"
     log.debug("PowerShell: %s", cmd)
     ret = __salt__["cmd.run_all"](cmd, shell="powershell", cwd=cwd)
 
@@ -71,9 +70,7 @@ def _pshell_json(cmd, cwd=None):
 
     if "retcode" not in ret or ret["retcode"] != 0:
         # run_all logs an error to log.error, fail hard back to the user
-        raise CommandExecutionError(
-            "Issue executing PowerShell {}".format(cmd), info=ret
-        )
+        raise CommandExecutionError(f"Issue executing PowerShell {cmd}", info=ret)
 
     # Sometimes Powershell returns an empty string, which isn't valid JSON
     if ret["stdout"] == "":
@@ -155,27 +152,32 @@ def install(feature, recurse=False, restart=False, source=None, exclude=None):
 
         feature (str, list):
             The name of the feature(s) to install. This can be a single feature,
-            a string of features in a comma delimited list (no spaces), or a
+            a string of features in a comma-delimited list (no spaces), or a
             list of features.
 
             .. versionadded:: 2018.3.0
                 Added the ability to pass a list of features to be installed.
 
-        recurse (Options[bool]):
-            Install all sub-features. Default is False
+        recurse (:obj:`bool`, optional):
+            Install all sub-features.
 
-        restart (Optional[bool]):
+            Default is ``False``.
+
+        restart (:obj:`bool`, optional):
             Restarts the computer when installation is complete, if required by
             the role/feature installed. Will also trigger a reboot if an item
-            in ``exclude`` requires a reboot to be properly removed. Default is
-            False
+            in ``exclude`` requires a reboot to be properly removed.
 
-        source (Optional[str]):
+            Default is ``False``.
+
+        source (:obj:`str`, optional):
             Path to the source files if missing from the target system. None
             means that the system will use windows update services to find the
-            required files. Default is None
+            required files.
 
-        exclude (Optional[str]):
+            Default is ``None``.
+
+        exclude (:obj:`str`, optional):
             The name of the feature to exclude when installing the named
             feature. This can be a single feature, a string of features in a
             comma-delimited list (no spaces), or a list of features.
@@ -187,6 +189,8 @@ def install(feature, recurse=False, restart=False, source=None, exclude=None):
                 and will then be removed. **If the feature named in ``exclude``
                 is not a sub-feature of one of the installed items it will still
                 be removed.**
+
+            Default is ``None``.
 
     Returns:
         dict: A dictionary containing the results of the install
@@ -228,7 +232,7 @@ def install(feature, recurse=False, restart=False, source=None, exclude=None):
         shlex.quote(feature),
         management_tools,
         "-IncludeAllSubFeature" if recurse else "",
-        "" if source is None else "-Source {}".format(source),
+        "" if source is None else f"-Source {source}",
     )
     out = _pshell_json(cmd)
 
@@ -325,19 +329,23 @@ def remove(feature, remove_payload=False, restart=False):
 
         feature (str, list):
             The name of the feature(s) to remove. This can be a single feature,
-            a string of features in a comma delimited list (no spaces), or a
+            a string of features in a comma-delimited list (no spaces), or a
             list of features.
 
             .. versionadded:: 2018.3.0
                 Added the ability to pass a list of features to be removed.
 
-        remove_payload (Optional[bool]):
+        remove_payload (:obj:`bool`, optional):
             True will cause the feature to be removed from the side-by-side
-            store (``%SystemDrive%:\Windows\WinSxS``). Default is False
+            store (``%SystemDrive%:\Windows\WinSxS``).
 
-        restart (Optional[bool]):
+            Default is ``False``.
+
+        restart (:obj:`bool`, optional):
             Restarts the computer when uninstall is complete, if required by the
-            role/feature removed. Default is False
+            role/feature removed.
+
+            Default is ``False``.
 
     Returns:
         dict: A dictionary containing the results of the uninstall

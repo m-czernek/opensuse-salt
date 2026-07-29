@@ -2,6 +2,7 @@
 Support for rpm
 """
 
+import datetime
 import logging
 import os
 import re
@@ -10,8 +11,6 @@ import salt.utils.decorators.path
 import salt.utils.itertools
 import salt.utils.path
 import salt.utils.pkg.rpm
-import salt.utils.versions
-import salt.utils.timeutil
 from salt.exceptions import CommandExecutionError, SaltInvocationError
 from salt.utils.versions import LooseVersion
 
@@ -21,20 +20,6 @@ try:
     HAS_RPM = True
 except ImportError:
     HAS_RPM = False
-
-try:
-    import rpmUtils.miscutils
-
-    HAS_RPMUTILS = True
-except ImportError:
-    HAS_RPMUTILS = False
-
-try:
-    import rpm_vercmp
-
-    HAS_PY_RPM = True
-except ImportError:
-    HAS_PY_RPM = False
 
 
 log = logging.getLogger(__name__)
@@ -110,14 +95,14 @@ def bin_pkg_info(path, saltenv="base"):
         newpath = __salt__["cp.cache_file"](path, saltenv)
         if not newpath:
             raise CommandExecutionError(
-                "Unable to retrieve {} from saltenv '{}'".format(path, saltenv)
+                f"Unable to retrieve {path} from saltenv '{saltenv}'"
             )
         path = newpath
     else:
         if not os.path.exists(path):
-            raise CommandExecutionError("{} does not exist on minion".format(path))
+            raise CommandExecutionError(f"{path} does not exist on minion")
         elif not os.path.isabs(path):
-            raise SaltInvocationError("{} does not exist on minion".format(path))
+            raise SaltInvocationError(f"{path} does not exist on minion")
 
     # REPOID is not a valid tag for the rpm command. Remove it and replace it
     # with 'none'
@@ -495,7 +480,7 @@ def diff(package_path, path):
     )
     res = __salt__["cmd.shell"](cmd.format(package_path, path), output_loglevel="trace")
     if res and res.startswith("Binary file"):
-        return "File '{}' is binary and its content has been modified.".format(path)
+        return f"File '{path}' is binary and its content has been modified."
 
     return res
 
@@ -649,8 +634,7 @@ def info(*packages, **kwargs):
             if key in ["build_date", "install_date"]:
                 try:
                     pkg_data[key] = (
-                        salt.utils.timeutil.utcfromtimestamp(int(value)).isoformat()
-                        + "Z"
+                        datetime.datetime.utcfromtimestamp(int(value)).isoformat() + "Z"
                     )
                 except ValueError:
                     log.warning('Could not convert "%s" into Unix time', value)
@@ -711,13 +695,25 @@ def version_cmp(ver1, ver2, ignore_epoch=False):
 
         salt '*' pkg.version_cmp '0.2-001' '0.2.0.1-002'
     """
-    normalize = lambda x: str(x).split(":", 1)[-1] if ignore_epoch else str(x)
+
+    def normalize(x):
+        return str(x).split(":", maxsplit=1)[-1] if ignore_epoch else str(x)
+
     ver1 = normalize(ver1)
     ver2 = normalize(ver2)
 
-    try:
-        cmp_func = None
-        if HAS_RPM:
+    (ver1_e, ver1_v, ver1_r) = salt.utils.pkg.rpm.version_to_evr(ver1)
+    (ver2_e, ver2_v, ver2_r) = salt.utils.pkg.rpm.version_to_evr(ver2)
+    # If one EVR is missing a release but not the other and they
+    # otherwise would be equal, ignore the release. This can happen if
+    # e.g. you are checking if a package version 3.2 is satisfied by
+    # 3.2-1.
+    if not ver1_r or not ver2_r:
+        ver1_r = ver2_r = ""
+
+    if HAS_RPM:
+        try:
+            cmp_func = None
             try:
                 cmp_func = rpm.labelCompare
             except AttributeError:
@@ -728,110 +724,27 @@ def version_cmp(ver1, ver2, ignore_epoch=False):
                     "labelCompare function. Not using rpm.labelCompare for "
                     "version comparison."
                 )
-        elif HAS_PY_RPM:
-            cmp_func = rpm_vercmp.vercmp
-        else:
-            log.warning(
-                "Please install a package that provides rpm.labelCompare for "
-                "more accurate version comparisons."
-            )
-        if cmp_func is None and HAS_RPMUTILS:
-            try:
-                cmp_func = rpmUtils.miscutils.compareEVR
-            except AttributeError:
-                log.debug("rpmUtils.miscutils.compareEVR is not available")
-
-        # If one EVR is missing a release but not the other and they
-        # otherwise would be equal, ignore the release. This can happen if
-        # e.g. you are checking if a package version 3.2 is satisfied by
-        # 3.2-1.
-        (ver1_e, ver1_v, ver1_r) = salt.utils.pkg.rpm.version_to_evr(ver1)
-        (ver2_e, ver2_v, ver2_r) = salt.utils.pkg.rpm.version_to_evr(ver2)
-
-        if not ver1_r or not ver2_r:
-            ver1_r = ver2_r = ""
-
-        if cmp_func is None:
-            ver1 = f"{ver1_e}:{ver1_v}-{ver1_r}"
-            ver2 = f"{ver2_e}:{ver2_v}-{ver2_r}"
-            if salt.utils.path.which("rpmdev-vercmp"):
-                log.warning(
-                    "Installing the rpmdevtools package may surface dev tools in"
-                    " production."
-                )
-
-                # rpmdev-vercmp always uses epochs, even when zero
-                def _ensure_epoch(ver):
-                    def _prepend(ver):
-                        return "0:{}".format(ver)
-
-                    try:
-                        if ":" not in ver:
-                            return _prepend(ver)
-                    except TypeError:
-                        return _prepend(ver)
-                    return ver
-
-                ver1 = _ensure_epoch(ver1)
-                ver2 = _ensure_epoch(ver2)
-                result = __salt__["cmd.run_all"](
-                    ["rpmdev-vercmp", ver1, ver2],
-                    python_shell=False,
-                    redirect_stderr=True,
-                    ignore_retcode=True,
-                )
-                # rpmdev-vercmp returns 0 on equal, 11 on greater-than, and
-                # 12 on less-than.
-                if result["retcode"] == 0:
-                    return 0
-                elif result["retcode"] == 11:
-                    return 1
-                elif result["retcode"] == 12:
-                    return -1
-                else:
-                    # We'll need to fall back to salt.utils.versions.version_cmp()
-                    log.warning(
-                        "Failed to interpret results of rpmdev-vercmp output. "
-                        "This is probably a bug, and should be reported. "
-                        "Return code was %s. Output: %s",
-                        result["retcode"],
-                        result["stdout"],
-                    )
-            else:
-                log.warning(
-                    "Falling back on salt.utils.versions.version_cmp() for version"
-                    " comparisons"
-                )
-        else:
-            if HAS_PY_RPM:
-                ver1 = f"{ver1_v}-{ver1_r}"
-                ver2 = f"{ver2_v}-{ver2_r}"
-
-                # handle epoch version comparison first
-                # rpm_vercmp.vercmp does not handle epoch version comparison
-                ret = salt.utils.versions.version_cmp(ver1_e, ver2_e)
-                if ret in (1, -1):
-                    return ret
-                cmp_result = cmp_func(ver1, ver2)
-            else:
+            if cmp_func is not None:
                 cmp_result = cmp_func(
                     (ver1_e, ver1_v, ver1_r), (ver2_e, ver2_v, ver2_r)
                 )
-            if cmp_result not in (-1, 0, 1):
-                raise CommandExecutionError(
-                    "Comparison result '{}' is invalid".format(cmp_result)
-                )
-            return cmp_result
-
-    except Exception as exc:  # pylint: disable=broad-except
-        log.warning(
-            "Failed to compare version '%s' to '%s' using RPM: %s", ver1, ver2, exc
+                if cmp_result not in (-1, 0, 1):
+                    raise CommandExecutionError(
+                        f"Comparison result '{cmp_result}' is invalid"
+                    )
+                return cmp_result
+        except Exception as exc:  # pylint: disable=broad-except
+            log.warning(
+                "Failed to compare version '%s' to '%s' using RPM: %s", ver1, ver2, exc
+            )
+    else:
+        log.info(
+            "Install a package that provides rpm.labelCompare for "
+            "faster version comparisons."
         )
-
-    # We would already have normalized the versions at the beginning of this
-    # function if ignore_epoch=True, so avoid unnecessary work and just pass
-    # False for this value.
-    return salt.utils.versions.version_cmp(ver1, ver2, ignore_epoch=False)
+    return salt.utils.pkg.rpm.evr_compare(
+        (ver1_e, ver1_v, ver1_r), (ver2_e, ver2_v, ver2_r)
+    )
 
 
 def checksum(*paths, **kwargs):
@@ -866,154 +779,3 @@ def checksum(*paths, **kwargs):
         )
 
     return ret
-
-
-def list_gpg_keys(info=False, root=None):
-    """Return the list of all the GPG keys stored in the RPM database
-
-    .. versionadded:: TBD
-
-    info
-       get the key information, returing a dictionary instead of a
-       list
-
-    root
-       use root as top level directory (default: "/")
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' lowpkg.list_gpg_keys
-        salt '*' lowpkg.list_gpg_keys info=True
-
-    """
-    cmd = ["rpm"]
-    if root:
-        cmd.extend(["--root", root])
-    cmd.extend(["-qa", "gpg-pubkey*"])
-    keys = __salt__["cmd.run_stdout"](cmd, python_shell=False).splitlines()
-    if info:
-        return {key: info_gpg_key(key, root=root) for key in keys}
-    else:
-        return keys
-
-
-def info_gpg_key(key, root=None):
-    """Return a dictionary with the information of a GPG key parsed
-
-    .. versionadded:: TBD
-
-    key
-       key identificatior
-
-    root
-       use root as top level directory (default: "/")
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' lowpkg.info_gpg_key gpg-pubkey-3dbdc284-53674dd4
-
-    """
-    cmd = ["rpm"]
-    if root:
-        cmd.extend(["--root", root])
-    cmd.extend(["-qi", key])
-    info = __salt__["cmd.run_stdout"](cmd, python_shell=False)
-
-    res = {}
-    # The parser algorithm is very ad-hoc.  Works under the
-    # expectation that all the fields are of the type "key: value" in
-    # a single line, except "Description", that will be composed of
-    # multiple lines.  Note that even if the official `rpm` makes this
-    # field the last one, other (like openSUSE) exted it with more
-    # fields.
-    in_description = False
-    description = []
-    for line in info.splitlines():
-        if line.startswith("Description"):
-            in_description = True
-        elif in_description:
-            description.append(line)
-            if line.startswith("-----END"):
-                res["Description"] = "\n".join(description)
-                in_description = False
-        elif line:
-            key, _, value = line.partition(":")
-            value = value.strip()
-            if "Date" in key:
-                try:
-                    value = datetime.datetime.strptime(
-                        value, "%a %d %b %Y %H:%M:%S %p %Z"
-                    )
-                except ValueError:
-                    pass
-            elif "Size" in key:
-                try:
-                    value = int(value)
-                except TypeError:
-                    pass
-            elif "(none)" in value:
-                value = None
-            res[key.strip()] = value
-    return res
-
-
-def import_gpg_key(key, root=None):
-    """Import a new key into the key storage
-
-    .. versionadded:: TBD
-
-    key
-       public key block content
-
-    root
-       use root as top level directory (default: "/")
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' lowpkg.import_gpg_key "-----BEGIN ..."
-
-    """
-    key_file = salt.utils.files.mkstemp()
-    with salt.utils.files.fopen(key_file, "w") as f:
-        f.write(key)
-
-    cmd = ["rpm"]
-    if root:
-        cmd.extend(["--root", root])
-    cmd.extend(["--import", key_file])
-    ret = __salt__["cmd.retcode"](cmd)
-
-    os.remove(key_file)
-
-    return ret == 0
-
-
-def remove_gpg_key(key, root=None):
-    """Remove a key from the key storage
-
-    .. versionadded:: TBD
-
-    key
-       key identificatior
-
-    root
-       use root as top level directory (default: "/")
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' lowpkg.remove_gpg_key gpg-pubkey-3dbdc284-53674dd4
-
-    """
-    cmd = ["rpm"]
-    if root:
-        cmd.extend(["--root", root])
-    cmd.extend(["-e", key])
-    return __salt__["cmd.retcode"](cmd) == 0

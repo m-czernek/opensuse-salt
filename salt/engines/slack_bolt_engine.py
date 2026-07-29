@@ -111,7 +111,7 @@ the desired command.
 .. code-block:: text
 
     engines:
-      - slack:
+      - slack_bolt:
           app_token: "xapp-x-xxxxxxxxxxx-xxxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
           bot_token: 'xoxb-xxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxx'
           control: True
@@ -149,7 +149,7 @@ must be quoted, or else PyYAML will fail to load the configuration.
 .. code-block:: text
 
     engines:
-      - slack:
+      - slack_bolt:
           groups_pillar: slack_engine_pillar
           app_token: "xapp-x-xxxxxxxxxxx-xxxxxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
           bot_token: 'xoxb-xxxxxxxxxx-xxxxxxxxxxxxxxxxxxxxxxxx'
@@ -234,7 +234,7 @@ class SlackClient:
 
         self.msg_queue = collections.deque()
 
-        trigger_pattern = "(^{}.*)".format(trigger_string)
+        trigger_pattern = f"(^{trigger_string}.*)"
 
         # Register message_trigger when we see messages that start
         # with the trigger string
@@ -584,6 +584,8 @@ class SlackClient:
 
         def just_data(m_data):
             """Always try to return the user and channel anyway"""
+            user_id = None
+            user_name = None
             if "user" not in m_data:
                 if "message" in m_data and "user" in m_data["message"]:
                     log.debug(
@@ -595,6 +597,17 @@ class SlackClient:
                 elif "comment" in m_data and "user" in m_data["comment"]:
                     log.debug("Comment was added, so we look for user in the comment.")
                     user_id = m_data["comment"]["user"]
+                elif m_data.get("subtype") == "bot_message":
+                    # Workflows and other bot-posted messages do not carry a
+                    # ``user`` field. Fall back to the bot identity so the
+                    # message can still be processed instead of crashing the
+                    # engine with UnboundLocalError. See issue #68105.
+                    log.debug(
+                        "Message was posted by a bot/workflow, "
+                        "so we use the bot id and username."
+                    )
+                    user_id = m_data.get("bot_id")
+                    user_name = m_data.get("username")
             else:
                 user_id = m_data.get("user")
             channel_id = m_data.get("channel")
@@ -602,10 +615,12 @@ class SlackClient:
                 channel_name = "private chat"
             else:
                 channel_name = all_slack_channels.get(channel_id)
+            if user_name is None:
+                user_name = all_slack_users.get(user_id)
             data = {
                 "message_data": m_data,
                 "user_id": user_id,
-                "user_name": all_slack_users.get(user_id),
+                "user_name": user_name,
                 "channel_name": channel_name,
             }
             if not data["user_name"]:
@@ -843,7 +858,7 @@ class SlackClient:
         results = {}
         for jid in outstanding_jids:
             # results[jid] = runner.cmd('jobs.lookup_jid', [jid])
-            if self.master_minion.returners["{}.get_jid".format(source)](jid):
+            if self.master_minion.returners[f"{source}.get_jid"](jid):
                 job_result = runner.cmd("jobs.list_job", [jid])
                 jid_result = job_result.get("Result", {})
                 jid_function = job_result.get("Function", {})
@@ -913,9 +928,9 @@ class SlackClient:
                     if control and (len(msg) > 1) and msg.get("cmdline"):
                         jid = self.run_command_async(msg)
                         log.debug("Submitted a job and got jid: %s", jid)
-                        outstanding[
-                            jid
-                        ] = msg  # record so we can return messages to the caller
+                        outstanding[jid] = (
+                            msg  # record so we can return messages to the caller
+                        )
                         text_msg = "@{}'s job is submitted as salt jid {}".format(
                             msg["user_name"], jid
                         )
@@ -954,7 +969,7 @@ class SlackClient:
                     )
                     ts = time.time()
                     st = datetime.datetime.fromtimestamp(ts).strftime("%Y%m%d%H%M%S%f")
-                    filename = "salt-results-{}.yaml".format(st)
+                    filename = f"salt-results-{st}.yaml"
                     resp = self.app.client.files_upload(
                         channels=channel,
                         filename=filename,
@@ -969,7 +984,6 @@ class SlackClient:
                     del outstanding[jid]
 
     def run_command_async(self, msg):
-
         """
         :type msg: dict
         :param msg: The message dictionary that contains the command and all information.
@@ -995,8 +1009,6 @@ class SlackClient:
         if cmd in runner_functions:
             runner = salt.runner.RunnerClient(__opts__)
             log.debug("Command %s will run via runner_functions", cmd)
-            # pylint is tripping
-            # pylint: disable=missing-whitespace-after-comma
             job_id_dict = runner.asynchronous(cmd, {"arg": args, "kwarg": kwargs})
             job_id = job_id_dict["jid"]
 
@@ -1075,4 +1087,4 @@ def start(
         )
         client.run_commands_from_slack_async(message_generator, fire_all, tag, control)
     except Exception:  # pylint: disable=broad-except
-        raise Exception("{}".format(traceback.format_exc()))
+        raise Exception(f"{traceback.format_exc()}")

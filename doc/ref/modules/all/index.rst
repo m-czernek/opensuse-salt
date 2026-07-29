@@ -93,7 +93,6 @@ execution modules
     cabal
     capirca_acl
     cassandra_cql
-    cassandra_mod
     celery
     ceph
     chassis
@@ -416,7 +415,6 @@ execution modules
     salt_version
     saltcheck
     saltcloudmod
-    saltsupport
     saltutil
     schedule
     scp_mod

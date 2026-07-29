@@ -1,6 +1,7 @@
 """
 Classes that manage file clients
 """
+
 import contextlib
 import errno
 import ftplib  # nosec
@@ -9,10 +10,10 @@ import logging
 import os
 import shutil
 import string
+import time
 import urllib.error
 import urllib.parse
-
-from tornado.httputil import HTTPHeaders, HTTPInputError, parse_response_start_line
+import weakref
 
 import salt.channel.client
 import salt.client
@@ -33,7 +34,13 @@ import salt.utils.templates
 import salt.utils.url
 import salt.utils.verify
 import salt.utils.versions
-from salt.exceptions import CommandExecutionError, MinionError
+from salt.config import DEFAULT_HASH_TYPE
+from salt.exceptions import CommandExecutionError, MinionError, SaltClientError
+from salt.ext.tornado.httputil import (
+    HTTPHeaders,
+    HTTPInputError,
+    parse_response_start_line,
+)
 from salt.utils.openstack.swift import SaltSwift
 
 log = logging.getLogger(__name__)
@@ -46,6 +53,7 @@ def get_file_client(opts, pillar=False):
     server
     """
     client = opts.get("file_client", "remote")
+
     if pillar and client == "local":
         client = "pillar"
     return {"remote": RemoteClient, "local": FSClient, "pillar": PillarClient}.get(
@@ -100,7 +108,7 @@ class Client:
         Make sure that this path is intended for the salt master and trim it
         """
         if not path.startswith("salt://"):
-            raise MinionError("Unsupported path: {}".format(path))
+            raise MinionError(f"Unsupported path: {path}")
         file_path, saltenv = salt.utils.url.parse(path)
         return file_path
 
@@ -266,7 +274,7 @@ class Client:
             for fn_ in self.file_list_emptydirs(saltenv):
                 fn_ = salt.utils.data.decode(fn_)
                 if fn_.startswith(path):
-                    minion_dir = "{}/{}".format(dest, fn_)
+                    minion_dir = f"{dest}/{fn_}"
                     if not os.path.isdir(minion_dir):
                         os.makedirs(minion_dir)
                     ret.append(minion_dir)
@@ -300,19 +308,19 @@ class Client:
         """
         This function must be overwritten
         """
-        return []
+        return []  # pragma: no cover
 
     def dir_list(self, saltenv="base", prefix=""):
         """
         This function must be overwritten
         """
-        return []
+        return []  # pragma: no cover
 
     def symlink_list(self, saltenv="base", prefix=""):
         """
         This function must be overwritten
         """
-        return {}
+        return {}  # pragma: no cover
 
     def is_cached(self, path, saltenv="base", cachedir=None):
         """
@@ -431,7 +439,7 @@ class Client:
             ret.append(
                 self.get_file(
                     salt.utils.url.create(fn_),
-                    "{}/{}".format(dest, minion_relpath),
+                    f"{dest}/{minion_relpath}",
                     True,
                     saltenv,
                     gzip,
@@ -450,7 +458,7 @@ class Client:
                 # Remove the leading directories from path to derive
                 # the relative path on the minion.
                 minion_relpath = fn_[len(prefix) :].lstrip("/")
-                minion_mkdir = "{}/{}".format(dest, minion_relpath)
+                minion_mkdir = f"{dest}/{minion_relpath}"
                 if not os.path.isdir(minion_mkdir):
                     os.makedirs(minion_mkdir)
                 ret.append(minion_mkdir)
@@ -474,7 +482,7 @@ class Client:
         """
         Get a single file from a URL.
         """
-        url_data = urllib.parse.urlparse(url)
+        url_data = urllib.parse.urlparse(url, allow_fragments=False)
         url_scheme = url_data.scheme
         url_path = os.path.join(url_data.netloc, url_data.path).rstrip(os.sep)
 
@@ -501,9 +509,7 @@ class Client:
         if url_scheme in ("file", ""):
             # Local filesystem
             if not os.path.isabs(url_path):
-                raise CommandExecutionError(
-                    "Path '{}' is not absolute".format(url_path)
-                )
+                raise CommandExecutionError(f"Path '{url_path}' is not absolute")
             if dest is None:
                 with salt.utils.files.fopen(url_path, "rb") as fp_:
                     data = fp_.read()
@@ -577,9 +583,7 @@ class Client:
                 )
                 return dest
             except Exception as exc:  # pylint: disable=broad-except
-                raise MinionError(
-                    "Could not fetch from {}. Exception: {}".format(url, exc)
-                )
+                raise MinionError(f"Could not fetch from {url}. Exception: {exc}")
         if url_data.scheme == "ftp":
             try:
                 ftp = ftplib.FTP()  # nosec
@@ -590,7 +594,7 @@ class Client:
                 ftp.login(url_data.username, url_data.password)
                 remote_file_path = url_data.path.lstrip("/")
                 with salt.utils.files.fopen(dest, "wb") as fp_:
-                    ftp.retrbinary("RETR {}".format(remote_file_path), fp_.write)
+                    ftp.retrbinary(f"RETR {remote_file_path}", fp_.write)
                 ftp.quit()
                 return dest
             except Exception as exc:  # pylint: disable=broad-except
@@ -624,7 +628,7 @@ class Client:
                 swift_conn.get_object(url_data.netloc, url_data.path[1:], dest)
                 return dest
             except Exception:  # pylint: disable=broad-except
-                raise MinionError("Could not fetch from {}".format(url))
+                raise MinionError(f"Could not fetch from {url}")
 
         get_kwargs = {}
         if url_data.username is not None and url_data.scheme in ("http", "https"):
@@ -647,7 +651,7 @@ class Client:
             fixed_url = url
 
         destfp = None
-        dest_etag = "{}.etag".format(dest)
+        dest_etag = f"{dest}.etag"
         try:
             # Tornado calls streaming_callback on redirect response bodies.
             # But we need streaming to support fetching large files (> RAM
@@ -744,10 +748,7 @@ class Client:
                 # Check the status line of the HTTP request
                 if write_body[0] is None:
                     try:
-                        try:
-                            hdr = parse_response_start_line(hdr)
-                        except HTTPInputError:
-                            hdr = parse_response_start_line(hdr.strip())
+                        hdr = parse_response_start_line(hdr)
                     except HTTPInputError:
                         # Not the first line, do nothing
                         return
@@ -764,7 +765,7 @@ class Client:
                         result.append(chunk)
 
             else:
-                dest_tmp = "{}.part".format(dest)
+                dest_tmp = f"{dest}.part"
                 # We need an open filehandle to use in the on_chunk callback,
                 # that's why we're not using a with clause here.
                 # pylint: disable=resource-leakage
@@ -793,7 +794,7 @@ class Client:
                 opts=self.opts,
                 verify_ssl=verify_ssl,
                 header_dict=header_dict,
-                **get_kwargs
+                **get_kwargs,
             )
 
             # 304 Not Modified is returned when If-None-Match header
@@ -822,11 +823,11 @@ class Client:
                 "HTTP error {0} reading {1}: {3}".format(
                     exc.code,
                     url,
-                    *http.server.BaseHTTPRequestHandler.responses[exc.code]
+                    *http.server.BaseHTTPRequestHandler.responses[exc.code],
                 )
             )
         except urllib.error.URLError as exc:
-            raise MinionError("Error reading {}: {}".format(url, exc.reason))
+            raise MinionError(f"Error reading {url}: {exc.reason}")
         finally:
             if destfp is not None:
                 destfp.close()
@@ -839,7 +840,7 @@ class Client:
         makedirs=False,
         saltenv="base",
         cachedir=None,
-        **kwargs
+        **kwargs,
     ):
         """
         Cache a file then process it as a template
@@ -891,6 +892,15 @@ class Client:
 
         # Strip user:pass from URLs
         netloc = netloc.split("@")[-1]
+        try:
+            if url_data.port:
+                # Remove : from path
+                netloc = netloc.replace(":", "")
+        except ValueError:
+            # On Windows urllib raises a ValueError
+            # when using a file:// source and trying
+            # to access the port attribute.
+            pass
 
         if cachedir is None:
             cachedir = self.opts["cachedir"]
@@ -901,6 +911,14 @@ class Client:
             file_name = "-".join([url_data.path, url_data.query])
         else:
             file_name = url_data.path
+
+        if salt.utils.platform.is_windows():
+            # The URL path can carry characters that are legal in URLs but
+            # illegal in Windows file names (commonly ``:`` from an embedded
+            # scheme like ``https://archive.org/.../https://...``). Sanitise
+            # the file_name portion the same way the netloc already is so the
+            # extrn_files cache write does not fail with ``WinError 123``.
+            file_name = salt.utils.path.sanitize_win_path(file_name)
 
         # clean_path returns an empty string if the check fails
         root_path = salt.utils.path.join(cachedir, "extrn_files", saltenv, netloc)
@@ -1039,7 +1057,7 @@ class PillarClient(Client):
             # Local file path
             fnd_path = fnd
 
-        hash_type = self.opts.get("hash_type", "md5")
+        hash_type = self.opts.get("hash_type", DEFAULT_HASH_TYPE)
         ret["hsum"] = salt.utils.hashutils.get_hash(fnd_path, form=hash_type)
         ret["hash_type"] = hash_type
         return ret
@@ -1070,7 +1088,7 @@ class PillarClient(Client):
             except Exception:  # pylint: disable=broad-except
                 fnd_stat = None
 
-        hash_type = self.opts.get("hash_type", "md5")
+        hash_type = self.opts.get("hash_type", DEFAULT_HASH_TYPE)
         ret["hsum"] = salt.utils.hashutils.get_hash(fnd_path, form=hash_type)
         ret["hash_type"] = hash_type
         return ret, fnd_stat
@@ -1117,37 +1135,112 @@ class RemoteClient(Client):
     Interact with the salt master file server.
     """
 
+    # Live RemoteClient instances tracked weakly so the at-fork handler can
+    # drop ZMQ sockets / IOLoop state inherited by any forked child.  Using
+    # a parent's channel from multiple sibling children races the ZMQ
+    # REQ/REP state machine and deadlocks the asyncio loop.
+    _instances = weakref.WeakSet()
+    _atfork_registered = False
+
     def __init__(self, opts):
         Client.__init__(self, opts)
         self._closing = False
-        self.channel = salt.channel.client.ReqChannel.factory(self.opts)
-        if hasattr(self.channel, "auth"):
-            self.auth = self.channel.auth
-        else:
-            self.auth = ""
+        # Eager init preserves prior __init__ semantics (existing tests
+        # expect ReqChannel.factory to be called once at construction time).
+        # After fork the at-fork handler clears _channel/_auth and the
+        # property below rebuilds them lazily on next use.
+        self._channel = salt.channel.client.ReqChannel.factory(self.opts)
+        self._auth = getattr(self._channel, "auth", "")
+        type(self)._register_atfork()
+        type(self)._instances.add(self)
+
+    @classmethod
+    def _register_atfork(cls):
+        if cls._atfork_registered or not hasattr(os, "register_at_fork"):
+            return
+        os.register_at_fork(after_in_child=cls._after_fork_in_child)
+        cls._atfork_registered = True
+
+    @classmethod
+    def _after_fork_in_child(cls):
+        # Drop references to inherited ZMQ sockets and asyncio/tornado
+        # loops -- they are unsafe to use in a forked child (per ZeroMQ
+        # guide).  We deliberately do NOT call .close() here: SyncWrapper
+        # close() tears down the IOLoop's FDs which were copied from the
+        # parent process state and may corrupt unrelated handlers.  GC
+        # will reclaim child-side FD copies; the parent keeps its own.
+        for inst in list(cls._instances):
+            try:
+                inst._channel = None
+                inst._auth = ""
+            except Exception:  # pylint: disable=broad-except
+                # Never let an at-fork handler raise -- the child would
+                # die before any user code could log the failure.
+                pass
+
+    @property
+    def channel(self):
+        channel = getattr(self, "_channel", None)
+        if channel is None:
+            channel = salt.channel.client.ReqChannel.factory(self.opts)
+            self._channel = channel
+            self._auth = getattr(channel, "auth", "")
+        return channel
+
+    @channel.setter
+    def channel(self, value):
+        self._channel = value
+
+    @property
+    def auth(self):
+        # Reading self.channel triggers lazy reinit if the at-fork handler
+        # cleared it, which keeps _auth consistent with _channel.
+        if getattr(self, "_channel", None) is None and not self._closing:
+            self.channel  # pylint: disable=pointless-statement
+        return getattr(self, "_auth", "")
+
+    @auth.setter
+    def auth(self, value):
+        self._auth = value
 
     def _refresh_channel(self):
         """
         Reset the channel, in the event of an interruption
         """
-        # Close the previous channel
-        self.channel.close()
-        # Instantiate a new one
-        self.channel = salt.channel.client.ReqChannel.factory(self.opts)
+        old_channel = self._channel
+        self._channel = None
+        self._auth = ""
+        if old_channel is not None:
+            try:
+                old_channel.close()
+            except Exception:  # pylint: disable=broad-except
+                log.debug("Error closing channel during refresh", exc_info=True)
         return self.channel
+
+    def _channel_send(self, load, raw=False):
+        start = time.monotonic()
+        try:
+            return self.channel.send(
+                load,
+                raw=raw,
+            )
+        except salt.exceptions.SaltReqTimeoutError:
+            raise SaltClientError(
+                f"File client timed out after {int(time.monotonic() - start)} seconds"
+            )
 
     def destroy(self):
         if self._closing:
             return
 
         self._closing = True
-        channel = None
-        try:
-            channel = self.channel
-        except AttributeError:
-            pass
+        channel = self._channel
+        self._channel = None
         if channel is not None:
-            channel.close()
+            try:
+                channel.close()
+            except AttributeError:
+                pass
 
     def get_file(
         self, path, dest="", makedirs=False, saltenv="base", gzip=None, cachedir=None
@@ -1162,7 +1255,10 @@ class RemoteClient(Client):
         if senv:
             saltenv = senv
 
-        hash_server = self.hash_file(path, saltenv)
+        if not salt.utils.platform.is_windows():
+            hash_server, stat_server = self.hash_and_stat_file(path, saltenv)
+        else:
+            hash_server = self.hash_file(path, saltenv)
 
         # Check if file exists on server, before creating files and
         # directories
@@ -1203,7 +1299,10 @@ class RemoteClient(Client):
         )
 
         if dest2check and os.path.isfile(dest2check):
-            hash_local = self.hash_file(dest2check, saltenv)
+            if not salt.utils.platform.is_windows():
+                hash_local, stat_local = self.hash_and_stat_file(dest2check, saltenv)
+            else:
+                hash_local = self.hash_file(dest2check, saltenv)
 
             if hash_local == hash_server:
                 return dest2check
@@ -1244,7 +1343,10 @@ class RemoteClient(Client):
                 load["loc"] = 0
             else:
                 load["loc"] = fn_.tell()
-            data = self.channel.send(load, raw=True)
+            data = self._channel_send(
+                load,
+                raw=True,
+            )
             # Sometimes the source is local (eg when using
             # 'salt.fileserver.FSChan'), in which case the keys are
             # already strings. Sometimes the source is remote, in which
@@ -1268,7 +1370,7 @@ class RemoteClient(Client):
                         hsum = salt.utils.hashutils.get_hash(
                             dest,
                             salt.utils.stringutils.to_str(
-                                data.get("hash_type", b"md5")
+                                data.get("hash_type", DEFAULT_HASH_TYPE)
                             ),
                         )
                         if hsum != data["hsum"]:
@@ -1337,28 +1439,36 @@ class RemoteClient(Client):
         List the files on the master
         """
         load = {"saltenv": saltenv, "prefix": prefix, "cmd": "_file_list"}
-        return self.channel.send(load)
+        return self._channel_send(
+            load,
+        )
 
     def file_list_emptydirs(self, saltenv="base", prefix=""):
         """
         List the empty dirs on the master
         """
         load = {"saltenv": saltenv, "prefix": prefix, "cmd": "_file_list_emptydirs"}
-        return self.channel.send(load)
+        return self._channel_send(
+            load,
+        )
 
     def dir_list(self, saltenv="base", prefix=""):
         """
         List the dirs on the master
         """
         load = {"saltenv": saltenv, "prefix": prefix, "cmd": "_dir_list"}
-        return self.channel.send(load)
+        return self._channel_send(
+            load,
+        )
 
     def symlink_list(self, saltenv="base", prefix=""):
         """
         List symlinked files and dirs on the master
         """
         load = {"saltenv": saltenv, "prefix": prefix, "cmd": "_symlink_list"}
-        return self.channel.send(load)
+        return self._channel_send(
+            load,
+        )
 
     def __hash_and_stat_file(self, path, saltenv="base"):
         """
@@ -1374,12 +1484,14 @@ class RemoteClient(Client):
                 return {}, None
             else:
                 ret = {}
-                hash_type = self.opts.get("hash_type", "md5")
+                hash_type = self.opts.get("hash_type", DEFAULT_HASH_TYPE)
                 ret["hsum"] = salt.utils.hashutils.get_hash(path, form=hash_type)
                 ret["hash_type"] = hash_type
                 return ret
         load = {"path": path, "saltenv": saltenv, "cmd": "_file_hash"}
-        return self.channel.send(load)
+        return self._channel_send(
+            load,
+        )
 
     def hash_file(self, path, saltenv="base"):
         """
@@ -1406,7 +1518,9 @@ class RemoteClient(Client):
                 except Exception:  # pylint: disable=broad-except
                     return hash_result, None
         load = {"path": path, "saltenv": saltenv, "cmd": "_file_find"}
-        fnd = self.channel.send(load)
+        fnd = self._channel_send(
+            load,
+        )
         try:
             stat_result = fnd.get("stat")
         except AttributeError:
@@ -1418,28 +1532,36 @@ class RemoteClient(Client):
         Return a list of the files in the file server's specified environment
         """
         load = {"saltenv": saltenv, "cmd": "_file_list"}
-        return self.channel.send(load)
+        return self._channel_send(
+            load,
+        )
 
     def envs(self):
         """
         Return a list of available environments
         """
         load = {"cmd": "_file_envs"}
-        return self.channel.send(load)
+        return self._channel_send(
+            load,
+        )
 
     def master_opts(self):
         """
         Return the master opts data
         """
         load = {"cmd": "_master_opts"}
-        return self.channel.send(load)
+        return self._channel_send(
+            load,
+        )
 
     def master_tops(self):
         """
         Return the metadata derived from the master_tops system
         """
         load = {"cmd": "_master_tops", "id": self.opts["id"], "opts": self.opts}
-        return self.channel.send(load)
+        return self._channel_send(
+            load,
+        )
 
     def __enter__(self):
         return self
@@ -1457,8 +1579,30 @@ class FSClient(RemoteClient):
     def __init__(self, opts):  # pylint: disable=W0231
         Client.__init__(self, opts)  # pylint: disable=W0233
         self._closing = False
-        self.channel = salt.fileserver.FSChan(opts)
-        self.auth = DumbAuth()
+        self._channel = salt.fileserver.FSChan(opts)
+        self._auth = DumbAuth()
+        # Deliberately not added to RemoteClient._instances: FSChan is an
+        # in-process file server, not a ZMQ socket, and the at-fork handler
+        # would otherwise wipe self._channel and the channel property below
+        # would lazily rebuild it as a remote ReqChannel.
+
+    @property
+    def channel(self):
+        # FSChan has no fork hazard and we never want to silently swap it
+        # for a remote ReqChannel via the parent's lazy-rebuild path.
+        return self._channel
+
+    @channel.setter
+    def channel(self, value):
+        self._channel = value
+
+    @property
+    def auth(self):
+        return self._auth
+
+    @auth.setter
+    def auth(self, value):
+        self._auth = value
 
 
 # Provide backward compatibility for anyone directly using LocalClient (but no
@@ -1474,3 +1618,17 @@ class DumbAuth:
 
     def gen_token(self, clear_tok):
         return clear_tok
+
+
+class ContextlessFileClient:
+    def __init__(self, file_client):
+        self.file_client = file_client
+
+    def __getattr__(self, key):
+        return getattr(self.file_client, key)
+
+    def __exit__(self, *_):
+        pass
+
+    def __enter__(self):
+        return self

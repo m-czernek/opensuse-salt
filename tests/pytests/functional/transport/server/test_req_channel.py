@@ -9,10 +9,8 @@ import salt.channel.client
 import salt.channel.server
 import salt.config
 import salt.exceptions
-import tornado.gen
+import salt.ext.tornado.gen
 import salt.master
-import salt.transport.client
-import salt.transport.server
 import salt.utils.platform
 import salt.utils.process
 import salt.utils.stringutils
@@ -25,10 +23,15 @@ pytestmark = [
         reason="These tests are currently broken on spawning platforms. Need to be rewritten.",
     ),
     pytest.mark.slow_test,
+    pytest.mark.skipif(
+        "grains['osfinger'] == 'Rocky Linux-8' and grains['osarch'] == 'aarch64'",
+        reason="Temporarily skip on Rocky Linux 8 Arm64",
+    ),
 ]
 
 
 class ReqServerChannelProcess(salt.utils.process.SignalHandlingProcess):
+
     def __init__(self, config, req_channel_crypt):
         super().__init__()
         self._closing = False
@@ -57,14 +60,16 @@ class ReqServerChannelProcess(salt.utils.process.SignalHandlingProcess):
             ),
         }
 
-        self.io_loop = tornado.ioloop.IOLoop()
+        self.io_loop = salt.ext.tornado.ioloop.IOLoop()
         self.io_loop.make_current()
         self.req_server_channel.post_fork(self._handle_payload, io_loop=self.io_loop)
         self.io_loop.add_callback(self.running.set)
         try:
             self.io_loop.start()
-        except KeyboardInterrupt:
+        except (KeyboardInterrupt, SystemExit):
             pass
+        finally:
+            self.req_server.close()
 
     def _handle_signals(self, signum, sigframe):
         self.close()
@@ -93,17 +98,17 @@ class ReqServerChannelProcess(salt.utils.process.SignalHandlingProcess):
                 terminate_process(pid=pid, kill_children=True, slow_stop=False)
             self.process_manager = None
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def _handle_payload(self, payload):
         if self.req_channel_crypt == "clear":
-            raise tornado.gen.Return((payload, {"fun": "send_clear"}))
+            raise salt.ext.tornado.gen.Return((payload, {"fun": "send_clear"}))
         for key in (
             "id",
             "ts",
             "tok",
         ):
             payload["load"].pop(key, None)
-        raise tornado.gen.Return((payload, {"fun": "send"}))
+        raise salt.ext.tornado.gen.Return((payload, {"fun": "send"}))
 
 
 @pytest.fixture
@@ -121,7 +126,7 @@ def req_server_channel(salt_master, req_channel_crypt):
 
 
 def req_channel_crypt_ids(value):
-    return "ReqChannel(crypt='{}')".format(value)
+    return f"ReqChannel(crypt='{value}')"
 
 
 @pytest.fixture(params=["clear", "aes"], ids=req_channel_crypt_ids)
@@ -130,7 +135,7 @@ def req_channel_crypt(request):
 
 
 @pytest.fixture
-def req_channel(req_server_channel, salt_minion, req_channel_crypt):
+def push_channel(req_server_channel, salt_minion, req_channel_crypt):
     with salt.channel.client.ReqChannel.factory(
         salt_minion.config, crypt=req_channel_crypt
     ) as _req_channel:
@@ -141,7 +146,7 @@ def req_channel(req_server_channel, salt_minion, req_channel_crypt):
             _req_channel.obj._refcount = 0
 
 
-def test_basic(req_channel):
+def test_basic(push_channel):
     """
     Test a variety of messages, make sure we get the expected responses
     """
@@ -151,11 +156,11 @@ def test_basic(req_channel):
         {"baz": "qux", "list": [1, 2, 3]},
     ]
     for msg in msgs:
-        ret = req_channel.send(dict(msg), timeout=5, tries=1)
+        ret = push_channel.send(dict(msg), timeout=5, tries=1)
         assert ret["load"] == msg
 
 
-def test_normalization(req_channel):
+def test_normalization(push_channel):
     """
     Since we use msgpack, we need to test that list types are converted to lists
     """
@@ -166,21 +171,21 @@ def test_normalization(req_channel):
         {"list": tuple([1, 2, 3])},
     ]
     for msg in msgs:
-        ret = req_channel.send(msg, timeout=5, tries=1)
+        ret = push_channel.send(msg, timeout=5, tries=1)
         for key, value in ret["load"].items():
             assert types[key] == type(value)
 
 
-def test_badload(req_channel, req_channel_crypt):
+def test_badload(push_channel, req_channel_crypt):
     """
     Test a variety of bad requests, make sure that we get some sort of error
     """
     msgs = ["", [], tuple()]
     if req_channel_crypt == "clear":
         for msg in msgs:
-            ret = req_channel.send(msg, timeout=5, tries=1)
+            ret = push_channel.send(msg, timeout=5, tries=1)
             assert ret == "payload and load must be a dict"
     else:
         for msg in msgs:
             with pytest.raises(salt.exceptions.AuthenticationError):
-                req_channel.send(msg, timeout=5, tries=1)
+                push_channel.send(msg, timeout=5, tries=1)

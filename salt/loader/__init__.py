@@ -9,9 +9,9 @@ import inspect
 import logging
 import os
 import re
-import threading
 import time
 import types
+from collections import OrderedDict
 
 import salt.config
 import salt.defaults.events
@@ -21,18 +21,16 @@ import salt.syspaths
 import salt.utils.context
 import salt.utils.data
 import salt.utils.dictupdate
-import salt.utils.event
 import salt.utils.files
 import salt.utils.lazy
-import salt.utils.odict
 import salt.utils.platform
 import salt.utils.stringutils
 import salt.utils.versions
-from salt.exceptions import LoaderError
+from salt.exceptions import LoaderError, SaltDeserializationError
 from salt.template import check_render_pipe_str
 from salt.utils import entrypoints
 
-from .lazy import SALT_BASE_PATH, FilterDictWrapper, LazyLoader as _LazyLoader
+from .lazy import SALT_BASE_PATH, FilterDictWrapper, LazyLoader
 
 log = logging.getLogger(__name__)
 
@@ -81,18 +79,6 @@ SALT_INTERNAL_LOADERS_PATHS = (
     str(SALT_BASE_PATH / "utils"),
     str(SALT_BASE_PATH / "wheel"),
 )
-
-LOAD_LOCK = threading.RLock()
-
-
-def LazyLoader(*args, **kwargs):
-    # This wrapper is used to prevent deadlocks with importlib (bsc#1182851)
-    # LOAD_LOCK is also used directly in salt.client.ssh.SSH
-    try:
-        LOAD_LOCK.acquire()
-        return _LazyLoader(*args, **kwargs)
-    finally:
-        LOAD_LOCK.release()
 
 
 def static_loader(
@@ -143,23 +129,24 @@ def _module_dirs(
 ):
     if tag is None:
         tag = ext_type
-    sys_types = os.path.join(base_path or str(SALT_BASE_PATH), int_type or ext_type)
-    return_types = [sys_types]
-    if opts.get("extension_modules"):
-        ext_types = os.path.join(opts["extension_modules"], ext_type)
-        return_types.insert(0, ext_types)
+    sys_types = [os.path.join(base_path or str(SALT_BASE_PATH), int_type or ext_type)]
 
-    if not sys_types.startswith(SALT_INTERNAL_LOADERS_PATHS):
+    if opts.get("extension_modules"):
+        ext_types = [os.path.join(opts["extension_modules"], ext_type)]
+    else:
+        ext_types = []
+
+    if not sys_types[0].startswith(SALT_INTERNAL_LOADERS_PATHS):
         raise RuntimeError(
             "{!r} is not considered a salt internal loader path. If this "
             "is a new loader being added, please also add it to "
-            "{}.SALT_INTERNAL_LOADERS_PATHS.".format(sys_types, __name__)
+            "{}.SALT_INTERNAL_LOADERS_PATHS.".format(sys_types[0], __name__)
         )
 
     ext_type_types = []
     if ext_dirs:
         if ext_type_dirs is None:
-            ext_type_dirs = "{}_dirs".format(tag)
+            ext_type_dirs = f"{tag}_dirs"
         if ext_type_dirs in opts:
             ext_type_types.extend(opts[ext_type_dirs])
         if ext_type_dirs and load_extensions is True:
@@ -259,11 +246,21 @@ def _module_dirs(
             cli_module_dirs.insert(0, maybe_dir)
             continue
 
-        maybe_dir = os.path.join(_dir, "_{}".format(ext_type))
+        maybe_dir = os.path.join(_dir, f"_{ext_type}")
         if os.path.isdir(maybe_dir):
             cli_module_dirs.insert(0, maybe_dir)
 
-    return cli_module_dirs + ext_type_types + return_types
+    if opts.get("features", {}).get(
+        "enable_deprecated_module_search_path_priority", False
+    ):
+        salt.utils.versions.warn_until(
+            3008,
+            "The old module search path priority will be removed in Salt 3008. "
+            "For more information see https://github.com/saltstack/salt/pull/65938.",
+        )
+        return cli_module_dirs + ext_type_types + ext_types + sys_types
+    else:
+        return cli_module_dirs + ext_types + ext_type_types + sys_types
 
 
 def minion_mods(
@@ -276,6 +273,7 @@ def minion_mods(
     notify=False,
     static_modules=None,
     proxy=None,
+    file_client=None,
 ):
     """
     Load execution modules
@@ -327,6 +325,7 @@ def minion_mods(
             "__utils__": utils,
             "__proxy__": proxy,
             "__opts__": opts,
+            "__file_client__": file_client,
         },
         whitelist=whitelist,
         loaded_base_name=loaded_base_name,
@@ -334,6 +333,10 @@ def minion_mods(
         extra_module_dirs=utils.module_dirs if utils else None,
         pack_self="__salt__",
     )
+
+    # Allow the usage of salt dunder in utils modules.
+    if utils and isinstance(utils, LazyLoader):
+        utils.pack["__salt__"] = ret
 
     # Load any provider overrides from the configuration file providers option
     #  Note: Providers can be pkg, service, user or group - not to be confused
@@ -354,6 +357,8 @@ def minion_mods(
                         ret[f_key] = funcs[func]
 
     if notify:
+        import salt.utils.event
+
         with salt.utils.event.get_event("minion", opts=opts, listen=False) as evt:
             evt.fire_event(
                 {"complete": True}, tag=salt.defaults.events.MINION_MOD_REFRESH_COMPLETE
@@ -530,6 +535,7 @@ def utils(
     whitelist=None,
     context=None,
     proxy=None,
+    file_client=None,
     pack_self=None,
     loaded_base_name=None,
 ):
@@ -549,7 +555,11 @@ def utils(
         opts,
         tag="utils",
         whitelist=whitelist,
-        pack={"__context__": context, "__proxy__": proxy or {}},
+        pack={
+            "__context__": context,
+            "__proxy__": proxy or {},
+            "__file_client__": file_client,
+        },
         pack_self=pack_self,
         loaded_base_name=loaded_base_name,
         _only_pack_properly_namespaced_functions=False,
@@ -738,7 +748,7 @@ def fileserver(opts, backends, loaded_base_name=None):
     )
 
 
-def roster(opts, runner=None, utils=None, whitelist=None, loaded_base_name=None, context=None):
+def roster(opts, runner=None, utils=None, whitelist=None, loaded_base_name=None):
     """
     Returns the roster modules
 
@@ -749,20 +759,12 @@ def roster(opts, runner=None, utils=None, whitelist=None, loaded_base_name=None,
     :param str loaded_base_name: The imported modules namespace when imported
                                  by the salt loader.
     """
-    if context is None:
-        context = {}
-
     return LazyLoader(
         _module_dirs(opts, "roster"),
         opts,
         tag="roster",
         whitelist=whitelist,
-        pack={
-            "__runner__": runner,
-            "__utils__": utils,
-            "__context__": context,
-            "__opts__": opts,
-        },
+        pack={"__runner__": runner, "__utils__": utils},
         extra_module_dirs=utils.module_dirs if utils else None,
         loaded_base_name=loaded_base_name,
     )
@@ -799,6 +801,7 @@ def states(
     proxy=None,
     context=None,
     loaded_base_name=None,
+    file_client=None,
 ):
     """
     Returns the state modules
@@ -836,6 +839,7 @@ def states(
             "__utils__": utils,
             "__serializers__": serializers,
             "__context__": context,
+            "__file_client__": file_client,
         },
         whitelist=whitelist,
         extra_module_dirs=utils.module_dirs if utils else None,
@@ -886,7 +890,9 @@ def log_handlers(opts, loaded_base_name=None):
     return FilterDictWrapper(ret, ".setup_handlers")
 
 
-def ssh_wrapper(opts, functions=None, context=None, loaded_base_name=None):
+def ssh_wrapper(
+    opts, functions=None, context=None, file_client=None, loaded_base_name=None
+):
     """
     Returns the custom logging handler modules
 
@@ -904,13 +910,23 @@ def ssh_wrapper(opts, functions=None, context=None, loaded_base_name=None):
         ),
         opts,
         tag="wrapper",
-        pack={"__salt__": functions, "__context__": context},
+        pack={
+            "__salt__": functions,
+            "__context__": context,
+            "__file_client__": file_client,
+        },
         loaded_base_name=loaded_base_name,
     )
 
 
 def render(
-    opts, functions, states=None, proxy=None, context=None, loaded_base_name=None
+    opts,
+    functions,
+    states=None,
+    proxy=None,
+    context=None,
+    file_client=None,
+    loaded_base_name=None,
 ):
     """
     Returns the render modules
@@ -931,6 +947,7 @@ def render(
         "__salt__": functions,
         "__grains__": opts.get("grains", {}),
         "__context__": context,
+        "__file_client__": file_client,
     }
 
     if states:
@@ -954,14 +971,7 @@ def render(
     )
     rend = FilterDictWrapper(ret, ".render")
 
-    def _check_render_pipe_str(pipestr, renderers, blacklist, whitelist):
-        try:
-            LOAD_LOCK.acquire()
-            return check_render_pipe_str(pipestr, renderers, blacklist, whitelist)
-        finally:
-            LOAD_LOCK.release()
-
-    if not _check_render_pipe_str(
+    if not check_render_pipe_str(
         opts["renderer"], rend, opts["renderer_blacklist"], opts["renderer_whitelist"]
     ):
         err = (
@@ -1057,7 +1067,7 @@ def _load_cached_grains(opts, cfn):
             return None
 
         return _format_cached_grains(cached_grains)
-    except OSError:
+    except (OSError, SaltDeserializationError):
         return None
 
 
@@ -1179,7 +1189,8 @@ def grains(opts, force_refresh=False, proxy=None, context=None, loaded_base_name
         except Exception:  # pylint: disable=broad-except
             if salt.utils.platform.is_proxy():
                 log.info(
-                    "The following CRITICAL message may not be an error; the proxy may not be completely established yet."
+                    "The following CRITICAL message may not be an error; "
+                    "the proxy may not be completely established yet."
                 )
             log.critical(
                 "Failed to load grains defined in grain file %s in "
@@ -1236,7 +1247,7 @@ def grains(opts, force_refresh=False, proxy=None, context=None, loaded_base_name
                     import salt.modules.cmdmod
 
                     # Make sure cache file isn't read-only
-                    salt.modules.cmdmod._run_quiet('attrib -R "{}"'.format(cfn))
+                    salt.modules.cmdmod._run_quiet(f'attrib -R "{cfn}"')
                 with salt.utils.files.fopen(cfn, "w+b") as fp_:
                     try:
                         salt.payload.dump(grains_data, fp_)
@@ -1256,6 +1267,10 @@ def grains(opts, force_refresh=False, proxy=None, context=None, loaded_base_name
         salt.utils.dictupdate.update(grains_data, opts["grains"])
     else:
         grains_data.update(opts["grains"])
+
+    # Clean up loaded grains modules from sys.modules to free memory
+    funcs.clean_modules()
+
     return salt.utils.data.decode(grains_data, preserve_tuples=True)
 
 

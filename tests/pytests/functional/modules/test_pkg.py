@@ -1,8 +1,8 @@
 import configparser
 import logging
 import os
+import re
 import shutil
-import tempfile
 import time
 
 import pytest
@@ -14,6 +14,10 @@ import salt.utils.platform
 
 log = logging.getLogger(__name__)
 
+pytestmark = [
+    pytest.mark.timeout_unless_on_windows(240),
+]
+
 
 @pytest.fixture
 def ctx():
@@ -21,25 +25,24 @@ def ctx():
 
 
 @pytest.fixture
-def preserve_rhel_yum_conf():
+def _preserve_rhel_yum_conf(tmp_path):
 
     # save off current yum.conf
     cfg_file = "/etc/yum.conf"
     if not os.path.exists(cfg_file):
         pytest.skip("Only runs on RedHat.")
 
-    tmp_dir = str(tempfile.gettempdir())
-    tmp_file = os.path.join(tmp_dir, "yum.conf")
+    tmp_file = tmp_path / "yum.conf"
     shutil.copy2(cfg_file, tmp_file)
-    yield
-
-    # restore saved yum.conf
-    shutil.copy2(tmp_file, cfg_file)
-    os.remove(tmp_file)
+    try:
+        yield
+    finally:
+        # restore saved yum.conf
+        shutil.copy2(tmp_file, cfg_file)
 
 
 @pytest.fixture
-def refresh_db(ctx, grains, modules):
+def _refresh_db(ctx, grains, modules):
     if "refresh" not in ctx:
         modules.pkg.refresh_db()
         ctx["refresh"] = True
@@ -62,19 +65,20 @@ def test_pkg(grains):
         _pkg = "putty"
     elif grains["os_family"] == "RedHat":
         if grains["os"] == "VMware Photon OS":
-            _pkg = "snoopy"
+            _pkg = "bc"
+        elif grains["osfinger"] == "Amazon Linux-2023":
+            return "dnf-utils"
         else:
             _pkg = "units"
     elif grains["os_family"] == "Debian":
         _pkg = "ifenslave"
-    elif grains["os_family"] == "Suse":
-        _pkg = "wget"
     return _pkg
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.requires_salt_modules("pkg.list_pkgs")
 @pytest.mark.slow_test
-def test_list(modules, refresh_db):
+def test_list(modules):
     """
     verify that packages are installed
     """
@@ -106,11 +110,12 @@ def test_version_cmp(grains, modules):
     assert modules.pkg.version_cmp(*gt) == 1
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.destructive_test
 @pytest.mark.requires_salt_modules("pkg.mod_repo", "pkg.del_repo", "pkg.get_repo")
 @pytest.mark.slow_test
 @pytest.mark.requires_network
-def test_mod_del_repo(grains, modules, refresh_db):
+def test_mod_del_repo(grains, modules):
     """
     test modifying and deleting a software repository
     """
@@ -127,7 +132,7 @@ def test_mod_del_repo(grains, modules, refresh_db):
 
             assert isinstance(ret, dict) is True
             assert ret["uri"] == uri
-        elif grains["os_family"] == "RedHat":
+        elif grains["os_family"] in ("RedHat", "Photon"):
             repo = "saltstack"
             name = "SaltStack repo for RHEL/CentOS {}".format(grains["osmajorrelease"])
             baseurl = "https://packages.broadcom.com/artifactory/saltproject-rpm/"
@@ -156,7 +161,8 @@ def test_mod_del_repo(grains, modules, refresh_db):
 
 
 @pytest.mark.slow_test
-def test_mod_del_repo_multiline_values(modules, refresh_db):
+@pytest.mark.usefixtures("_refresh_db")
+def test_mod_del_repo_multiline_values(modules):
     """
     test modifying and deleting a software repository defined with multiline values
     """
@@ -170,7 +176,6 @@ def test_mod_del_repo_multiline_values(modules, refresh_db):
             expected_get_repo_baseurl = (
                 "http://my.fake.repo/foo/bar/\nhttp://my.fake.repo.alt/foo/bar/"
             )
-            major_release = int(modules.grains.item("osmajorrelease")["osmajorrelease"])
             repo = "fakerepo"
             name = "Fake repo for RHEL/CentOS/SUSE"
             baseurl = my_baseurl
@@ -211,6 +216,8 @@ def test_owner(modules, grains):
     binary = "/bin/ls"
     if grains["os"] == "Ubuntu" and grains["osmajorrelease"] >= 24:
         binary = "/usr/bin/ls"
+    if grains["os"] == "Debian" and grains["osmajorrelease"] >= 13:
+        binary = "/usr/bin/ls"
 
     ret = modules.pkg.owner(binary)
     assert len(ret) != 0
@@ -219,28 +226,23 @@ def test_owner(modules, grains):
 # Similar to pkg.owner, but for FreeBSD's pkgng
 @pytest.mark.skip_on_freebsd(reason="test for new package manager for FreeBSD")
 @pytest.mark.requires_salt_modules("pkg.which")
-def test_which(grains, modules):
+def test_which(modules, grains):
     """
     test finding the package owning a file
     """
     binary = "/bin/ls"
     if grains["os"] == "Ubuntu" and grains["osmajorrelease"] >= 24:
         binary = "/usr/bin/ls"
-    elif grains["os"] == "Debian" and grains["osmajorrelease"] >= 13:
-        binary = "/usr/bin/ls"
     ret = modules.pkg.which(binary)
     assert len(ret) != 0
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.destructive_test
 @pytest.mark.requires_salt_modules("pkg.version", "pkg.install", "pkg.remove")
 @pytest.mark.slow_test
 @pytest.mark.requires_network
-@pytest.mark.skipif(
-    bool(salt.utils.path.which("transactional-update")),
-    reason="Skipping on transactional systems",
-)
-def test_install_remove(modules, test_pkg, refresh_db):
+def test_install_remove(modules, test_pkg):
     """
     successfully install and uninstall a package
     """
@@ -265,6 +267,7 @@ def test_install_remove(modules, test_pkg, refresh_db):
         test_remove()
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.destructive_test
 @pytest.mark.skip_on_photonos(
     reason="package hold/unhold unsupported on Photon OS",
@@ -280,11 +283,7 @@ def test_install_remove(modules, test_pkg, refresh_db):
 @pytest.mark.slow_test
 @pytest.mark.requires_network
 @pytest.mark.requires_salt_states("pkg.installed")
-@pytest.mark.skipif(
-    bool(salt.utils.path.which("transactional-update")),
-    reason="Skipping on transactional systems",
-)
-def test_hold_unhold(grains, modules, states, test_pkg, refresh_db):
+def test_hold_unhold(grains, modules, states, test_pkg):
     """
     test holding and unholding a package
     """
@@ -302,14 +301,14 @@ def test_hold_unhold(grains, modules, states, test_pkg, refresh_db):
             except AssertionError:
                 pass
         else:
-            pytest.fail("Could not install versionlock package from {}".format(pkgs))
+            pytest.fail(f"Could not install versionlock package from {pkgs}")
 
     modules.pkg.install(test_pkg)
 
     try:
         hold_ret = modules.pkg.hold(test_pkg)
         if versionlock_pkg and "-versionlock is not installed" in str(hold_ret):
-            pytest.skip("{}  `{}` is installed".format(hold_ret, versionlock_pkg))
+            pytest.skip(f"{hold_ret}  `{versionlock_pkg}` is installed")
         assert test_pkg in hold_ret
         assert hold_ret[test_pkg]["result"] is True
 
@@ -326,11 +325,12 @@ def test_hold_unhold(grains, modules, states, test_pkg, refresh_db):
             assert ret.result is True
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.destructive_test
 @pytest.mark.requires_salt_modules("pkg.refresh_db")
 @pytest.mark.slow_test
 @pytest.mark.requires_network
-def test_refresh_db(grains, tmp_path, minion_opts, refresh_db):
+def test_refresh_db(grains, minion_opts):
     """
     test refreshing the package database
     """
@@ -341,7 +341,7 @@ def test_refresh_db(grains, tmp_path, minion_opts, refresh_db):
     loader = Loaders(minion_opts)
     ret = loader.modules.pkg.refresh_db()
     if not isinstance(ret, dict):
-        pytest.skip("Upstream repo did not return coherent results: {}".format(ret))
+        pytest.skip(f"Upstream repo did not return coherent results: {ret}")
 
     if grains["os_family"] == "RedHat":
         assert ret in (True, None)
@@ -355,9 +355,10 @@ def test_refresh_db(grains, tmp_path, minion_opts, refresh_db):
     assert os.path.isfile(rtag) is False
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.requires_salt_modules("pkg.info_installed")
 @pytest.mark.slow_test
-def test_pkg_info(grains, modules, test_pkg, refresh_db):
+def test_pkg_info(grains, modules, test_pkg):
     """
     Test returning useful information on Ubuntu systems.
     """
@@ -367,10 +368,16 @@ def test_pkg_info(grains, modules, test_pkg, refresh_db):
         assert "bash" in keys
         assert "dpkg" in keys
     elif grains["os_family"] == "RedHat":
-        ret = modules.pkg.info_installed("rpm", "bash")
-        keys = ret.keys()
-        assert "rpm" in keys
-        assert "bash" in keys
+        if grains["os"] == "VMware Photon OS":
+            ret = modules.pkg.info_installed("tdnf", "bash")
+            keys = ret.keys()
+            assert "tdnf" in keys
+            assert "bash" in keys
+        else:
+            ret = modules.pkg.info_installed("rpm", "bash")
+            keys = ret.keys()
+            assert "rpm" in keys
+            assert "bash" in keys
     elif grains["os_family"] == "Suse":
         ret = modules.pkg.info_installed("less", "zypper")
         keys = ret.keys()
@@ -382,6 +389,7 @@ def test_pkg_info(grains, modules, test_pkg, refresh_db):
         assert test_pkg in keys
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.skipif(True, reason="Temporary Skip - Causes centos 8 test to fail")
 @pytest.mark.destructive_test
 @pytest.mark.requires_salt_modules(
@@ -393,12 +401,12 @@ def test_pkg_info(grains, modules, test_pkg, refresh_db):
 )
 @pytest.mark.slow_test
 @pytest.mark.requires_network
-def test_pkg_upgrade_has_pending_upgrades(grains, modules, test_pkg, refresh_db):
+def test_pkg_upgrade_has_pending_upgrades(grains, modules):
     """
     Test running a system upgrade when there are packages that need upgrading
     """
     if grains["os"] == "Arch":
-        pytest.skipTest("Arch moved to Python 3.8 and we're not ready for it yet")
+        pytest.skip("Arch moved to Python 3.8 and we're not ready for it yet")
 
     modules.pkg.upgrade()
 
@@ -436,9 +444,7 @@ def test_pkg_upgrade_has_pending_upgrades(grains, modules, test_pkg, refresh_db)
         ret = modules.pkg.install(target, version=old)
         if not isinstance(ret, dict):
             if ret.startswith("ERROR"):
-                pytest.skipTest(
-                    "Could not install older {} to complete test.".format(target)
-                )
+                pytest.skip(f"Could not install older {target} to complete test.")
 
         # Run a system upgrade, which should catch the fact that the
         # targeted package needs upgrading, and upgrade it.
@@ -452,7 +458,7 @@ def test_pkg_upgrade_has_pending_upgrades(grains, modules, test_pkg, refresh_db)
     else:
         ret = modules.pkg.list_upgrades()
         if ret == "" or ret == {}:
-            pytest.skipTest(
+            pytest.skip(
                 "No updates available for this machine.  Skipping pkg.upgrade test."
             )
         else:
@@ -463,6 +469,7 @@ def test_pkg_upgrade_has_pending_upgrades(grains, modules, test_pkg, refresh_db)
             assert ret != {}
 
 
+@pytest.mark.usefixtures("_refresh_db")
 @pytest.mark.destructive_test
 @pytest.mark.skip_on_darwin(
     reason="The jenkins user is equivalent to root on mac, causing the test to be unrunnable"
@@ -470,7 +477,7 @@ def test_pkg_upgrade_has_pending_upgrades(grains, modules, test_pkg, refresh_db)
 @pytest.mark.requires_salt_modules("pkg.remove", "pkg.latest_version")
 @pytest.mark.slow_test
 @pytest.mark.requires_salt_states("pkg.removed")
-def test_pkg_latest_version(grains, modules, states, test_pkg, refresh_db):
+def test_pkg_latest_version(grains, modules, states, test_pkg):
     """
     Check that pkg.latest_version returns the latest version of the uninstalled package.
     The package is not installed. Only the package version is checked.
@@ -479,19 +486,17 @@ def test_pkg_latest_version(grains, modules, states, test_pkg, refresh_db):
 
     cmd_pkg = []
     if grains["os_family"] == "RedHat":
-        cmd_pkg = modules.cmd.run("yum list {}".format(test_pkg))
+        cmd_pkg = modules.cmd.run(f"yum list {test_pkg}")
     elif salt.utils.platform.is_windows():
         cmd_pkg = modules.pkg.list_available(test_pkg)
     elif grains["os_family"] == "Debian":
-        cmd_pkg = modules.cmd.run("apt list {}".format(test_pkg))
+        cmd_pkg = modules.cmd.run(f"apt list {test_pkg}")
     elif grains["os_family"] == "Arch":
-        cmd_pkg = modules.cmd.run("pacman -Si {}".format(test_pkg))
+        cmd_pkg = modules.cmd.run(f"pacman -Si {test_pkg}")
     elif grains["os_family"] == "FreeBSD":
-        cmd_pkg = modules.cmd.run(
-            "pkg search -S name -qQ version -e {}".format(test_pkg)
-        )
+        cmd_pkg = modules.cmd.run(f"pkg search -S name -qQ version -e {test_pkg}")
     elif grains["os_family"] == "Suse":
-        cmd_pkg = modules.cmd.run("zypper info {}".format(test_pkg))
+        cmd_pkg = modules.cmd.run(f"zypper info {test_pkg}")
     elif grains["os_family"] == "MacOS":
         brew_bin = salt.utils.path.which("brew")
         mac_user = modules.file.get_user(brew_bin)
@@ -501,17 +506,18 @@ def test_pkg_latest_version(grains, modules, states, test_pkg, refresh_db):
                     os.listdir("/Users/")
                 )
             )
-        cmd_pkg = modules.cmd.run("brew info {}".format(test_pkg), run_as=mac_user)
+        cmd_pkg = modules.cmd.run(f"brew info {test_pkg}", run_as=mac_user)
     else:
         pytest.skip("TODO: test not configured for {}".format(grains["os_family"]))
     pkg_latest = modules.pkg.latest_version(test_pkg)
     assert pkg_latest in cmd_pkg
 
 
+@pytest.mark.usefixtures("_preserve_rhel_yum_conf")
 @pytest.mark.destructive_test
 @pytest.mark.requires_salt_modules("pkg.list_repos")
 @pytest.mark.slow_test
-def test_list_repos_duplicate_entries(preserve_rhel_yum_conf, grains, modules):
+def test_list_repos_duplicate_entries(grains, modules):
     """
     test duplicate entries in /etc/yum.conf
 
@@ -542,10 +548,39 @@ def test_list_repos_duplicate_entries(preserve_rhel_yum_conf, grains, modules):
     # test explicitly strict_config
     expected = "While reading from '/etc/yum.conf' [line  8]: option 'http_caching' in section 'main' already exists"
     with pytest.raises(configparser.DuplicateOptionError) as exc_info:
-        result = modules.pkg.list_repos(strict_config=True)
-    assert "{}".format(exc_info.value) == expected
+        modules.pkg.list_repos(strict_config=True)
+    assert str(exc_info.value) == expected
 
     # test implicitly strict_config
     with pytest.raises(configparser.DuplicateOptionError) as exc_info:
-        result = modules.pkg.list_repos()
-    assert "{}".format(exc_info.value) == expected
+        modules.pkg.list_repos()
+    assert str(exc_info.value) == expected
+
+
+@pytest.mark.destructive_test
+@pytest.mark.slow_test
+def test_pkg_install_port(grains, modules):
+    """
+    test install package with a port in the url
+    """
+    pkgs = modules.pkg.list_pkgs()
+    nano = pkgs.get("nano")
+    if nano:
+        modules.pkg.remove("nano")
+
+    if grains["os_family"] == "Debian":
+        url = modules.cmd.run("apt download --print-uris nano").split()[-4]
+        if url.startswith("'mirror+file"):
+            url = "http://ftp.debian.org/debian/pool/" + url.split("pool")[1].rstrip(
+                "'"
+            )
+        try:
+            ret = modules.pkg.install(sources=f'[{{"nano":{url}}}]')
+            version = re.compile(r"\d\.\d")
+            assert version.search(url).group(0) in ret["nano"]["new"]
+        finally:
+            modules.pkg.remove("nano")
+            if nano:
+                # If nano existed on the machine before the test ran
+                # re-install that version
+                modules.pkg.install(f"nano={nano}")

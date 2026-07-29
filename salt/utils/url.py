@@ -2,10 +2,9 @@
 URL utils
 """
 
-
 import re
 import sys
-from urllib.parse import urlparse, urlunparse, urlunsplit
+from urllib.parse import quote, urlparse, urlunparse, urlunsplit
 
 import salt.utils.data
 import salt.utils.path
@@ -46,7 +45,7 @@ def create(path, saltenv=None):
         path = salt.utils.path.sanitize_win_path(path)
     path = salt.utils.data.decode(path)
 
-    query = "saltenv={}".format(saltenv) if saltenv else ""
+    query = f"saltenv={saltenv}" if saltenv else ""
     return f'salt://{salt.utils.data.decode(urlunsplit(("", "", path, query, "")))}'
 
 
@@ -79,13 +78,13 @@ def escape(url):
         if url.startswith("|"):
             return url
         else:
-            return "|{}".format(url)
+            return f"|{url}"
     elif scheme == "salt":
         path, saltenv = parse(url)
         if path.startswith("|"):
             return create(path, saltenv)
         else:
-            return create("|{}".format(path), saltenv)
+            return create(f"|{path}", saltenv)
     else:
         return url
 
@@ -156,12 +155,16 @@ def add_http_basic_auth(url, user=None, password=None, https_only=False):
         urltuple = urlparse(url)
         if https_only and urltuple.scheme != "https":
             raise ValueError("Basic Auth only supported for HTTPS")
+        # Percent-encode the userinfo so reserved characters (e.g. "/", "@",
+        # ":") in the user or password do not corrupt the resulting URL.
         if password is None:
-            netloc = "{}@{}".format(user, urltuple.netloc)
+            netloc = f"{quote(user, safe='')}@{urltuple.netloc}"
             urltuple = urltuple._replace(netloc=netloc)
             return urlunparse(urltuple)
         else:
-            netloc = "{}:{}@{}".format(user, password, urltuple.netloc)
+            netloc = (
+                f"{quote(user, safe='')}:{quote(password, safe='')}@{urltuple.netloc}"
+            )
             urltuple = urltuple._replace(netloc=netloc)
             return urlunparse(urltuple)
 

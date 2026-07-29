@@ -16,8 +16,10 @@ import stat
 import sys
 import tempfile
 
+import salt.utils.files
 import salt.utils.path
 import salt.utils.platform
+import salt.utils.user
 from salt.exceptions import CommandExecutionError, SaltInvocationError
 from salt.modules.file import (
     __clean_tmp,
@@ -107,6 +109,15 @@ try:
 except ImportError:
     HAS_WINDOWS_MODULES = False
 
+HAS_WIN_DACL = False
+try:
+    if salt.utils.platform.is_windows():
+        import salt.utils.win_dacl
+
+        HAS_WIN_DACL = True
+except ImportError:
+    HAS_WIN_DACL = False
+
 if salt.utils.platform.is_windows():
     if HAS_WINDOWS_MODULES:
         # namespace functions from file.py
@@ -194,6 +205,8 @@ def __virtual__():
     """
     if not salt.utils.platform.is_windows() or not HAS_WINDOWS_MODULES:
         return False, "Module win_file: Missing Win32 modules"
+    if not HAS_WIN_DACL:
+        return False, "Module win_file: Unable to load salt.utils.win_dacl"
     return __virtualname__
 
 
@@ -248,6 +261,7 @@ def gid_to_group(gid):
     directly.
 
     Args:
+
         gid (str): The gid of the group
 
     Returns:
@@ -257,16 +271,14 @@ def gid_to_group(gid):
 
     .. code-block:: bash
 
-        salt '*' file.gid_to_group S-1-5-21-626487655-2533044672-482107328-1010
+        salt '*' file.gid_to_group 'S-1-5-21-626487655-2533044672-482107328-1010'
     """
-    func_name = "{}.gid_to_group".format(__virtualname__)
-    if __opts__.get("fun", "") == func_name:
-        log.info(
-            "The function %s should not be used on Windows systems; "
-            "see function docs for details.",
-            func_name,
-        )
-
+    func_name = f"{__virtualname__}.gid_to_group"
+    log.info(
+        "The function %s should not be used on Windows systems; "
+        "see function docs for details.",
+        func_name,
+    )
     return uid_to_user(gid)
 
 
@@ -283,6 +295,7 @@ def group_to_gid(group):
     directly.
 
     Args:
+
         group (str): The name of the group
 
     Returns:
@@ -292,20 +305,18 @@ def group_to_gid(group):
 
     .. code-block:: bash
 
-        salt '*' file.group_to_gid administrators
+        salt '*' file.group_to_gid 'administrators'
     """
-    func_name = "{}.group_to_gid".format(__virtualname__)
-    if __opts__.get("fun", "") == func_name:
-        log.info(
-            "The function %s should not be used on Windows systems; "
-            "see function docs for details.",
-            func_name,
-        )
-
+    func_name = f"{__virtualname__}.group_to_gid"
+    log.info(
+        "The function %s should not be used on Windows systems; "
+        "see function docs for details.",
+        func_name,
+    )
     if group is None:
         return ""
 
-    return __utils__["dacl.get_sid_string"](group)
+    return salt.utils.win_dacl.get_sid_string(group)
 
 
 def get_pgid(path, follow_symlinks=True):
@@ -320,11 +331,13 @@ def get_pgid(path, follow_symlinks=True):
     Ensure you know what you are doing before using this function.
 
     Args:
+
         path (str): The path to the file or directory
 
-        follow_symlinks (bool):
+        follow_symlinks (:obj:`bool`, optional):
             If the object specified by ``path`` is a symlink, get attributes of
-            the linked file instead of the symlink itself. Default is True
+            the linked file instead of the symlink itself.
+            Default is ``True``.
 
     Returns:
         str: The gid of the primary group
@@ -333,10 +346,10 @@ def get_pgid(path, follow_symlinks=True):
 
     .. code-block:: bash
 
-        salt '*' file.get_pgid c:\\temp\\test.txt
+        salt '*' file.get_pgid 'c:\\temp\\test.txt'
     """
     if not os.path.exists(path):
-        raise CommandExecutionError("Path not found: {}".format(path))
+        raise CommandExecutionError(f"Path not found: {path}")
 
     # Under Windows, if the path is a symlink, the user that owns the symlink is
     # returned, not the user that owns the file/directory the symlink is
@@ -346,8 +359,8 @@ def get_pgid(path, follow_symlinks=True):
     if follow_symlinks and sys.getwindowsversion().major >= 6:
         path = _resolve_symlink(path)
 
-    group_name = __utils__["dacl.get_primary_group"](path)
-    return __utils__["dacl.get_sid_string"](group_name)
+    group_name = salt.utils.win_dacl.get_primary_group(path)
+    return salt.utils.win_dacl.get_sid_string(group_name)
 
 
 def get_pgroup(path, follow_symlinks=True):
@@ -367,11 +380,13 @@ def get_pgroup(path, follow_symlinks=True):
     which will return the SID, including for the system 'None' group.
 
     Args:
+
         path (str): The path to the file or directory
 
-        follow_symlinks (bool):
+        follow_symlinks (:obj:`bool`, optional):
             If the object specified by ``path`` is a symlink, get attributes of
-            the linked file instead of the symlink itself. Default is True
+            the linked file instead of the symlink itself.
+            Default is ``True``.
 
     Returns:
         str: The name of the primary group
@@ -380,7 +395,7 @@ def get_pgroup(path, follow_symlinks=True):
 
     .. code-block:: bash
 
-        salt '*' file.get_pgroup c:\\temp\\test.txt
+        salt '*' file.get_pgroup 'c:\\temp\\test.txt'
     """
     return uid_to_user(get_pgid(path, follow_symlinks))
 
@@ -405,11 +420,13 @@ def get_gid(path, follow_symlinks=True):
     `file.get_pgid`.
 
     Args:
+
         path (str): The path to the file or directory
 
-        follow_symlinks (bool):
+        follow_symlinks (:obj:`bool`, optional):
             If the object specified by ``path`` is a symlink, get attributes of
-            the linked file instead of the symlink itself. Default is True
+            the linked file instead of the symlink itself.
+            Default is ``True``.
 
     Returns:
         str: The gid of the owner
@@ -418,17 +435,15 @@ def get_gid(path, follow_symlinks=True):
 
     .. code-block:: bash
 
-        salt '*' file.get_gid c:\\temp\\test.txt
+        salt '*' file.get_gid 'c:\\temp\\test.txt'
     """
-    func_name = "{}.get_gid".format(__virtualname__)
-    if __opts__.get("fun", "") == func_name:
-        log.info(
-            "The function %s should not be used on Windows systems; "
-            "see function docs for details. The value returned is the "
-            "uid.",
-            func_name,
-        )
-
+    func_name = f"{__virtualname__}.get_gid"
+    log.info(
+        "The function %s should not be used on Windows systems; "
+        "see function docs for details. The value returned is the "
+        "uid.",
+        func_name,
+    )
     return get_uid(path, follow_symlinks)
 
 
@@ -452,11 +467,13 @@ def get_group(path, follow_symlinks=True):
     `file.get_pgroup`.
 
     Args:
+
         path (str): The path to the file or directory
 
-        follow_symlinks (bool):
+        follow_symlinks (:obj:`bool`, optional):
             If the object specified by ``path`` is a symlink, get attributes of
-            the linked file instead of the symlink itself. Default is True
+            the linked file instead of the symlink itself.
+            Default is ``True``.
 
     Returns:
         str: The name of the owner
@@ -465,40 +482,40 @@ def get_group(path, follow_symlinks=True):
 
     .. code-block:: bash
 
-        salt '*' file.get_group c:\\temp\\test.txt
+        salt '*' file.get_group 'c:\\temp\\test.txt'
     """
-    func_name = "{}.get_group".format(__virtualname__)
-    if __opts__.get("fun", "") == func_name:
-        log.info(
-            "The function %s should not be used on Windows systems; "
-            "see function docs for details. The value returned is the "
-            "user (owner).",
-            func_name,
-        )
-
+    func_name = f"{__virtualname__}.get_group"
+    log.info(
+        "The function %s should not be used on Windows systems; "
+        "see function docs for details. The value returned is the "
+        "user (owner).",
+        func_name,
+    )
     return get_user(path, follow_symlinks)
 
 
 def uid_to_user(uid):
     """
-    Convert a uid to a user name
+    Convert a User ID (uid) to a username
 
     Args:
+
         uid (str): The user id to lookup
 
     Returns:
-        str: The name of the user
+        str: The name of the user. The ``uid`` will be returned if there is no
+             corresponding username
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' file.uid_to_user S-1-5-21-626487655-2533044672-482107328-1010
+        salt '*' file.uid_to_user 'S-1-5-21-626487655-2533044672-482107328-1010'
     """
     if uid is None or uid == "":
         return ""
 
-    return __utils__["dacl.get_name"](uid)
+    return salt.utils.win_dacl.get_name(uid)
 
 
 def user_to_uid(user):
@@ -506,6 +523,7 @@ def user_to_uid(user):
     Convert user name to a uid
 
     Args:
+
         user (str): The user to lookup
 
     Returns:
@@ -515,12 +533,12 @@ def user_to_uid(user):
 
     .. code-block:: bash
 
-        salt '*' file.user_to_uid myusername
+        salt '*' file.user_to_uid 'myusername'
     """
     if user is None:
-        user = __utils__["user.get_user"]()
+        user = salt.utils.user.get_user()
 
-    return __utils__["dacl.get_sid_string"](user)
+    return salt.utils.win_dacl.get_sid_string(user)
 
 
 def get_uid(path, follow_symlinks=True):
@@ -531,11 +549,13 @@ def get_uid(path, follow_symlinks=True):
     `follow_symlinks=False` to turn off this behavior.
 
     Args:
+
         path (str): The path to the file or directory
 
-        follow_symlinks (bool):
+        follow_symlinks (:obj:`bool`, optional):
             If the object specified by ``path`` is a symlink, get attributes of
-            the linked file instead of the symlink itself. Default is True
+            the linked file instead of the symlink itself.
+            Default is ``True``.
 
     Returns:
         str: The uid of the owner
@@ -544,11 +564,11 @@ def get_uid(path, follow_symlinks=True):
 
     .. code-block:: bash
 
-        salt '*' file.get_uid c:\\temp\\test.txt
-        salt '*' file.get_uid c:\\temp\\test.txt follow_symlinks=False
+        salt '*' file.get_uid 'c:\\temp\\test.txt'
+        salt '*' file.get_uid 'c:\\temp\\test.txt' follow_symlinks=False
     """
     if not os.path.exists(path):
-        raise CommandExecutionError("Path not found: {}".format(path))
+        raise CommandExecutionError(f"Path not found: {path}")
 
     # Under Windows, if the path is a symlink, the user that owns the symlink is
     # returned, not the user that owns the file/directory the symlink is
@@ -558,8 +578,8 @@ def get_uid(path, follow_symlinks=True):
     if follow_symlinks and sys.getwindowsversion().major >= 6:
         path = _resolve_symlink(path)
 
-    owner_sid = __utils__["dacl.get_owner"](path)
-    return __utils__["dacl.get_sid_string"](owner_sid)
+    owner_sid = salt.utils.win_dacl.get_owner(path)
+    return salt.utils.win_dacl.get_sid_string(owner_sid)
 
 
 def get_user(path, follow_symlinks=True):
@@ -570,11 +590,13 @@ def get_user(path, follow_symlinks=True):
     `follow_symlinks=False` to turn off this behavior.
 
     Args:
+
         path (str): The path to the file or directory
 
-        follow_symlinks (bool):
+        follow_symlinks (:obj:`bool`, optional):
             If the object specified by ``path`` is a symlink, get attributes of
-            the linked file instead of the symlink itself. Default is True
+            the linked file instead of the symlink itself.
+            Default is ``True``.
 
     Returns:
         str: The name of the owner
@@ -583,11 +605,11 @@ def get_user(path, follow_symlinks=True):
 
     .. code-block:: bash
 
-        salt '*' file.get_user c:\\temp\\test.txt
-        salt '*' file.get_user c:\\temp\\test.txt follow_symlinks=False
+        salt '*' file.get_user 'c:\\temp\\test.txt'
+        salt '*' file.get_user 'c:\\temp\\test.txt' follow_symlinks=False
     """
     if not os.path.exists(path):
-        raise CommandExecutionError("Path not found: {}".format(path))
+        raise CommandExecutionError(f"Path not found: {path}")
 
     # Under Windows, if the path is a symlink, the user that owns the symlink is
     # returned, not the user that owns the file/directory the symlink is
@@ -597,7 +619,7 @@ def get_user(path, follow_symlinks=True):
     if follow_symlinks and sys.getwindowsversion().major >= 6:
         path = _resolve_symlink(path)
 
-    return __utils__["dacl.get_owner"](path)
+    return salt.utils.win_dacl.get_owner(path)
 
 
 def get_mode(path):
@@ -608,6 +630,7 @@ def get_mode(path):
     like Linux
 
     Args:
+
         path (str): The path to the file or directory
 
     Returns:
@@ -620,17 +643,15 @@ def get_mode(path):
         salt '*' file.get_mode /etc/passwd
     """
     if not os.path.exists(path):
-        raise CommandExecutionError("Path not found: {}".format(path))
+        raise CommandExecutionError(f"Path not found: {path}")
 
-    func_name = "{}.get_mode".format(__virtualname__)
-    if __opts__.get("fun", "") == func_name:
-        log.info(
-            "The function %s should not be used on Windows systems; "
-            "see function docs for details. The value returned is "
-            "always None.",
-            func_name,
-        )
-
+    func_name = f"{__virtualname__}.get_mode"
+    log.info(
+        "The function %s should not be used on Windows systems; "
+        "see function docs for details. The value returned is "
+        "always None.",
+        func_name,
+    )
     return None
 
 
@@ -650,14 +671,22 @@ def lchown(path, user, group=None, pgroup=None):
     implications, pass the Windows only parameter, pgroup, instead.
 
     To set the primary group to 'None', it must be specified in quotes.
-    Otherwise Salt will interpret it as the Python value of None and no primary
+    Otherwise, Salt will interpret it as the Python value of None and no primary
     group changes will occur. See the example below.
 
     Args:
+
         path (str): The path to the file or directory
+
         user (str): The name of the user to own the file
-        group (str): The group (not used)
-        pgroup (str): The primary group to assign
+
+        group (:obj:`str`, optional):
+            The group (not used).
+            Default is ``None``.
+
+        pgroup (:obj:`str`, optional):
+            The primary group to assign.
+            Default is ``None``.
 
     Returns:
         bool: True if successful, otherwise error
@@ -666,18 +695,17 @@ def lchown(path, user, group=None, pgroup=None):
 
     .. code-block:: bash
 
-        salt '*' file.lchown c:\\temp\\test.txt myusername
-        salt '*' file.lchown c:\\temp\\test.txt myusername pgroup=Administrators
-        salt '*' file.lchown c:\\temp\\test.txt myusername "pgroup='None'"
+        salt '*' file.lchown 'c:\\temp\\test.txt' myusername
+        salt '*' file.lchown 'c:\\temp\\test.txt' myusername pgroup=Administrators
+        salt '*' file.lchown 'c:\\temp\\test.txt' myusername "pgroup='None'"
     """
     if group:
-        func_name = "{}.lchown".format(__virtualname__)
-        if __opts__.get("fun", "") == func_name:
-            log.info(
-                "The group parameter has no effect when using %s on "
-                "Windows systems; see function docs for details.",
-                func_name,
-            )
+        func_name = f"{__virtualname__}.lchown"
+        log.info(
+            "The group parameter has no effect when using %s on "
+            "Windows systems; see function docs for details.",
+            func_name,
+        )
         log.debug("win_file.py %s Ignoring the group parameter for %s", func_name, path)
         group = None
 
@@ -699,45 +727,57 @@ def chown(path, user, group=None, pgroup=None, follow_symlinks=True):
     implications, pass the Windows only parameter, pgroup, instead.
 
     Args:
+
         path (str): The path to the file or directory
+
         user (str): The name of the user to own the file
-        group (str): The group (not used)
-        pgroup (str): The primary group to assign
-        follow_symlinks (bool):
+
+        group (:obj:`str`, optional):
+            The group (not used).
+            Default is ``None``.
+
+        pgroup (:obj:`str`, optional):
+            The primary group to assign. Default is ``None``.
+
+        follow_symlinks (:obj:`bool`, optional):
             If the object specified by ``path`` is a symlink, get attributes of
-            the linked file instead of the symlink itself. Default is True
+            the linked file instead of the symlink itself.
+            Default is ``True``.
 
     Returns:
-        bool: True if successful, otherwise error
+        bool: ``True`` if successful
+
+    Raises:
+        CommandExecutionError: Path not found
+        CommandExecutionError: Failed to change ownership
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' file.chown c:\\temp\\test.txt myusername
-        salt '*' file.chown c:\\temp\\test.txt myusername pgroup=Administrators
-        salt '*' file.chown c:\\temp\\test.txt myusername "pgroup='None'"
+        salt '*' file.chown 'c:\\temp\\test.txt' 'myusername'
+        salt '*' file.chown 'c:\\temp\\test.txt' 'myusername' pgroup=Administrators
+        salt '*' file.chown 'c:\\temp\\test.txt' 'myusername' pgroup=None
     """
     # the group parameter is not used; only provided for API compatibility
     if group is not None:
-        func_name = "{}.chown".format(__virtualname__)
-        if __opts__.get("fun", "") == func_name:
-            log.info(
-                "The group parameter has no effect when using %s on "
-                "Windows systems; see function docs for details.",
-                func_name,
-            )
+        func_name = f"{__virtualname__}.chown"
+        log.info(
+            "The group parameter has no effect when using %s on "
+            "Windows systems; see function docs for details.",
+            func_name,
+        )
         log.debug("win_file.py %s Ignoring the group parameter for %s", func_name, path)
 
     if follow_symlinks and sys.getwindowsversion().major >= 6:
         path = _resolve_symlink(path)
 
     if not os.path.exists(path):
-        raise CommandExecutionError("Path not found: {}".format(path))
+        raise CommandExecutionError(f"Path not found: {path}")
 
-    __utils__["dacl.set_owner"](path, user)
+    salt.utils.win_dacl.set_owner(path, user)
     if pgroup:
-        __utils__["dacl.set_primary_group"](path, pgroup)
+        salt.utils.win_dacl.set_primary_group(path, pgroup)
 
     return True
 
@@ -754,20 +794,25 @@ def chpgrp(path, group):
     Ensure you know what you are doing before using this function.
 
     Args:
+
         path (str): The path to the file or directory
+
         pgroup (str): The primary group to assign
 
     Returns:
-        bool: True if successful, otherwise error
+        bool: ``True`` if successful
+
+    Raises:
+        CommandExecutionError: Failed to change group
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' file.chpgrp c:\\temp\\test.txt Administrators
-        salt '*' file.chpgrp c:\\temp\\test.txt "'None'"
+        salt '*' file.chpgrp 'c:\\temp\\test.txt' Administrators
+        salt '*' file.chpgrp 'c:\\temp\\test.txt' None
     """
-    return __utils__["dacl.set_primary_group"](path, group)
+    return salt.utils.win_dacl.set_primary_group(path, group)
 
 
 def chgrp(path, group):
@@ -782,17 +827,18 @@ def chgrp(path, group):
     Services For Unix, NFS services).
 
     Salt, therefore, remaps this function to do nothing while still being
-    compatible with Unix behavior. When managing Windows systems,
-    this function is superfluous and will generate an info level log entry if
-    used directly.
+    compatible with Unix behavior. When managing Windows systems, this function
+    is superfluous and will generate an info level log entry if used directly.
 
-    If you do actually want to set the 'primary group' of a file, use ``file
-    .chpgrp``.
+    If you do actually want to set the 'primary group' of a file, use
+    ``file.chpgrp``.
 
-    To set group permissions use ``file.set_perms``
+    To set group permissions use ``file.set_perms``.
 
     Args:
+
         path (str): The path to the file or directory
+
         group (str): The group (unused)
 
     Returns:
@@ -802,15 +848,14 @@ def chgrp(path, group):
 
     .. code-block:: bash
 
-        salt '*' file.chpgrp c:\\temp\\test.txt administrators
+        salt '*' file.chgrp 'c:\\temp\\test.txt' administrators
     """
-    func_name = "{}.chgrp".format(__virtualname__)
-    if __opts__.get("fun", "") == func_name:
-        log.info(
-            "The function %s should not be used on Windows systems; see "
-            "function docs for details.",
-            func_name,
-        )
+    func_name = f"{__virtualname__}.chgrp"
+    log.info(
+        "The function %s should not be used on Windows systems; see "
+        "function docs for details.",
+        func_name,
+    )
     log.debug("win_file.py %s Doing nothing for %s", func_name, path)
 
     return None
@@ -827,16 +872,22 @@ def stats(path, hash_type="sha256", follow_symlinks=True):
     configured and is only used to support Unix compatibility features (e.g.
     Services For Unix, NFS services).
 
-    Salt, therefore, remaps these properties to keep some kind of
-    compatibility with Unix behavior. If the 'primary group' is required, it
-    can be accessed in the `pgroup` and `pgid` properties.
+    Salt, therefore, remaps these properties to keep some kind of compatibility
+    with Unix behavior. If the 'primary group' is required, it can be accessed
+    in the `pgroup` and `pgid` properties.
 
     Args:
+
         path (str): The path to the file or directory
-        hash_type (str): The type of hash to return
-        follow_symlinks (bool):
+
+        hash_type (:obj:`str`, optional):
+            The type of hash to return.
+            Default is``sha256``.
+
+        follow_symlinks (:obj:`bool`, optional):
             If the object specified by ``path`` is a symlink, get attributes of
-            the linked file instead of the symlink itself. Default is True
+            the linked file instead of the symlink itself.
+            Default is ``True``.
 
     Returns:
         dict: A dictionary of file/directory stats
@@ -850,7 +901,7 @@ def stats(path, hash_type="sha256", follow_symlinks=True):
     # This is to mirror the behavior of file.py. `check_file_meta` expects an
     # empty dictionary when the file does not exist
     if not os.path.exists(path):
-        raise CommandExecutionError("Path not found: {}".format(path))
+        raise CommandExecutionError(f"Path not found: {path}")
 
     if follow_symlinks and sys.getwindowsversion().major >= 6:
         path = _resolve_symlink(path)
@@ -871,7 +922,7 @@ def stats(path, hash_type="sha256", follow_symlinks=True):
     ret["mtime"] = pstat.st_mtime
     ret["ctime"] = pstat.st_ctime
     ret["size"] = pstat.st_size
-    ret["mode"] = __utils__["files.normalize_mode"](oct(stat.S_IMODE(pstat.st_mode)))
+    ret["mode"] = salt.utils.files.normalize_mode(oct(stat.S_IMODE(pstat.st_mode)))
     if hash_type:
         ret["sum"] = get_sum(path, hash_type)
     ret["type"] = "file"
@@ -898,6 +949,7 @@ def _get_version_os(flags):
     Helper function to parse the OS data
 
     Args:
+
         flags: The flags as returned by the GetFileVersionInfo function
 
     Returns:
@@ -953,27 +1005,28 @@ def _get_version_type(file_type, file_subtype):
 
     if ret_type == "Driver":
         if file_subtype in driver_subtypes:
-            ret_type = "{} Driver".format(driver_subtypes[file_subtype])
+            ret_type = f"{driver_subtypes[file_subtype]} Driver"
     if ret_type == "Font":
         if file_subtype in font_subtypes:
-            ret_type = "{} Font".format(font_subtypes[file_subtype])
+            ret_type = f"{font_subtypes[file_subtype]} Font"
     if ret_type == "Virtual Device":
         # The Virtual Device Identifier
-        ret_type = "Virtual Device: {}".format(file_subtype)
+        ret_type = f"Virtual Device: {file_subtype}"
     return ret_type
 
 
 def _get_version(path, fixed_info=None):
     """
-    Get's the version of the file passed in path, or the fixed_info object if
+    Get the version of the file passed in path or the fixed_info object if
     passed.
 
     Args:
 
         path (str): The path to the file
 
-        fixed_info (obj): The fixed info object returned by the
-            GetFileVersionInfo function
+        fixed_info (:obj:`obj`, optional):
+            The fixed info object returned by the GetFileVersionInfo function.
+            Default is ``None``.
 
     Returns:
         str: The version of the file
@@ -1010,6 +1063,7 @@ def version(path):
             - .sys
 
     Args:
+
         path (str): The path to the file.
 
     Returns:
@@ -1024,13 +1078,13 @@ def version(path):
 
     .. code-block:: bash
 
-        salt * file.version C:\Windows\notepad.exe
+        salt '*' file.version 'C:\Windows\notepad.exe'
     """
     # Input validation
     if not os.path.exists(path):
-        raise CommandExecutionError("File not found: {}".format(path))
+        raise CommandExecutionError(f"File not found: {path}")
     if os.path.isdir(path):
-        raise CommandExecutionError("Not a file: {}".format(path))
+        raise CommandExecutionError(f"Not a file: {path}")
     return _get_version(path)
 
 
@@ -1064,13 +1118,13 @@ def version_details(path):
 
     .. code-block:: bash
 
-        salt * file.version_details C:\Windows\notepad.exe
+        salt '*' file.version_details 'C:\Windows\notepad.exe'
     """
     # Input validation
     if not os.path.exists(path):
-        raise CommandExecutionError("File not found: {}".format(path))
+        raise CommandExecutionError(f"File not found: {path}")
     if os.path.isdir(path):
-        raise CommandExecutionError("Not a file: {}".format(path))
+        raise CommandExecutionError(f"Not a file: {path}")
 
     ret = {}
     try:
@@ -1130,10 +1184,10 @@ def version_details(path):
 
 def get_attributes(path):
     """
-    Return a dictionary object with the Windows
-    file attributes for a file.
+    Return a dictionary object with the Windows file attributes for a file.
 
     Args:
+
         path (str): The path to the file or directory
 
     Returns:
@@ -1143,10 +1197,10 @@ def get_attributes(path):
 
     .. code-block:: bash
 
-        salt '*' file.get_attributes c:\\temp\\a.txt
+        salt '*' file.get_attributes 'c:\\temp\\a.txt'
     """
     if not os.path.exists(path):
-        raise CommandExecutionError("Path not found: {}".format(path))
+        raise CommandExecutionError(f"Path not found: {path}")
 
     # set up dictionary for attribute values
     attributes = {}
@@ -1202,33 +1256,54 @@ def set_attributes(
     temporary=None,
 ):
     """
-    Set file attributes for a file.  Note that the normal attribute
-    means that all others are false.  So setting it will clear all others.
+    Set file attributes for a file. Note that the normal attribute means that
+    all others are false. So setting it will clear all others.
 
     Args:
+
         path (str): The path to the file or directory
-        archive (bool): Sets the archive attribute. Default is None
-        hidden (bool): Sets the hidden attribute. Default is None
-        normal (bool):
+
+        archive (:obj:`bool`, optional):
+            Sets the archive attribute.
+            Default is ``None``.
+
+        hidden (:obj:`bool`, optional):
+            Sets the hidden attribute.
+            Default is ``None``.
+
+        normal (:obj:`bool`, optional):
             Resets the file attributes. Cannot be used in conjunction with any
-            other attribute. Default is None
-        notIndexed (bool): Sets the indexed attribute. Default is None
-        readonly (bool): Sets the readonly attribute. Default is None
-        system (bool): Sets the system attribute. Default is None
-        temporary (bool): Sets the temporary attribute. Default is None
+            other attribute.
+            Default is ``None``.
+
+        notIndexed (:obj:`bool`, optional):
+            Sets the indexed attribute.
+            Default is ``None``.
+
+        readonly (:obj:`bool`, optional):
+            Sets the readonly attribute.
+            Default is ``None``.
+
+        system (:obj:`bool`, optional):
+            Sets the system attribute.
+            Default is ``None``.
+
+        temporary (:obj:`bool`, optional):
+            Sets the temporary attribute.
+            Default is ``None``.
 
     Returns:
-        bool: True if successful, otherwise False
+        bool: ``True`` if successful, otherwise ``False``
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' file.set_attributes c:\\temp\\a.txt normal=True
-        salt '*' file.set_attributes c:\\temp\\a.txt readonly=True hidden=True
+        salt '*' file.set_attributes 'c:\\temp\\a.txt' normal=True
+        salt '*' file.set_attributes 'c:\\temp\\a.txt' readonly=True hidden=True
     """
     if not os.path.exists(path):
-        raise CommandExecutionError("Path not found: {}".format(path))
+        raise CommandExecutionError(f"Path not found: {path}")
 
     if normal:
         if archive or hidden or notIndexed or readonly or system or temporary:
@@ -1285,8 +1360,10 @@ def set_mode(path, mode):
     Windows
 
     Args:
-        path: The path to the file or directory
-        mode: The mode (not used)
+
+        path (str): The path to the file or directory
+
+        mode (str): The mode (not used)
 
     Returns:
         None
@@ -1297,15 +1374,13 @@ def set_mode(path, mode):
 
         salt '*' file.set_mode /etc/passwd 0644
     """
-    func_name = "{}.set_mode".format(__virtualname__)
-    if __opts__.get("fun", "") == func_name:
-        log.info(
-            "The function %s should not be used on Windows systems; "
-            "see function docs for details. The value returned is "
-            "always None. Use set_perms instead.",
-            func_name,
-        )
-
+    func_name = f"{__virtualname__}.set_mode"
+    log.info(
+        "The function %s should not be used on Windows systems; "
+        "see function docs for details. The value returned is "
+        "always None. Use set_perms instead.",
+        func_name,
+    )
     return get_mode(path)
 
 
@@ -1314,17 +1389,21 @@ def remove(path, force=False):
     Remove the named file or directory
 
     Args:
+
         path (str): The path to the file or directory to remove.
-        force (bool): Remove even if marked Read-Only. Default is False
+
+        force (:obj:`bool`, optional):
+            Remove even if marked Read-Only.
+            Default is ``False``.
 
     Returns:
-        bool: True if successful, False if unsuccessful
+        bool: ``True`` if successful, otherwise ``False``
 
     CLI Example:
 
     .. code-block:: bash
 
-        salt '*' file.remove C:\\Temp
+        salt '*' file.remove 'C:\\Temp'
     """
     # This must be a recursive function in windows to properly deal with
     # Symlinks. The shutil.rmtree function will remove the contents of
@@ -1333,11 +1412,11 @@ def remove(path, force=False):
     path = os.path.expanduser(path)
 
     if not os.path.isabs(path):
-        raise SaltInvocationError("File path must be absolute: {}".format(path))
+        raise SaltInvocationError(f"File path must be absolute: {path}")
 
     # Does the file/folder exists
     if not os.path.exists(path) and not is_link(path):
-        raise CommandExecutionError("Path not found: {}".format(path))
+        raise CommandExecutionError(f"Path not found: {path}")
 
     # Remove ReadOnly Attribute
     if force:
@@ -1353,9 +1432,13 @@ def remove(path, force=False):
             # If it's a symlink directory, use the rmdir command
             os.rmdir(path)
         else:
+            # Twangboy: This is for troubleshooting
+            is_dir = os.path.isdir(path)
+            exists = os.path.exists(path)
+            # This is a directory, list its contents and remove them recursively
             for name in os.listdir(path):
-                item = "{}\\{}".format(path, name)
-                # If its a normal directory, recurse to remove it's contents
+                item = f"{path}\\{name}"
+                # If it's a normal directory, recurse to remove its contents
                 remove(item, force)
 
             # rmdir will work now because the directory is empty
@@ -1364,7 +1447,7 @@ def remove(path, force=False):
         if force:
             # Reset attributes to the original if delete fails.
             win32api.SetFileAttributes(path, file_attributes)
-        raise CommandExecutionError("Could not remove '{}': {}".format(path, exc))
+        raise CommandExecutionError(f"Could not remove '{path}': {exc}")
 
     return True
 
@@ -1386,17 +1469,27 @@ def symlink(src, link, force=False, atomic=False):
 
         link (str): The path to the link. Must be an absolute path
 
-        force (bool):
-            Overwrite an existing symlink with the same name
+        force (:obj:`bool`, optional):
+            Overwrite an existing symlink with the same name.
+            Default is ``False``.
+
             .. versionadded:: 3005
 
-        atomic (bool):
-            Use atomic file operations to create the symlink
+        atomic (:obj:`bool`, optional):
+            Use atomic file operations to create the symlink.
+            Default is ``False``.
+
             .. versionadded:: 3006.0
 
     Returns:
+        bool: ``True`` if successful
 
-        bool: ``True`` if successful, otherwise raises ``CommandExecutionError``
+    Raises:
+        SaltInvocationError: Unsupported version of Windows
+        SaltInvocationError: Link path must be absolute
+        CommandExecutionError: Existing symlink and force is False
+        CommandExecutionError: Existing path is not a symlink
+        CommandExecutionError: Failed to create symlink
 
     CLI Example:
 
@@ -1412,7 +1505,7 @@ def symlink(src, link, force=False, atomic=False):
         )
 
     if not os.path.isabs(link):
-        raise SaltInvocationError("Link path must be absolute: {}".format(link))
+        raise SaltInvocationError(f"Link path must be absolute: {link}")
 
     if os.path.islink(link):
         try:
@@ -1425,11 +1518,11 @@ def symlink(src, link, force=False, atomic=False):
             pass
 
         if not force and not atomic:
-            msg = "Found existing symlink: {}".format(link)
+            msg = f"Found existing symlink: {link}"
             raise CommandExecutionError(msg)
 
     if os.path.exists(link) and not force and not atomic:
-        msg = "Existing path is not a symlink: {}".format(link)
+        msg = f"Existing path is not a symlink: {link}"
         raise CommandExecutionError(msg)
 
     # ensure paths are using the right slashes
@@ -1464,14 +1557,14 @@ def symlink(src, link, force=False, atomic=False):
             return True
         except win32file.error:
             os.remove(temp_link)
-            raise CommandExecutionError("Could not create '{}'".format(link))
+            raise CommandExecutionError(f"Could not create '{link}'")
 
     try:
         win32file.CreateSymbolicLink(link, src, int(is_dir))
         return True
     except win32file.error as exc:
         raise CommandExecutionError(
-            "Could not create '{}' - [{}] {}".format(link, exc.winerror, exc.strerror)
+            f"Could not create '{link}' - [{exc.winerror}] {exc.strerror}"
         )
 
 
@@ -1486,10 +1579,11 @@ def is_link(path):
     not an OSError.
 
     Args:
+
         path (str): The path to a file or directory
 
     Returns:
-        bool: True if path is a symlink, otherwise False
+        bool: ``True`` if path is a symlink, otherwise ``False``
 
     CLI Example:
 
@@ -1503,7 +1597,7 @@ def is_link(path):
         )
 
     try:
-        return __utils__["path.islink"](path)
+        return salt.utils.path.islink(path)
     except Exception as exc:  # pylint: disable=broad-except
         raise CommandExecutionError(exc)
 
@@ -1519,11 +1613,12 @@ def mkdir(
         path (str):
             The full path to the directory.
 
-        owner (str):
+        owner (:obj:`str`, optional):
             The owner of the directory. If not passed, it will be the account
-            that created the directory, likely SYSTEM
+            that created the directory, likely SYSTEM.
+            Default is ``None``.
 
-        grant_perms (dict):
+        grant_perms (:obj:`dict`, optional):
             A dictionary containing the user/group and the basic permissions to
             grant, ie: ``{'user': {'perms': 'basic_permission'}}``. You can also
             set the ``applies_to`` setting here. The default is
@@ -1541,47 +1636,52 @@ def mkdir(
 
                 {'user': {'perms': ['read_attributes', 'read_ea'], 'applies_to': 'this_folder'}}
 
-        deny_perms (dict):
+            Default is ``None``.
+
+        deny_perms (:obj:`dict`, optional):
             A dictionary containing the user/group and permissions to deny along
             with the ``applies_to`` setting. Use the same format used for the
             ``grant_perms`` parameter. Remember, deny permissions supersede
             grant permissions.
+            Default is ``None``.
 
-        inheritance (bool):
-            If True the object will inherit permissions from the parent, if
+        inheritance (:obj:`bool`, optional):
+            If ``True``, the object will inherit permissions from the parent. If
             ``False``, inheritance will be disabled. Inheritance setting will
             not apply to parent directories if they must be created.
+            Default is ``True``.
 
-        reset (bool):
+        reset (:obj:`bool`, optional):
             If ``True`` the existing DACL will be cleared and replaced with the
             settings defined in this function. If ``False``, new entries will be
-            appended to the existing DACL. Default is ``False``.
+            appended to the existing DACL.
+            Default is ``False``.
 
             .. versionadded:: 2018.3.0
 
     Returns:
-        bool: True if successful
+        bool: ``True`` if successful
 
     Raises:
-        CommandExecutionError: If unsuccessful
+        CommandExecutionError: Failed to create directory
 
     CLI Example:
 
     .. code-block:: bash
 
         # To grant the 'Users' group 'read & execute' permissions.
-        salt '*' file.mkdir C:\\Temp\\ Administrators "{'Users': {'perms': 'read_execute'}}"
+        salt '*' file.mkdir 'C:\\Temp\\' Administrators '{"Users": {"perms": "read_execute"}}'
 
         # Locally using salt call
-        salt-call file.mkdir C:\\Temp\\ Administrators "{'Users': {'perms': 'read_execute', 'applies_to': 'this_folder_only'}}"
+        salt-call file.mkdir 'C:\\Temp\\' Administrators '{"Users": {"perms": "read_execute", "applies_to": "this_folder_only"}}'
 
         # Specify advanced attributes with a list
-        salt '*' file.mkdir C:\\Temp\\ Administrators "{'jsnuffy': {'perms': ['read_attributes', 'read_ea'], 'applies_to': 'this_folder_only'}}"
+        salt '*' file.mkdir 'C:\\Temp\\' Administrators '{"jsnuffy": {"perms": ["read_attributes", "read_ea"], "applies_to": "this_folder_only"}}'
     """
     # Make sure the drive is valid
     drive = os.path.splitdrive(path)[0]
     if not os.path.isdir(drive):
-        raise CommandExecutionError("Drive {} is not mapped".format(drive))
+        raise CommandExecutionError(f"Drive {drive} is not mapped")
 
     path = os.path.expanduser(path)
     path = os.path.expandvars(path)
@@ -1594,10 +1694,10 @@ def mkdir(
 
             # Set owner
             if owner:
-                __utils__["dacl.set_owner"](obj_name=path, principal=owner)
+                salt.utils.win_dacl.set_owner(obj_name=path, principal=owner)
 
             # Set permissions
-            __utils__["dacl.set_perms"](
+            salt.utils.win_dacl.set_perms(
                 obj_name=path,
                 obj_type="file",
                 grant_perms=grant_perms,
@@ -1621,6 +1721,7 @@ def makedirs_(
     Args:
 
         path (str):
+
             The full path to the directory.
 
             .. note::
@@ -1632,11 +1733,11 @@ def makedirs_(
                 like ``C:\\temp\\test\\``, then it would be treated as
                 ``C:\\temp\\test\\``.
 
-        owner (str):
+        owner (:obj:`str`, optional):
             The owner of the directory. If not passed, it will be the account
-            that created the directory, likely SYSTEM.
+            that created the directory, likely SYSTEM. Default is ``None``.
 
-        grant_perms (dict):
+        grant_perms (:obj:`dict`, optional):
             A dictionary containing the user/group and the basic permissions to
             grant, ie: ``{'user': {'perms': 'basic_permission'}}``. You can also
             set the ``applies_to`` setting here. The default is
@@ -1647,48 +1748,54 @@ def makedirs_(
 
                 {'user': {'perms': 'full_control', 'applies_to': 'this_folder'}}
 
-            To set advanced permissions use a list for the ``perms`` parameter, ie:
+            To set advanced permissions use a list for the ``perms`` parameter,
+            ie:
 
             .. code-block:: yaml
 
                 {'user': {'perms': ['read_attributes', 'read_ea'], 'applies_to': 'this_folder'}}
 
-        deny_perms (dict):
+            Default is ``None``.
+
+        deny_perms (:obj:`dict`, optional):
             A dictionary containing the user/group and permissions to deny along
             with the ``applies_to`` setting. Use the same format used for the
             ``grant_perms`` parameter. Remember, deny permissions supersede
             grant permissions.
+            Default is ``None``.
 
-        inheritance (bool):
-            If True the object will inherit permissions from the parent, if
-            False, inheritance will be disabled. Inheritance setting will not
-            apply to parent directories if they must be created.
+        inheritance (:obj:`bool`, optional):
+            If ``True``, the object will inherit permissions from the parent. If
+            ``False``, inheritance will be disabled. Inheritance setting will
+            not apply to parent directories if they must be created.
+            Default is ``True``.
 
-        reset (bool):
-            If ``True`` the existing DACL will be cleared and replaced with the
+        reset (:obj:`bool`, optional):
+            If ``True``, the existing DACL will be cleared and replaced with the
             settings defined in this function. If ``False``, new entries will be
-            appended to the existing DACL. Default is ``False``.
+            appended to the existing DACL.
+            Default is ``False``.
 
             .. versionadded:: 2018.3.0
 
     Returns:
-        bool: True if successful
+        bool: ``True`` if successful
 
     Raises:
-        CommandExecutionError: If unsuccessful
+        CommandExecutionError: Failed to create directories
 
     CLI Example:
 
     .. code-block:: bash
 
         # To grant the 'Users' group 'read & execute' permissions.
-        salt '*' file.makedirs C:\\Temp\\ Administrators "{'Users': {'perms': 'read_execute'}}"
+        salt '*' file.makedirs 'C:\\Temp\\' Administrators '{"Users": {"perms": "read_execute"}}'
 
         # Locally using salt call
-        salt-call file.makedirs C:\\Temp\\ Administrators "{'Users': {'perms': 'read_execute', 'applies_to': 'this_folder_only'}}"
+        salt-call file.makedirs 'C:\\Temp\\' Administrators '{"Users": {"perms": "read_execute", "applies_to": "this_folder_only"}}'
 
         # Specify advanced attributes with a list
-        salt '*' file.makedirs C:\\Temp\\ Administrators "{'jsnuffy': {'perms': ['read_attributes', 'read_ea'], 'applies_to': 'this_folder_only'}}"
+        salt '*' file.makedirs 'C:\\Temp\\' Administrators '{"jsnuffy": {"perms": ["read_attributes", "read_ea"], "applies_to": "this_folder_only"}}'
     """
     path = os.path.expanduser(path)
 
@@ -1698,12 +1805,12 @@ def makedirs_(
 
     if os.path.isdir(dirname):
         # There's nothing for us to do
-        msg = "Directory '{}' already exists".format(dirname)
+        msg = f"Directory '{dirname}' already exists"
         log.debug(msg)
         return msg
 
     if os.path.exists(dirname):
-        msg = "The path '{}' already exists and is not a directory".format(dirname)
+        msg = f"The path '{dirname}' already exists and is not a directory"
         log.debug(msg)
         return msg
 
@@ -1750,11 +1857,12 @@ def makedirs_perms(
         path (str):
             The full path to the directory.
 
-        owner (str):
+        owner (:obj:`str`, optional):
             The owner of the directory. If not passed, it will be the account
             that created the directory, likely SYSTEM.
+            Default is ``None``.
 
-        grant_perms (dict):
+        grant_perms (:obj:`dict`, optional):
             A dictionary containing the user/group and the basic permissions to
             grant, ie: ``{'user': {'perms': 'basic_permission'}}``. You can also
             set the ``applies_to`` setting here. The default is
@@ -1771,39 +1879,49 @@ def makedirs_perms(
 
                 {'user': {'perms': ['read_attributes', 'read_ea'], 'applies_to': 'this_folder'}}
 
-        deny_perms (dict):
+            Default is ``None``.
+
+        deny_perms (:obj:`dict`, optional):
             A dictionary containing the user/group and permissions to deny along
             with the ``applies_to`` setting. Use the same format used for the
             ``grant_perms`` parameter. Remember, deny permissions supersede
             grant permissions.
+            Default is ``None``.
 
-        inheritance (bool):
-            If ``True`` the object will inherit permissions from the parent, if
+        inheritance (:obj:`bool`, optional):
+            If ``True``, the object will inherit permissions from the parent. If
             ``False``, inheritance will be disabled. Inheritance setting will
-            not apply to parent directories if they must be created
+            not apply to parent directories if they must be created.
+            Default is ``True``.
 
-        reset (bool):
-            If ``True`` the existing DACL will be cleared and replaced with the
+        reset (:obj:`bool`, optional):
+            If ``True``, the existing DACL will be cleared and replaced with the
             settings defined in this function. If ``False``, new entries will be
-            appended to the existing DACL. Default is ``False``.
+            appended to the existing DACL.
+            Default is ``False``.
 
             .. versionadded:: 2018.3.0
 
     Returns:
-        bool: True if successful, otherwise raises an error
+        bool: ``True`` if successful
+
+    Raises:
+        OSError: Failed to create dirs and set perms
 
     CLI Example:
 
     .. code-block:: bash
 
         # To grant the 'Users' group 'read & execute' permissions.
-        salt '*' file.makedirs_perms C:\\Temp\\ Administrators "{'Users': {'perms': 'read_execute'}}"
-
-        # Locally using salt call
-        salt-call file.makedirs_perms C:\\Temp\\ Administrators "{'Users': {'perms': 'read_execute', 'applies_to': 'this_folder_only'}}"
+        salt '*' file.makedirs_perms 'C:\\Temp\\' Administrators '{"Users": {"perms": "read_execute"}}'
 
         # Specify advanced attributes with a list
-        salt '*' file.makedirs_perms C:\\Temp\\ Administrators "{'jsnuffy': {'perms': ['read_attributes', 'read_ea'], 'applies_to': 'this_folder_files'}}"
+        salt '*' file.makedirs_perms 'C:\\Temp\\' Administrators '{"jsnuffy": {"perms": ["read_attributes", "read_ea"], "applies_to": "this_folder_files"}}'
+
+    .. code-block:: bat
+
+        # Locally using salt call
+        salt-call file.makedirs_perms "C:\\Temp\\" Administrators "{'Users': {'perms': 'read_execute', 'applies_to': 'this_folder_only'}}"
     """
     # Expand any environment variables
     path = os.path.expanduser(path)
@@ -1870,30 +1988,34 @@ def check_perms(
         path (str):
             The full path to the directory.
 
-        ret (dict):
+        ret (:obj:`dict`, optional):
             A dictionary to append changes to and return. If not passed, will
             create a new dictionary to return.
+            Default is ``None``.
 
-        owner (str):
+        owner (:obj:`str`, optional):
             The owner to set for the directory.
+            Default is ``None``.
 
-        grant_perms (dict):
+        grant_perms (:obj:`dict`, optional):
             A dictionary containing the user/group and the basic permissions to
             check/grant, ie: ``{'user': {'perms': 'basic_permission'}}``.
             Default is ``None``.
 
-        deny_perms (dict):
+        deny_perms (:obj:`dict`, optional):
             A dictionary containing the user/group and permissions to
-            check/deny. Default is ``None``.
+            check/deny.
+            Default is ``None``.
 
-        inheritance (bool):
-            ``True will check if inheritance is enabled and enable it. ``False``
-            will check if inheritance is disabled and disable it. Default is
-            ``True``.
+        inheritance (:obj:`bool`, optional):
+            ``True`` will check if inheritance is enabled and enable it.
+            ``False`` will check if inheritance is disabled and disable it.
+            Default is ``True``.
 
-        reset (bool):
+        reset (:obj:`bool`, optional):
             ``True`` will show what permissions will be removed by resetting the
-            DACL. ``False`` will do nothing. Default is ``False``.
+            DACL. ``False`` will do nothing.
+            Default is ``False``.
 
     Returns:
         dict: A dictionary of changes that have been made
@@ -1902,21 +2024,24 @@ def check_perms(
 
     .. code-block:: bash
 
-        # To see changes to ``C:\\Temp`` if the 'Users' group is given 'read & execute' permissions.
-        salt '*' file.check_perms C:\\Temp\\ {} Administrators "{'Users': {'perms': 'read_execute'}}"
-
-        # Locally using salt call
-        salt-call file.check_perms C:\\Temp\\ {} Administrators "{'Users': {'perms': 'read_execute', 'applies_to': 'this_folder_only'}}"
+        # To see changes to C:\\Temp if the 'Users' group is given 'read & execute' permissions.
+        salt '*' file.check_perms 'C:\\Temp\\' '{}' Administrators '{"Users": {"perms": "read_execute"}}'
 
         # Specify advanced attributes with a list
-        salt '*' file.check_perms C:\\Temp\\ {} Administrators "{'jsnuffy': {'perms': ['read_attributes', 'read_ea'], 'applies_to': 'files_only'}}"
+        salt '*' file.check_perms 'C:\\Temp\\' '{}' Administrators '{"jsnuffy": {"perms": ["read_attributes", "read_ea"], "applies_to": "files_only"}}'
+
+    .. code-block:: bat
+
+        # Locally using salt call
+        salt-call file.check_perms "C:\\Temp\\" {} Administrators "{'Users': {'perms': 'read_execute', 'applies_to': 'this_folder_only'}}"
+
     """
     if not os.path.exists(path):
-        raise CommandExecutionError("Path not found: {}".format(path))
+        raise CommandExecutionError(f"Path not found: {path}")
 
     path = os.path.expanduser(path)
 
-    return __utils__["dacl.check_perms"](
+    return salt.utils.win_dacl.check_perms(
         obj_name=path,
         obj_type="file",
         ret=ret,
@@ -1925,6 +2050,7 @@ def check_perms(
         deny_perms=deny_perms,
         inheritance=inheritance,
         reset=reset,
+        test_mode=__opts__["test"],
     )
 
 
@@ -1937,7 +2063,7 @@ def set_perms(path, grant_perms=None, deny_perms=None, inheritance=True, reset=F
         path (str):
             The full path to the directory.
 
-        grant_perms (dict):
+        grant_perms (:obj:`dict`, optional):
             A dictionary containing the user/group and the basic permissions to
             grant, ie: ``{'user': {'perms': 'basic_permission'}}``. You can also
             set the ``applies_to`` setting here for directories. The default for
@@ -1959,32 +2085,37 @@ def set_perms(path, grant_perms=None, deny_perms=None, inheritance=True, reset=F
             the documentation for salt.utils.win_dacl.
 
             A value of ``None`` will make no changes to the ``grant`` portion of
-            the DACL. Default is ``None``.
+            the DACL.
 
-        deny_perms (dict):
+            Default is ``None``.
+
+        deny_perms (:obj:`dict`, optional):
             A dictionary containing the user/group and permissions to deny along
             with the ``applies_to`` setting. Use the same format used for the
             ``grant_perms`` parameter. Remember, deny permissions supersede
             grant permissions.
 
             A value of ``None`` will make no changes to the ``deny`` portion of
-            the DACL. Default is ``None``.
+            the DACL.
 
-        inheritance (bool):
-            If ``True`` the object will inherit permissions from the parent, if
+            Default is ``None``.
+
+        inheritance (:obj:`bool`, optional):
+            If ``True``, the object will inherit permissions from the parent. If
             ``False``, inheritance will be disabled. Inheritance setting will
-            not apply to parent directories if they must be created. Default is
-            ``False``.
+            not apply to parent directories if they must be created.
+            Default is ``True``.
 
-        reset (bool):
-            If ``True`` the existing DCL will be cleared and replaced with the
+        reset (:obj:`bool`, optional):
+            If ``True``, the existing DCL will be cleared and replaced with the
             settings defined in this function. If ``False``, new entries will be
-            appended to the existing DACL. Default is ``False``.
+            appended to the existing DACL.
+            Default is ``False``.
 
             .. versionadded:: 2018.3.0
 
     Returns:
-        bool: True if successful
+        bool: ``True`` if successful
 
     Raises:
         CommandExecutionError: If unsuccessful
@@ -1994,15 +2125,17 @@ def set_perms(path, grant_perms=None, deny_perms=None, inheritance=True, reset=F
     .. code-block:: bash
 
         # To grant the 'Users' group 'read & execute' permissions.
-        salt '*' file.set_perms C:\\Temp\\ "{'Users': {'perms': 'read_execute'}}"
-
-        # Locally using salt call
-        salt-call file.set_perms C:\\Temp\\ "{'Users': {'perms': 'read_execute', 'applies_to': 'this_folder_only'}}"
+        salt '*' file.set_perms 'C:\\Temp\\' '{"Users": {"perms": "read_execute"}}'
 
         # Specify advanced attributes with a list
-        salt '*' file.set_perms C:\\Temp\\ "{'jsnuffy': {'perms': ['read_attributes', 'read_ea'], 'applies_to': 'this_folder_only'}}"
+        salt '*' file.set_perms 'C:\\Temp\\' '{"jsnuffy": {"perms": ["read_attributes", "read_ea"], "applies_to": "this_folder_only"}}'
+
+    .. code-block:: bat
+
+        # Locally using salt call
+        salt-call file.set_perms "C:\\Temp\\" "{'Users': {'perms': 'read_execute', 'applies_to': 'this_folder_only'}}"
     """
-    return __utils__["dacl.set_perms"](
+    return salt.utils.win_dacl.set_perms(
         obj_name=path,
         obj_type="file",
         grant_perms=grant_perms,

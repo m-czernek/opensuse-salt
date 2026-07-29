@@ -17,7 +17,7 @@ def configure_loader_modules():
     return {
         filemod: {
             "__context__": {},
-            "__opts__": {"test": True},
+            "__opts__": {"test": False},
         }
     }
 
@@ -88,7 +88,7 @@ def test_check_managed_follow_symlinks(a_link, tfile):
         a_link, tfile, None, None, user, None, lperms, None, None, None, None, None
     )
     assert ret is True
-    assert comments == "The file {} is in the correct state".format(a_link)
+    assert comments == f"The file {a_link} is in the correct state"
 
     ret, comments = filemod.check_managed(
         a_link, tfile, None, None, user, None, "0644", None, None, None, None, None
@@ -113,7 +113,7 @@ def test_check_managed_follow_symlinks(a_link, tfile):
         follow_symlinks=True,
     )
     assert ret is True
-    assert comments == "The file {} is in the correct state".format(a_link)
+    assert comments == f"The file {a_link} is in the correct state"
 
 
 @pytest.mark.skip_on_windows(reason="os.symlink is not available on Windows")
@@ -172,7 +172,7 @@ def test_check_managed_changes_follow_symlinks(a_link, tfile):
         ),
         # no user/group changes needed by id
         (
-            {"user": 2001, "group": 1001},
+            {"user": 3001, "group": 4001},
             {},
         ),
     ],
@@ -184,9 +184,9 @@ def test_check_perms_user_group_name_and_id(input, expected):
         stat_out = {
             "user": "luser",
             "group": "lgroup",
-            "uid": 2001,
-            "gid": 1001,
-            "mode": "0123",
+            "uid": 3001,
+            "gid": 4001,
+            "mode": "123",
         }
 
         patch_stats = patch(

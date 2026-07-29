@@ -2,7 +2,6 @@
     :codeauthor: :email:`Vernon Cole <vernondcole@gmail.com>`
 """
 
-
 import os
 
 import salt.utils.sdb as sdb
@@ -49,7 +48,7 @@ class SdbTestCase(TestCase, LoaderModuleMockMixin):
     # test with SQLite database write and read
 
     def test_sqlite_get_found(self):
-        expected = {"name": "testone", "number": 46}
+        expected = {b"name": b"testone", b"number": 46}
         sdb.sdb_set("sdb://test_sdb_data/test1", expected, self.sdb_opts)
         resp = sdb.sdb_get("sdb://test_sdb_data/test1", self.sdb_opts)
         self.assertEqual(resp, expected)

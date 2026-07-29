@@ -1,6 +1,7 @@
 """
     Tests for salt.modules.boto3_elasticsearch
 """
+
 import datetime
 import random
 import string
@@ -27,6 +28,10 @@ except ImportError:
 # which was added in boto 2.8.0
 # https://github.com/boto/boto/commit/33ac26b416fbb48a60602542b4ce15dcc7029f12
 REQUIRED_BOTO3_VERSION = "1.2.1"
+
+pytestmark = [
+    pytest.mark.skip_on_fips_enabled_platform,
+]
 
 
 def __virtual__():
@@ -681,7 +686,7 @@ class Boto3ElasticsearchTestCase(TestCase, LoaderModuleMockMixin):
                     domain_name="testdomain",
                     instance_type="foo",
                     elasticsearch_version="1.0",
-                    **CONN_PARAMETERS
+                    **CONN_PARAMETERS,
                 ),
                 {"result": True, "response": ret_val["LimitsByRole"]},
             )
@@ -702,7 +707,7 @@ class Boto3ElasticsearchTestCase(TestCase, LoaderModuleMockMixin):
                 domain_name="testdomain",
                 instance_type="foo",
                 elasticsearch_version="1.0",
-                **CONN_PARAMETERS
+                **CONN_PARAMETERS,
             )
             self.assertFalse(result["result"])
             self.assertEqual(
@@ -1118,7 +1123,7 @@ class Boto3ElasticsearchTestCase(TestCase, LoaderModuleMockMixin):
                 boto3_elasticsearch.purchase_reserved_elasticsearch_instance_offering(
                     reserved_elasticsearch_instance_offering_id="foo",
                     reservation_name="bar",
-                    **CONN_PARAMETERS
+                    **CONN_PARAMETERS,
                 ),
                 {"result": True, "response": ret_val},
             )
@@ -1139,7 +1144,7 @@ class Boto3ElasticsearchTestCase(TestCase, LoaderModuleMockMixin):
                 boto3_elasticsearch.purchase_reserved_elasticsearch_instance_offering(
                     reserved_elasticsearch_instance_offering_id="foo",
                     reservation_name="bar",
-                    **CONN_PARAMETERS
+                    **CONN_PARAMETERS,
                 )
             )
             self.assertFalse(result["result"])

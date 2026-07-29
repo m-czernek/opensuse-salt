@@ -3,20 +3,24 @@ Unit tests for the docker module
 """
 
 import logging
-import sys
 
 import pytest
 
 import salt.loader
 import salt.modules.dockermod as docker_mod
 import salt.utils.platform
+import salt.utils.versions
 from salt.exceptions import CommandExecutionError, SaltInvocationError
 from tests.support.mock import MagicMock, Mock, call, patch
 
 log = logging.getLogger(__name__)
 
-pytest.importorskip(
+docker = pytest.importorskip(
     "docker", reason="The python 'docker' package must be installed to run these tests"
+)
+docker_older_than_1_5_0_skip_marker = pytest.mark.skipif(
+    salt.utils.versions.Version(docker.__version__) < "1.5.0",
+    reason="docker module must be installed to run this test or is too old. <=1.5.0",
 )
 
 
@@ -27,7 +31,6 @@ def configure_loader_modules(minion_opts):
         whitelist=[
             "args",
             "docker",
-            "files",
             "json",
             "state",
             "thin",
@@ -304,10 +307,10 @@ def test_check_mine_cache_is_refreshed_on_container_change_event(command_name, a
         try:
             mine_send.assert_called_with("docker.ps", verbose=True, all=True, host=True)
         except AssertionError as exc:
-            raise Exception(
+            raise AssertionError(
                 "command '{}' did not call docker.ps with expected "
                 "arguments: {}".format(command_name, exc)
-            )
+            ) from exc
 
 
 def test_update_mine():
@@ -316,24 +319,14 @@ def test_update_mine():
     """
 
     def config_get_disabled(val, default):
-        return {
-            "base_url": docker_mod.NOTSET,
-            "version": docker_mod.NOTSET,
-            "docker.url": docker_mod.NOTSET,
-            "docker.version": docker_mod.NOTSET,
-            "docker.machine": docker_mod.NOTSET,
-            "docker.update_mine": False,
-        }[val]
+        if val == "docker.update_mine":
+            return False
+        return docker_mod.NOTSET
 
     def config_get_enabled(val, default):
-        return {
-            "base_url": docker_mod.NOTSET,
-            "version": docker_mod.NOTSET,
-            "docker.url": docker_mod.NOTSET,
-            "docker.version": docker_mod.NOTSET,
-            "docker.machine": docker_mod.NOTSET,
-            "docker.update_mine": True,
-        }[val]
+        if val == "docker.update_mine":
+            return True
+        return docker_mod.NOTSET
 
     mine_mock = Mock()
     dunder_salt = {
@@ -356,10 +349,7 @@ def test_update_mine():
         mine_mock.assert_called_once()
 
 
-@pytest.mark.skipif(
-    docker_mod._get_docker_py_versioninfo() < (1, 5, 0),
-    reason="docker module must be installed to run this test or is too old. >=1.5.0",
-)
+@docker_older_than_1_5_0_skip_marker
 def test_list_networks():
     """
     test list networks.
@@ -380,10 +370,7 @@ def test_list_networks():
     client.networks.assert_called_once_with(names=["foo"], ids=["01234"])
 
 
-@pytest.mark.skipif(
-    docker_mod._get_docker_py_versioninfo() < (1, 5, 0),
-    reason="docker module must be installed to run this test or is too old. >=1.5.0",
-)
+@docker_older_than_1_5_0_skip_marker
 def test_create_network():
     """
     test create network.
@@ -424,10 +411,7 @@ def test_create_network():
     )
 
 
-@pytest.mark.skipif(
-    docker_mod._get_docker_py_versioninfo() < (1, 5, 0),
-    reason="docker module must be installed to run this test or is too old. >=1.5.0",
-)
+@docker_older_than_1_5_0_skip_marker
 def test_remove_network():
     """
     test remove network.
@@ -446,10 +430,7 @@ def test_remove_network():
     client.remove_network.assert_called_once_with("foo")
 
 
-@pytest.mark.skipif(
-    docker_mod._get_docker_py_versioninfo() < (1, 5, 0),
-    reason="docker module must be installed to run this test or is too old. >=1.5.0",
-)
+@docker_older_than_1_5_0_skip_marker
 def test_inspect_network():
     """
     test inspect network.
@@ -468,10 +449,54 @@ def test_inspect_network():
     client.inspect_network.assert_called_once_with("foo")
 
 
-@pytest.mark.skipif(
-    docker_mod._get_docker_py_versioninfo() < (1, 5, 0),
-    reason="docker module must be installed to run this test or is too old. >=1.5.0",
-)
+@docker_older_than_1_5_0_skip_marker
+def test_compare_networks_ipam_config_empty_iprange():
+    """
+    Docker 29 added an empty-string ``IPRange`` to every IPAM Config entry.
+    Older Salt-built desired configs don't carry that key, so a strict dict
+    comparison reports a spurious diff and ``docker_network.present`` would
+    recreate the network on every run.
+
+    Regression test for #68518.
+    """
+    existing = {
+        "Name": "inf-network",
+        "Driver": "bridge",
+        "IPAM": {
+            "Driver": "default",
+            "Options": None,
+            "Config": [
+                {
+                    "Subnet": "172.18.0.0/16",
+                    "IPRange": "",
+                    "Gateway": "172.18.0.1",
+                }
+            ],
+        },
+        "Options": {},
+    }
+    desired = {
+        "Name": "inf-network",
+        "Driver": "bridge",
+        "IPAM": {
+            "Driver": "default",
+            "Options": {},
+            "Config": [
+                {
+                    "Subnet": "172.18.0.0/16",
+                    "Gateway": "172.18.0.1",
+                }
+            ],
+        },
+        "Options": {},
+    }
+    assert docker_mod.compare_networks(existing, desired) == {}
+    # Symmetric: a real subnet change still has to be reported.
+    desired["IPAM"]["Config"][0]["Subnet"] = "172.19.0.0/16"
+    assert "IPAM" in docker_mod.compare_networks(existing, desired)
+
+
+@docker_older_than_1_5_0_skip_marker
 def test_connect_container_to_network():
     """
     test connect_container_to_network
@@ -493,10 +518,7 @@ def test_connect_container_to_network():
     client.connect_container_to_network.assert_called_once_with("container", "foo")
 
 
-@pytest.mark.skipif(
-    docker_mod._get_docker_py_versioninfo() < (1, 5, 0),
-    reason="docker module must be installed to run this test or is too old. >=1.5.0",
-)
+@docker_older_than_1_5_0_skip_marker
 def test_disconnect_container_from_network():
     """
     test disconnect_container_from_network
@@ -515,10 +537,7 @@ def test_disconnect_container_from_network():
     client.disconnect_container_from_network.assert_called_once_with("container", "foo")
 
 
-@pytest.mark.skipif(
-    docker_mod._get_docker_py_versioninfo() < (1, 5, 0),
-    reason="docker module must be installed to run this test or is too old. >=1.5.0",
-)
+@docker_older_than_1_5_0_skip_marker
 def test_list_volumes():
     """
     test list volumes.
@@ -541,10 +560,7 @@ def test_list_volumes():
     )
 
 
-@pytest.mark.skipif(
-    docker_mod._get_docker_py_versioninfo() < (1, 5, 0),
-    reason="docker module must be installed to run this test or is too old. >=1.5.0",
-)
+@docker_older_than_1_5_0_skip_marker
 def test_create_volume():
     """
     test create volume.
@@ -571,10 +587,7 @@ def test_create_volume():
     )
 
 
-@pytest.mark.skipif(
-    docker_mod._get_docker_py_versioninfo() < (1, 5, 0),
-    reason="docker module must be installed to run this test or is too old. >=1.5.0",
-)
+@docker_older_than_1_5_0_skip_marker
 def test_remove_volume():
     """
     test remove volume.
@@ -593,10 +606,7 @@ def test_remove_volume():
     client.remove_volume.assert_called_once_with("foo")
 
 
-@pytest.mark.skipif(
-    docker_mod._get_docker_py_versioninfo() < (1, 5, 0),
-    reason="docker module must be installed to run this test or is too old. >=1.5.0",
-)
+@docker_older_than_1_5_0_skip_marker
 def test_inspect_volume():
     """
     test inspect volume.
@@ -882,16 +892,13 @@ def test_call_success():
     client = Mock()
     client.put_archive = Mock()
     get_client_mock = MagicMock(return_value=client)
-    gen_venv_tar_mock = MagicMock(return_value=None)
 
     context = {"docker.exec_driver": "docker-exec"}
     salt_dunder = {"config.option": docker_config_mock}
 
     with patch.object(docker_mod, "run_all", docker_run_all_mock), patch.object(
         docker_mod, "copy_to", docker_copy_to_mock
-    ), patch.object(docker_mod, "_get_client", get_client_mock), patch.object(
-        docker_mod, "gen_venv_tar", gen_venv_tar_mock
-    ), patch.dict(
+    ), patch.object(docker_mod, "_get_client", get_client_mock), patch.dict(
         docker_mod.__opts__, {"cachedir": "/tmp"}
     ), patch.dict(
         docker_mod.__salt__, salt_dunder
@@ -936,11 +943,6 @@ def test_call_success():
         != docker_run_all_mock.mock_calls[9][1][1]
     )
 
-    # check the parameters of gen_venv_tar call
-    assert gen_venv_tar_mock.mock_calls[0][1][0] == "/tmp"
-    assert gen_venv_tar_mock.mock_calls[0][1][1] == "/var/tmp"
-    assert gen_venv_tar_mock.mock_calls[0][1][2] == "venv-salt-minion"
-
     assert {"retcode": 0, "comment": "container cmd"} == ret
 
 
@@ -972,19 +974,19 @@ def test_compare_container_image_id_resolution():
     """
 
     def _inspect_container_effect(id_):
-        return {
-            "container1": {
+        if id_ == "container1":
+            return {
                 "Config": {"Image": "realimage:latest"},
                 "HostConfig": {},
-            },
-            "container2": {"Config": {"Image": "image_id"}, "HostConfig": {}},
-        }[id_]
+            }
+        if id_ == "container2":
+            return {"Config": {"Image": "image_id"}, "HostConfig": {}}
 
     def _inspect_image_effect(id_):
-        return {
-            "realimage:latest": {"Id": "image_id"},
-            "image_id": {"Id": "image_id"},
-        }[id_]
+        if id_ == "realimage:latest":
+            return {"Id": "image_id"}
+        if id_ == "image_id":
+            return {"Id": "image_id"}
 
     inspect_container_mock = MagicMock(side_effect=_inspect_container_effect)
     inspect_image_mock = MagicMock(side_effect=_inspect_image_effect)
@@ -1002,8 +1004,8 @@ def test_compare_container_ulimits_order():
     """
 
     def _inspect_container_effect(id_):
-        return {
-            "container1": {
+        if id_ == "container1":
+            return {
                 "Config": {},
                 "HostConfig": {
                     "Ulimits": [
@@ -1011,8 +1013,9 @@ def test_compare_container_ulimits_order():
                         {"Hard": 65536, "Soft": 65536, "Name": "nofile"},
                     ]
                 },
-            },
-            "container2": {
+            }
+        if id_ == "container2":
+            return {
                 "Config": {},
                 "HostConfig": {
                     "Ulimits": [
@@ -1020,8 +1023,7 @@ def test_compare_container_ulimits_order():
                         {"Hard": -1, "Soft": -1, "Name": "core"},
                     ]
                 },
-            },
-        }[id_]
+            }
 
     inspect_container_mock = MagicMock(side_effect=_inspect_container_effect)
 
@@ -1039,16 +1041,16 @@ def test_compare_container_env_order():
     """
 
     def _inspect_container_effect(id_):
-        return {
-            "container1": {
+        if id_ == "container1":
+            return {
                 "Config": {},
                 "HostConfig": {"Env": ["FOO=bar", "HELLO=world"]},
-            },
-            "container2": {
+            }
+        if id_ == "container2":
+            return {
                 "Config": {},
                 "HostConfig": {"Env": ["HELLO=world", "FOO=bar"]},
-            },
-        }[id_]
+            }
 
     inspect_container_mock = MagicMock(side_effect=_inspect_container_effect)
 
@@ -1362,69 +1364,3 @@ def test_port():
             "bar": {"6666/tcp": ports["bar"]["6666/tcp"]},
             "baz": {},
         }
-
-
-@pytest.mark.slow_test
-def test_call_with_gen_venv_tar():
-    """
-    test module calling inside containers with the Salt Bundle
-    """
-    ret = None
-    docker_run_all_mock = MagicMock(
-        return_value={
-            "retcode": 0,
-            "stdout": '{"retcode": 0, "comment": "container cmd"}',
-            "stderr": "err",
-        }
-    )
-    docker_copy_to_mock = MagicMock(return_value={"retcode": 0})
-    docker_config_mock = MagicMock(return_value="")
-    docker_cmd_run_mock = MagicMock(
-        return_value={
-            "retcode": 0,
-            "stdout": "test",
-        }
-    )
-    client = Mock()
-    client.put_archive = Mock()
-    get_client_mock = MagicMock(return_value=client)
-
-    context = {"docker.exec_driver": "docker-exec"}
-    salt_dunder = {
-        "config.option": docker_config_mock,
-        "cmd.run_all": docker_cmd_run_mock,
-    }
-
-    with patch.object(docker_mod, "run_all", docker_run_all_mock), patch.object(
-        docker_mod, "copy_to", docker_copy_to_mock
-    ), patch.object(docker_mod, "_get_client", get_client_mock), patch.object(
-        sys, "executable", "/tmp/venv-salt-minion/bin/python"
-    ), patch.dict(
-        docker_mod.__opts__, {"cachedir": "/tmp"}
-    ), patch.dict(
-        docker_mod.__salt__, salt_dunder
-    ), patch.dict(
-        docker_mod.__context__, context
-    ):
-        ret = docker_mod.call("ID", "test.arg", 1, 2, arg1="val1")
-
-    # Check that the directory is different each time
-    # [ call(name, [args]), ...
-    assert "mkdir" in docker_run_all_mock.mock_calls[0][1][1]
-
-    assert (
-        "tar zxf /var/tmp/venv-salt.tgz -C /var/tmp"
-        == docker_run_all_mock.mock_calls[1][1][1]
-    )
-
-    assert docker_run_all_mock.mock_calls[3][1][1].startswith(
-        "/var/tmp/venv-salt-minion/bin/python /var/tmp/venv-salt-minion/bin/salt-call "
-    )
-
-    # check remove the salt bundle tarball
-    assert docker_run_all_mock.mock_calls[2][1][1] == "rm -f /var/tmp/venv-salt.tgz"
-
-    # check directory cleanup
-    assert docker_run_all_mock.mock_calls[4][1][1] == "rm -rf /var/tmp/venv-salt-minion"
-
-    assert {"retcode": 0, "comment": "container cmd"} == ret

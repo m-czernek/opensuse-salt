@@ -11,7 +11,6 @@ Package support for openSUSE via the zypper package manager
 
 """
 
-
 import configparser
 import datetime
 import errno
@@ -36,8 +35,6 @@ import salt.utils.stringutils
 import salt.utils.systemd
 import salt.utils.versions
 from salt.exceptions import CommandExecutionError, MinionError, SaltInvocationError
-
-# pylint: disable=import-error,redefined-builtin,no-name-in-module
 from salt.utils.versions import LooseVersion
 
 if salt.utils.files.is_fcntl_available():
@@ -47,8 +44,8 @@ log = logging.getLogger(__name__)
 
 HAS_ZYPP = False
 ZYPP_HOME = "/etc/zypp"
-LOCKS = "{}/locks".format(ZYPP_HOME)
-REPOS = "{}/repos.d".format(ZYPP_HOME)
+LOCKS = f"{ZYPP_HOME}/locks"
+REPOS = f"{ZYPP_HOME}/repos.d"
 DEFAULT_PRIORITY = 99
 PKG_ARCH_SEPARATOR = "."
 
@@ -105,8 +102,6 @@ class _Zypper:
     }
 
     LOCK_EXIT_CODE = 7
-    NOT_FOUND_EXIT_CODE = 104
-
     XML_DIRECTIVES = ["-x", "--xmlout"]
     # ZYPPER_LOCK is not affected by --root
     ZYPPER_LOCK = "/var/run/zypp.pid"
@@ -138,16 +133,8 @@ class _Zypper:
         self.__no_raise = False
         self.__refresh = False
         self.__ignore_repo_failure = False
-        self.__ignore_not_found = False
         self.__systemd_scope = False
         self.__root = None
-
-        # Dist upgrade vendor change support (SLE12+)
-        self.dup_avc = False
-        # Install/Patch/Upgrade vendor change support (SLE15+)
-        self.inst_avc = False
-        # Flag if allow vendor change should be allowed
-        self.avc = False
 
         # Call status
         self.__called = False
@@ -165,9 +152,6 @@ class _Zypper:
         # Ignore exit code for 106 (repo is not available)
         if "no_repo_failure" in kwargs:
             self.__ignore_repo_failure = kwargs["no_repo_failure"]
-        # Ignore exit code for 104 (package not found)
-        if "ignore_not_found" in kwargs:
-            self.__ignore_not_found = kwargs["ignore_not_found"]
         if "systemd_scope" in kwargs:
             self.__systemd_scope = kwargs["systemd_scope"]
         if "root" in kwargs:
@@ -193,8 +177,6 @@ class _Zypper:
             self.__no_raise = True
         elif item == "refreshable":
             self.__refresh = True
-        elif item == "allow_vendor_change":
-            return self.__allow_vendor_change
         elif item == "call":
             return self.__call
         else:
@@ -234,33 +216,6 @@ class _Zypper:
     @property
     def pid(self):
         return self.__call_result.get("pid", "")
-
-    def __allow_vendor_change(self, allowvendorchange, novendorchange):
-        if allowvendorchange or not novendorchange:
-            self.refresh_zypper_flags()
-            if self.dup_avc or self.inst_avc:
-                log.info("Enabling vendor change")
-                self.avc = True
-            else:
-                log.warning(
-                    "Enabling/Disabling vendor changes is not supported on this Zypper version"
-                )
-        return self
-
-    def refresh_zypper_flags(self):
-        try:
-            zypp_version = version("zypper")
-            # zypper version 1.11.34 in SLE12 update supports vendor change for only dist upgrade
-            if version_cmp(zypp_version, "1.11.34") >= 0:
-                # zypper version supports vendor change for dist upgrade
-                self.dup_avc = True
-            # zypper version 1.14.8 in SLE15 update supports vendor change in install/patch/upgrading
-            if version_cmp(zypp_version, "1.14.8") >= 0:
-                self.inst_avc = True
-            else:
-                log.error("Failed to compare Zypper version")
-        except Exception as ex:
-            log.error("Unable to get Zypper version: {}".format(ex))
 
     def _is_error(self):
         """
@@ -377,10 +332,6 @@ class _Zypper:
         if self.__root:
             self.__cmd.extend(["--root", self.__root])
 
-        # Do not consider 104 as a retcode error
-        if self.__ignore_not_found:
-            kwargs["success_retcodes"] = [_Zypper.NOT_FOUND_EXIT_CODE]
-
         self.__cmd.extend(args)
         kwargs["output_loglevel"] = "trace"
         kwargs["python_shell"] = False
@@ -400,15 +351,6 @@ class _Zypper:
             if self.__systemd_scope:
                 cmd.extend(["systemd-run", "--scope"])
             cmd.extend(self.__cmd)
-
-            if self.avc:
-                for i in ["install", "upgrade", "dist-upgrade"]:
-                    if i in cmd:
-                        if i == "install" and self.inst_avc:
-                            cmd.insert(cmd.index(i) + 1, "--allow-vendor-change")
-                        elif i in ["upgrade", "dist-upgrade"] and self.dup_avc:
-                            cmd.insert(cmd.index(i) + 1, "--allow-vendor-change")
-
             log.debug("Calling Zypper: %s", " ".join(cmd))
             self.__call_result = __salt__["cmd.run_all"](cmd, **kwargs)
             if self._check_result():
@@ -429,9 +371,7 @@ class _Zypper:
                 self.TAG_RELEASED,
             )
         if self.error_msg and not self.__no_raise and not self.__ignore_repo_failure:
-            raise CommandExecutionError(
-                "Zypper command failure: {}".format(self.error_msg)
-            )
+            raise CommandExecutionError(f"Zypper command failure: {self.error_msg}")
 
         return (
             self._is_xml_mode()
@@ -536,15 +476,11 @@ class Wildcard:
         Get available versions of the package.
         :return:
         """
-        solvables = (
-            self.zypper(ignore_not_found=True)
-            .nolock.xml.call("se", "-v", self.name)
-            .getElementsByTagName("solvable")
-        )
+        solvables = self.zypper.nolock.xml.call(
+            "se", "-xv", self.name
+        ).getElementsByTagName("solvable")
         if not solvables:
-            raise CommandExecutionError(
-                "No packages found matching '{}'".format(self.name)
-            )
+            raise CommandExecutionError(f"No packages found matching '{self.name}'")
 
         return sorted(
             {
@@ -579,7 +515,7 @@ class Wildcard:
         self._op = version.replace(exact_version, "") or None
         if self._op and self._op not in self.Z_OP:
             raise CommandExecutionError(
-                'Zypper do not supports operator "{}".'.format(self._op)
+                f'Zypper do not supports operator "{self._op}".'
             )
         self.version = exact_version
 
@@ -623,7 +559,7 @@ def list_upgrades(refresh=True, root=None, **kwargs):
         salt '*' pkg.list_upgrades
     """
     if refresh:
-        refresh_db(root, **kwargs)
+        refresh_db(root)
 
     ret = dict()
     cmd = ["list-updates"]
@@ -737,7 +673,7 @@ def info_available(*names, **kwargs):
 
     # Refresh db before extracting the latest package
     if kwargs.get("refresh", True):
-        refresh_db(root, **kwargs)
+        refresh_db(root)
 
     pkg_info = []
     batch = names[:]
@@ -980,7 +916,7 @@ def list_pkgs(versions_as_list=False, root=None, includes=None, **kwargs):
 
     # Results can be different if a different root or a different
     # inclusion types are passed
-    contextkey = "pkg.list_pkgs_{}_{}".format(root, includes)
+    contextkey = f"pkg.list_pkgs_{root}_{includes}"
 
     if contextkey in __context__ and kwargs.get("use_context", True):
         return _list_pkgs_from_context(versions_as_list, contextkey, attr)
@@ -1048,7 +984,7 @@ def list_pkgs(versions_as_list=False, root=None, includes=None, **kwargs):
             else:
                 elements = []
             for element in elements:
-                extended_name = "{}:{}".format(include, element)
+                extended_name = f"{include}:{element}"
                 info = info_available(extended_name, refresh=False, root=root)
                 _ret[extended_name] = [
                     {
@@ -1145,7 +1081,7 @@ def list_repo_pkgs(*args, **kwargs):
 
     root = kwargs.get("root") or None
     for node in (
-        __zypper__(root=root, ignore_not_found=True)
+        __zypper__(root=root)
         .xml.call("se", "-s", *targets)
         .getElementsByTagName("solvable")
     ):
@@ -1214,9 +1150,7 @@ def _get_repo_info(alias, repos_cfg=None, root=None):
     Get one repo meta-data.
     """
     try:
-        meta = dict(
-            (repos_cfg or _get_configured_repos(root=root)).items(alias, raw=True)
-        )
+        meta = dict((repos_cfg or _get_configured_repos(root=root)).items(alias))
         meta["alias"] = alias
         for key, val in meta.items():
             if val in ["0", "1"]:
@@ -1291,7 +1225,7 @@ def del_repo(repo, root=None):
                     "message": msg[0].childNodes[0].nodeValue,
                 }
 
-    raise CommandExecutionError("Repository '{}' not found.".format(repo))
+    raise CommandExecutionError(f"Repository '{repo}' not found.")
 
 
 def mod_repo(repo, **kwargs):
@@ -1378,7 +1312,7 @@ def mod_repo(repo, **kwargs):
 
             if new_url == base_url:
                 raise CommandExecutionError(
-                    "Repository '{}' already exists as '{}'.".format(repo, alias)
+                    f"Repository '{repo}' already exists as '{alias}'."
                 )
 
         # Add new repo
@@ -1439,6 +1373,7 @@ def mod_repo(repo, **kwargs):
         cmd_opt.append(kwargs.get("name"))
 
     if kwargs.get("gpgautoimport") is True:
+        global_cmd_opt.append("--gpg-auto-import-keys")
         call_refresh = True
 
     if cmd_opt:
@@ -1450,8 +1385,8 @@ def mod_repo(repo, **kwargs):
         # when used with "zypper ar --refresh" or "zypper mr --refresh"
         # --gpg-auto-import-keys is not doing anything
         # so we need to specifically refresh here with --gpg-auto-import-keys
-        kwargs.update({"repos": repo})
-        refresh_db(root=root, **kwargs)
+        refresh_opts = global_cmd_opt + ["refresh"] + [repo]
+        __zypper__(root=root).xml.call(*refresh_opts)
     elif not added and not cmd_opt:
         comment = "Specified arguments did not result in modification of repo"
 
@@ -1462,7 +1397,7 @@ def mod_repo(repo, **kwargs):
     return repo
 
 
-def refresh_db(force=None, root=None, **kwargs):
+def refresh_db(force=None, root=None):
     """
     Trigger a repository refresh by calling ``zypper refresh``. Refresh will run
     with ``--force`` if the "force=True" flag is passed on the CLI or
@@ -1472,17 +1407,6 @@ def refresh_db(force=None, root=None, **kwargs):
     It will return a dict::
 
         {'<database name>': Bool}
-
-    gpgautoimport : False
-        If set to True, automatically trust and import public GPG key for
-        the repository.
-
-        .. versionadded:: 3005
-
-    repos
-        Refresh just the specified repos
-
-        .. versionadded:: 3005
 
     root
         operate on a different root directory.
@@ -1504,22 +1428,11 @@ def refresh_db(force=None, root=None, **kwargs):
     salt.utils.pkg.clear_rtag(__opts__)
     ret = {}
     refresh_opts = ["refresh"]
-    global_opts = []
     if force is None:
         force = __pillar__.get("zypper", {}).get("refreshdb_force", True)
     if force:
         refresh_opts.append("--force")
-    repos = kwargs.get("repos", [])
-    refresh_opts.extend([repos] if not isinstance(repos, list) else repos)
-
-    if kwargs.get("gpgautoimport", False):
-        global_opts.append("--gpg-auto-import-keys")
-
-    # We do the actual call to zypper refresh.
-    # We ignore retcode 6 which is returned when there are no repositories defined.
-    out = __zypper__(root=root).refreshable.call(
-        *global_opts, *refresh_opts, success_retcodes=[0, 6]
-    )
+    out = __zypper__(root=root).refreshable.call(*refresh_opts)
 
     for line in out.splitlines():
         if not line:
@@ -1538,10 +1451,8 @@ def refresh_db(force=None, root=None, **kwargs):
     return ret
 
 
-def _detect_includes(pkgs, inclusion_detection):
+def _find_types(pkgs):
     """Form a package names list, find prefixes of packages types."""
-    if not inclusion_detection:
-        return None
     return sorted({pkg.split(":", 1)[0] for pkg in pkgs if len(pkg.split(":", 1)) == 2})
 
 
@@ -1557,10 +1468,7 @@ def install(
     ignore_repo_failure=False,
     no_recommends=False,
     root=None,
-    inclusion_detection=False,
-    novendorchange=True,
-    allowvendorchange=False,
-    **kwargs
+    **kwargs,
 ):
     """
     .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
@@ -1607,17 +1515,16 @@ def install(
     skip_verify
         Skip the GPG verification check (e.g., ``--no-gpg-checks``)
 
-    novendorchange
-        DEPRECATED(use allowvendorchange): If set to True, do not allow vendor changes. Default: True
-
-    allowvendorchange
-        If set to True, vendor change is allowed. Default: False
-        If both allowvendorchange and novendorchange are passed, only allowvendorchange is used.
-
     version
         Can be either a version number, or the combination of a comparison
         operator (<, >, <=, >=, =) and a version number (ex. '>1.2.3-4').
         This parameter is ignored if ``pkgs`` or ``sources`` is passed.
+
+        .. note::
+            Remember that versions that contain a single `.` will be interpreted
+            as numbers and must be double-quoted. For example, version
+            ``3006.10`` will be rendered as ``3006.1``. To pass ``3006.10``
+            you'll need to use double-quotes. ``version="'3006.10'"``
 
     resolve_capabilities
         If this option is set to True zypper will take capabilities into
@@ -1682,9 +1589,6 @@ def install(
 
         .. versionadded:: 2018.3.0
 
-    inclusion_detection:
-        Detect ``includes`` based on ``sources``
-        By default packages are always included
 
     Returns a dict containing the new package names and versions::
 
@@ -1704,7 +1608,7 @@ def install(
                 'arch': '<new-arch>'}}}
     """
     if refresh:
-        refresh_db(root, **kwargs)
+        refresh_db(root)
 
     try:
         pkg_params, pkg_type = __salt__["pkg_resource.parse_targets"](
@@ -1737,7 +1641,7 @@ def install(
                 prefix, verstr = salt.utils.pkg.split_comparison(version_num)
                 if not prefix:
                     prefix = "="
-                target = "{}{}{}".format(param, prefix, verstr)
+                target = f"{param}{prefix}{verstr}"
                 log.debug("targeting package: %s", target)
                 targets.append(target)
     elif pkg_type == "advisory":
@@ -1745,9 +1649,7 @@ def install(
         cur_patches = list_patches(root=root)
         for advisory_id in pkg_params:
             if advisory_id not in cur_patches:
-                raise CommandExecutionError(
-                    'Advisory id "{}" not found'.format(advisory_id)
-                )
+                raise CommandExecutionError(f'Advisory id "{advisory_id}" not found')
             else:
                 # If we add here the `patch:` prefix, the
                 # `_find_types` helper will take the patches into the
@@ -1760,8 +1662,7 @@ def install(
 
     diff_attr = kwargs.get("diff_attr")
 
-    includes = _detect_includes(targets, inclusion_detection)
-
+    includes = _find_types(targets)
     old = (
         list_pkgs(attr=diff_attr, root=root, includes=includes)
         if not downloadonly
@@ -1779,7 +1680,6 @@ def install(
     cmd_install.append(
         kwargs.get("resolve_capabilities") and "--capability" or "--name"
     )
-    # Install / patching / upgrade with vendor change support is only in SLE 15+  opensuse Leap 15+
 
     if not refresh:
         cmd_install.insert(0, "--no-refresh")
@@ -1802,7 +1702,7 @@ def install(
     # if the name of the package is already prefixed with 'patch:' we
     # can avoid listing them in the `advisory_ids` field.
     if pkg_type == "advisory":
-        targets = ["patch:{}".format(t) for t in targets]
+        targets = [f"patch:{t}" for t in targets]
 
     # Split the targets into batches of 500 packages each, so that
     # the maximal length of the command line is not broken
@@ -1816,7 +1716,6 @@ def install(
                 systemd_scope=systemd_scope,
                 root=root,
             )
-            .allow_vendor_change(allowvendorchange, novendorchange)
             .call(*cmd)
             .splitlines()
         ):
@@ -1829,9 +1728,7 @@ def install(
     while downgrades:
         cmd = cmd_install + ["--force"] + downgrades[:500]
         downgrades = downgrades[500:]
-        __zypper__(no_repo_failure=ignore_repo_failure, root=root).allow_vendor_change(
-            allowvendorchange, novendorchange
-        ).call(*cmd)
+        __zypper__(no_repo_failure=ignore_repo_failure, root=root).call(*cmd)
 
     _clean_cache()
     new = (
@@ -1864,13 +1761,12 @@ def upgrade(
     dryrun=False,
     dist_upgrade=False,
     fromrepo=None,
-    novendorchange=True,
-    allowvendorchange=False,
+    novendorchange=False,
     skip_verify=False,
     no_recommends=False,
     root=None,
     diff_attr=None,
-    **kwargs
+    **kwargs,
 ):  # pylint: disable=unused-argument
     """
     .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
@@ -1926,11 +1822,7 @@ def upgrade(
         Specify a list of package repositories to upgrade from. Default: None
 
     novendorchange
-        DEPRECATED(use allowvendorchange): If set to True, do not allow vendor changes. Default: True
-
-    allowvendorchange
-        If set to True, vendor change is allowed. Default: False
-        If both allowvendorchange and novendorchange are passed, only allowvendorchange is used.
+        If set to True, no allow vendor changes. Default: False
 
     skip_verify
         Skip the GPG verification check (e.g., ``--no-gpg-checks``)
@@ -2001,7 +1893,7 @@ def upgrade(
         cmd_update.insert(0, "--no-gpg-checks")
 
     if refresh:
-        refresh_db(root, **kwargs)
+        refresh_db(root)
 
     if dryrun:
         cmd_update.append("--dry-run")
@@ -2013,18 +1905,28 @@ def upgrade(
             cmd_update.extend(["--from" if dist_upgrade else "--repo", repo])
         log.info("Targeting repos: %s", fromrepo)
 
-    if no_recommends:
-        cmd_update.append("--no-recommends")
-        log.info("Disabling recommendations")
+    if dist_upgrade:
+        if novendorchange:
+            # TODO: Grains validation should be moved to Zypper class
+            if __grains__["osrelease_info"][0] > 11:
+                cmd_update.append("--no-allow-vendor-change")
+                log.info("Disabling vendor changes")
+            else:
+                log.warning(
+                    "Disabling vendor changes is not supported on this Zypper version"
+                )
 
-    if dryrun:
-        # Creates a solver test case for debugging.
-        log.info("Executing debugsolver and performing a dry-run dist-upgrade")
-        __zypper__(systemd_scope=_systemd_scope(), root=root).allow_vendor_change(
-            allowvendorchange, novendorchange
-        ).noraise.call(*cmd_update + ["--debug-solver"])
+        if no_recommends:
+            cmd_update.append("--no-recommends")
+            log.info("Disabling recommendations")
 
-    if not dist_upgrade:
+        if dryrun:
+            # Creates a solver test case for debugging.
+            log.info("Executing debugsolver and performing a dry-run dist-upgrade")
+            __zypper__(systemd_scope=_systemd_scope(), root=root).noraise.call(
+                *cmd_update + ["--debug-solver"]
+            )
+    else:
         if name or pkgs:
             try:
                 (pkg_params, _) = __salt__["pkg_resource.parse_targets"](
@@ -2038,9 +1940,7 @@ def upgrade(
 
     old = list_pkgs(root=root, attr=diff_attr)
 
-    __zypper__(systemd_scope=_systemd_scope(), root=root).allow_vendor_change(
-        allowvendorchange, novendorchange
-    ).noraise.call(*cmd_update)
+    __zypper__(systemd_scope=_systemd_scope(), root=root).noraise.call(*cmd_update)
     _clean_cache()
     new = list_pkgs(root=root, attr=diff_attr)
     ret = salt.utils.data.compare_dicts(old, new)
@@ -2063,7 +1963,7 @@ def upgrade(
     return ret
 
 
-def _uninstall(inclusion_detection, name=None, pkgs=None, root=None):
+def _uninstall(name=None, pkgs=None, root=None):
     """
     Remove and purge do identical things but with different Zypper commands,
     this function performs the common logic.
@@ -2073,21 +1973,17 @@ def _uninstall(inclusion_detection, name=None, pkgs=None, root=None):
     except MinionError as exc:
         raise CommandExecutionError(exc)
 
-    ptfpackages = _find_ptf_packages(pkg_params.keys(), root=root)
-    includes = _detect_includes(pkg_params.keys(), inclusion_detection)
+    includes = _find_types(pkg_params.keys())
     old = list_pkgs(root=root, includes=includes)
     targets = []
     for target in pkg_params:
-        if target in ptfpackages:
-            # ptfpackages needs special handling
-            continue
         # Check if package version set to be removed is actually installed:
         # old[target] contains a comma-separated list of installed versions
         if target in old and pkg_params[target] in old[target].split(","):
             targets.append(target + "-" + pkg_params[target])
         elif target in old and not pkg_params[target]:
             targets.append(target)
-    if not targets and not ptfpackages:
+    if not targets:
         return {}
 
     systemd_scope = _systemd_scope()
@@ -2098,13 +1994,6 @@ def _uninstall(inclusion_detection, name=None, pkgs=None, root=None):
             "remove", *targets[:500]
         )
         targets = targets[500:]
-
-    # handle ptf packages
-    while ptfpackages:
-        __zypper__(systemd_scope=systemd_scope, root=root).call(
-            "removeptf", "--allow-downgrade", *ptfpackages[:500]
-        )
-        ptfpackages = ptfpackages[500:]
 
     _clean_cache()
     new = list_pkgs(root=root, includes=includes)
@@ -2147,7 +2036,7 @@ def normalize_name(name):
 
 
 def remove(
-    name=None, pkgs=None, root=None, inclusion_detection=False, **kwargs
+    name=None, pkgs=None, root=None, **kwargs
 ):  # pylint: disable=unused-argument
     """
     .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
@@ -2179,11 +2068,8 @@ def remove(
     root
         Operate on a different root directory.
 
-    inclusion_detection:
-        Detect ``includes`` based on ``pkgs``
-        By default packages are always included
-
     .. versionadded:: 0.16.0
+
 
     Returns a dict containing the changes.
 
@@ -2194,18 +2080,11 @@ def remove(
         salt '*' pkg.remove <package name>
         salt '*' pkg.remove <package1>,<package2>,<package3>
         salt '*' pkg.remove pkgs='["foo", "bar"]'
-
-    .. versionchanged:: 3007
-        Can now remove also PTF packages which require a different handling in the backend.
-
-    Can now remove also PTF packages which require a different handling in the backend.
     """
-    return _uninstall(inclusion_detection, name=name, pkgs=pkgs, root=root)
+    return _uninstall(name=name, pkgs=pkgs, root=root)
 
 
-def purge(
-    name=None, pkgs=None, root=None, inclusion_detection=False, **kwargs
-):  # pylint: disable=unused-argument
+def purge(name=None, pkgs=None, root=None, **kwargs):  # pylint: disable=unused-argument
     """
     .. versionchanged:: 2015.8.12,2016.3.3,2016.11.0
         On minions running systemd>=205, `systemd-run(1)`_ is now used to
@@ -2237,10 +2116,6 @@ def purge(
     root
         Operate on a different root directory.
 
-    inclusion_detection:
-        Detect ``includes`` based on ``pkgs``
-        By default packages are always included
-
     .. versionadded:: 0.16.0
 
 
@@ -2254,7 +2129,7 @@ def purge(
         salt '*' pkg.purge <package1>,<package2>,<package3>
         salt '*' pkg.purge pkgs='["foo", "bar"]'
     """
-    return _uninstall(inclusion_detection, name=name, pkgs=pkgs, root=root)
+    return _uninstall(name=name, pkgs=pkgs, root=root)
 
 
 def list_holds(pattern=None, full=True, root=None, **kwargs):
@@ -2310,7 +2185,7 @@ def list_holds(pattern=None, full=True, root=None, **kwargs):
                         )
                     )
 
-    ptrn_re = re.compile(r"{}-\S+".format(pattern)) if pattern else None
+    ptrn_re = re.compile(rf"{pattern}-\S+") if pattern else None
     for pkg_name, pkg_editions in inst_pkgs.items():
         for pkg_info in pkg_editions:
             pkg_ret = (
@@ -2446,20 +2321,18 @@ def unhold(name=None, pkgs=None, root=None, **kwargs):
                 lock_ver = lock_ver.lstrip("= ")
             if version and lock_ver != version:
                 ret[target]["result"] = False
-                ret[target][
-                    "comment"
-                ] = "Unable to unhold package {} as it is held with the other version.".format(
-                    target
+                ret[target]["comment"] = (
+                    "Unable to unhold package {} as it is held with the other version.".format(
+                        target
+                    )
                 )
             else:
-                removed.append(
-                    target if not lock_ver else "{}={}".format(target, lock_ver)
-                )
+                removed.append(target if not lock_ver else f"{target}={lock_ver}")
                 ret[target]["changes"]["new"] = ""
                 ret[target]["changes"]["old"] = "hold"
-                ret[target]["comment"] = "Package {} is no longer held.".format(target)
+                ret[target]["comment"] = f"Package {target} is no longer held."
         else:
-            ret[target]["comment"] = "Package {} was already unheld.".format(target)
+            ret[target]["comment"] = f"Package {target} was already unheld."
 
     if removed:
         __zypper__(root=root).call("rl", *removed)
@@ -2511,10 +2384,10 @@ def hold(name=None, pkgs=None, root=None, **kwargs):
             (target, version) = next(iter(target.items()))
         ret[target] = {"name": target, "changes": {}, "result": True, "comment": ""}
         if not locks.get(target):
-            added.append(target if not version else "{}={}".format(target, version))
+            added.append(target if not version else f"{target}={version}")
             ret[target]["changes"]["new"] = "hold"
             ret[target]["changes"]["old"] = ""
-            ret[target]["comment"] = "Package {} is now being held.".format(target)
+            ret[target]["comment"] = f"Package {target} is now being held."
         else:
             ret[target]["comment"] = "Package {} is already set to be held.".format(
                 target
@@ -2662,9 +2535,7 @@ def owner(*paths, **kwargs):
 def _get_visible_patterns(root=None):
     """Get all available patterns in the repo that are visible."""
     patterns = {}
-    search_patterns = __zypper__(root=root, ignore_not_found=True).nolock.xml.call(
-        "se", "-t", "pattern"
-    )
+    search_patterns = __zypper__(root=root).nolock.xml.call("se", "-t", "pattern")
     for element in search_patterns.getElementsByTagName("solvable"):
         installed = element.getAttribute("status") == "installed"
         patterns[element.getAttribute("name")] = {
@@ -2672,28 +2543,6 @@ def _get_visible_patterns(root=None):
             "summary": element.getAttribute("summary"),
         }
     return patterns
-
-
-def _find_ptf_packages(pkgs, root=None):
-    """
-    Find ptf packages in "pkgs" and return them as list
-    """
-    ptfs = []
-    cmd = ["rpm"]
-    if root:
-        cmd.extend(["--root", root])
-    cmd.extend(["-q", "--qf", "%{NAME}: [%{PROVIDES} ]\n"])
-    cmd.extend(pkgs)
-    output = __salt__["cmd.run"](cmd)
-    for line in output.splitlines():
-        if not line.strip():
-            continue
-        if ":" not in line:
-            continue
-        pkg, provides = line.split(":", 1)
-        if "ptf()" in provides:
-            ptfs.append(pkg)
-    return ptfs
 
 
 def _get_installed_patterns(root=None):
@@ -2867,7 +2716,7 @@ def search(criteria, refresh=False, **kwargs):
     root = kwargs.get("root", None)
 
     if refresh:
-        refresh_db(root, **kwargs)
+        refresh_db(root)
 
     cmd = ["search"]
     if kwargs.get("match") == "exact":
@@ -2883,12 +2732,12 @@ def search(criteria, refresh=False, **kwargs):
 
     cmd.append(criteria)
     solvables = (
-        __zypper__(root=root, ignore_not_found=True)
+        __zypper__(root=root)
         .nolock.noraise.xml.call(*cmd)
         .getElementsByTagName("solvable")
     )
     if not solvables:
-        raise CommandExecutionError("No packages found matching '{}'".format(criteria))
+        raise CommandExecutionError(f"No packages found matching '{criteria}'")
 
     out = {}
     for solvable in solvables:
@@ -3018,7 +2867,7 @@ def download(*packages, **kwargs):
 
     refresh = kwargs.get("refresh", False)
     if refresh:
-        refresh_db(root, **kwargs)
+        refresh_db(root)
 
     pkg_ret = {}
     for dld_result in (
@@ -3040,10 +2889,10 @@ def download(*packages, **kwargs):
     if pkg_ret:
         failed = [pkg for pkg in packages if pkg not in pkg_ret]
         if failed:
-            pkg_ret[
-                "_error"
-            ] = "The following package(s) failed to download: {}".format(
-                ", ".join(failed)
+            pkg_ret["_error"] = (
+                "The following package(s) failed to download: {}".format(
+                    ", ".join(failed)
+                )
             )
         return pkg_ret
 
@@ -3135,7 +2984,7 @@ def _get_patches(installed_only=False, root=None):
     """
     patches = {}
     for element in (
-        __zypper__(root=root, ignore_not_found=True)
+        __zypper__(root=root)
         .nolock.xml.call("se", "-t", "patch")
         .getElementsByTagName("solvable")
     ):
@@ -3170,7 +3019,7 @@ def list_patches(refresh=False, root=None, **kwargs):
         salt '*' pkg.list_patches
     """
     if refresh:
-        refresh_db(root, **kwargs)
+        refresh_db(root)
 
     return _get_patches(root=root)
 
@@ -3264,7 +3113,7 @@ def resolve_capabilities(pkgs, refresh=False, root=None, **kwargs):
         salt '*' pkg.resolve_capabilities resolve_capabilities=True w3m_ssl
     """
     if refresh:
-        refresh_db(root, **kwargs)
+        refresh_db(root)
 
     ret = list()
     for pkg in pkgs:
@@ -3320,91 +3169,3 @@ def services_need_restart(root=None, **kwargs):
     services = zypper_output.split()
 
     return services
-
-
-def get_repo_keys(info=False, root=None, **kwargs):
-    """Return the list of all the GPG keys stored in the RPM database
-
-    .. versionadded:: TBD
-
-    info
-       get the key information, returing a dictionary instead of a
-       list
-
-    root
-       use root as top level directory (default: "/")
-
-    CLI Example:
-
-    .. code-block:: bash
-
-        salt '*' pkg.get_repo_keys
-        salt '*' pkg.get_repo_keys info=True
-
-    """
-    return __salt__["lowpkg.list_gpg_keys"](info, root)
-
-
-def add_repo_key(path=None, text=None, root=None, saltenv="base", **kwargs):
-    """Import a new key into the key storage
-
-    .. versionadded:: TBD
-
-    path
-        the path of the key file to import
-
-    text
-        the key data to import, in string form
-
-    root
-        use root as top level directory (default: "/")
-
-    saltenv
-        the environment the key file resides in
-
-    CLI Examples:
-
-    .. code-block:: bash
-
-        salt '*' pkg.add_repo_key 'salt://apt/sources/test.key'
-        salt '*' pkg.add_repo_key text="'$KEY1'"
-
-    """
-    if not path and not text:
-        raise SaltInvocationError("Provide a key to add")
-
-    if path and text:
-        raise SaltInvocationError("Add a key via path or key")
-
-    if path:
-        cache_path = __salt__["cp.cache_file"](path, saltenv)
-
-        if not cache_path:
-            log.error("Unable to get cached copy of file: %s", path)
-            return False
-
-        with salt.utils.files.fopen(cache_path, "r") as f:
-            text = f.read()
-
-    return __salt__["lowpkg.import_gpg_key"](text, root)
-
-
-def del_repo_key(keyid, root=None, **kwargs):
-    """Remove a key from the key storage
-
-    .. versionadded:: TBD
-
-    keyid
-        key identificatior
-
-    root
-       use root as top level directory (default: "/")
-
-    CLI Examples:
-
-    .. code-block:: bash
-
-        salt '*' pkg.del_repo_key keyid=gpg-pubkey-3dbdc284-53674dd4
-
-    """
-    return __salt__["lowpkg.remove_gpg_key"](keyid, root)

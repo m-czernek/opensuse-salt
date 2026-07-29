@@ -2,22 +2,28 @@
 Zeromq transport classes
 """
 
+import datetime
 import errno
 import hashlib
+import itertools
 import logging
 import os
 import signal
+import socket
 import sys
 import threading
 from random import randint
 
 import zmq.error
+import zmq.eventloop.future
 import zmq.eventloop.zmqstream
 
-import tornado
-import tornado.concurrent
-import tornado.gen
-import tornado.ioloop
+import salt.ext.tornado
+import salt.ext.tornado.concurrent
+import salt.ext.tornado.gen
+import salt.ext.tornado.ioloop
+import salt.ext.tornado.locks
+import salt.ext.tornado.queues
 import salt.payload
 import salt.transport.base
 import salt.utils.files
@@ -37,6 +43,22 @@ except ImportError:
 
 
 log = logging.getLogger(__name__)
+
+REQUEST_TIMEOUT = 60
+
+# Payload marker for AsyncReqMessageClient queue: stop _send_recv gracefully.
+_REQ_QUEUE_SHUTDOWN = object()
+
+# Per-process counter used to give each AsyncReqMessageClient instance a
+# stable, unique routing-id slot.  Long-lived daemons (minions, syndics)
+# multiplex multiple concurrent REQ sockets over one process, so each
+# socket must claim a distinct identity -- otherwise the master's
+# ROUTER_HANDOVER=1 would drop in-flight replies when a sibling socket
+# reconnected with the same identity.  Within a single socket instance the
+# identity is reused across ZMQ-level reconnects, which is what lets the
+# master's ROUTER replace the previous peer table entry instead of
+# leaking one per reconnect.
+_REQ_IDENTITY_SLOT = itertools.count()
 
 
 def _get_master_uri(master_ip, master_port, source_ip=None, source_port=None):
@@ -204,22 +226,18 @@ class PublishClient(salt.transport.base.PublishClient):
         self.close()
 
     # TODO: this is the time to see if we are connected, maybe use the req channel to guess?
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def connect(self, publish_port, connect_callback=None, disconnect_callback=None):
+        self._connect_called = True
         self.publish_port = publish_port
         log.debug(
             "Connecting the Minion to the Master publish port, using the URI: %s",
             self.master_pub,
         )
         log.debug("%r connecting to %s", self, self.master_pub)
-        if (
-            hasattr(self, "_monitor")
-            and self._monitor is not None
-            and disconnect_callback is not None
-        ):
-            self._monitor.disconnect_callback = disconnect_callback
         self._socket.connect(self.master_pub)
-        connect_callback(True)
+        if connect_callback is not None:
+            connect_callback(True)
 
     @property
     def master_pub(self):
@@ -233,7 +251,7 @@ class PublishClient(salt.transport.base.PublishClient):
             source_port=self.opts.get("source_publish_port"),
         )
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def _decode_messages(self, messages):
         """
         Take the zmq messages, decrypt/decode them into a payload
@@ -255,7 +273,7 @@ class PublishClient(salt.transport.base.PublishClient):
                 and message_target not in ("broadcast", "syndic")
             ):
                 log.debug("Publish received for not this minion: %s", message_target)
-                raise tornado.gen.Return(None)
+                raise salt.ext.tornado.gen.Return(None)
             payload = salt.payload.loads(messages[1])
         else:
             raise Exception(
@@ -265,7 +283,7 @@ class PublishClient(salt.transport.base.PublishClient):
             )
         # Yield control back to the caller. When the payload has been decoded, assign
         # the decoded payload to 'ret' and resume operation
-        raise tornado.gen.Return(payload)
+        raise salt.ext.tornado.gen.Return(payload)
 
     @property
     def stream(self):
@@ -284,9 +302,37 @@ class PublishClient(salt.transport.base.PublishClient):
 
         :param func callback: A function which should be called when data is received
         """
-        return self.stream.on_recv(callback)
+        if callback is None:
+            # Caller wants to clear the callback — pass through directly.
+            try:
+                return self.stream.on_recv(None)
+            except OSError as exc:
+                if str(exc) == "Stream is closed":
+                    return
+                raise
 
-    @tornado.gen.coroutine
+        # Wrap the callback so PyZMQ never sees an Awaitable return value.
+        # Without this, when callback is a @gen.coroutine (e.g. the minion's
+        # _handle_payload), PyZMQ's _run_callback does
+        # `asyncio.ensure_future(callback_result)`, creating asyncio.Tasks on
+        # the asyncio loop which is never driven by Tornado's IOLoop. Those
+        # Tasks (plus their gen.Runner / Future / WeakRef tracking) accumulate
+        # indefinitely. Routing through spawn_callback lets Tornado's own
+        # _run_callback convert the coroutine into a Tornado Future and drive
+        # it to completion natively, returning None to PyZMQ.
+        io_loop = self.io_loop
+
+        def _dispatch(*args, **kwargs):
+            io_loop.spawn_callback(callback, *args, **kwargs)
+
+        try:
+            return self.stream.on_recv(_dispatch)
+        except OSError as exc:
+            if str(exc) == "Stream is closed":
+                return
+            raise
+
+    @salt.ext.tornado.gen.coroutine
     def send(self, msg):
         self.stream.send(msg, noblock=True)
 
@@ -303,18 +349,44 @@ class RequestServer(salt.transport.base.DaemonizedRequestServer):
         Multiprocessing target for the zmq queue device
         """
         self.__setup_signals()
-        context = zmq.Context(self.opts["worker_threads"])
+        # The first argument to zmq.Context is ``io_threads`` -- the
+        # number of background I/O threads libzmq spawns -- not the
+        # number of MWorker processes.  Each libzmq I/O thread keeps
+        # its own message-buffer pool that grows under sustained
+        # traffic and is never released, so passing in
+        # ``opts["worker_threads"]`` (typically 5-10) caused the
+        # MWorkerQueue process RSS to climb ~7-8 MB/min indefinitely.
+        # The QUEUE device only proxies two sockets; one I/O thread is
+        # plenty.
+        context = zmq.Context(1)
         # Prepare the zeromq sockets
         self.uri = "tcp://{interface}:{ret_port}".format(**self.opts)
         self.clients = context.socket(zmq.ROUTER)
-        self.clients.setsockopt(zmq.LINGER, -1)
+        # LINGER=-1 ("never discard") combined with the salt CLI's pattern
+        # of one-shot connections (connect, send, recv, disconnect) caused
+        # libzmq to retain undelivered queue slots for every disconnected
+        # peer indefinitely under sustained CLI churn.  A small finite
+        # LINGER lets libzmq reap those slots.  ROUTER_HANDOVER=1 makes
+        # the router swap a stale peer (same routing-id, new connection)
+        # instead of blocking on the old one -- relevant for minions that
+        # reconnect after a brief network blip.  TCP_KEEPALIVE forces
+        # libzmq to notice peers that disappear without sending FIN, so
+        # their queues are reaped instead of leaking until the OS default
+        # 2-hour idle timer fires.
+        self.clients.setsockopt(zmq.LINGER, 1000)
+        if hasattr(zmq, "ROUTER_HANDOVER"):
+            self.clients.setsockopt(zmq.ROUTER_HANDOVER, 1)
+        self.clients.setsockopt(zmq.TCP_KEEPALIVE, 1)
+        self.clients.setsockopt(zmq.TCP_KEEPALIVE_IDLE, 60)
+        self.clients.setsockopt(zmq.TCP_KEEPALIVE_INTVL, 15)
+        self.clients.setsockopt(zmq.TCP_KEEPALIVE_CNT, 3)
         if self.opts["ipv6"] is True and hasattr(zmq, "IPV4ONLY"):
             # IPv6 sockets work for both IPv6 and IPv4 addresses
             self.clients.setsockopt(zmq.IPV4ONLY, 0)
         self.clients.setsockopt(zmq.BACKLOG, self.opts.get("zmq_backlog", 1000))
         self._start_zmq_monitor()
         self.workers = context.socket(zmq.DEALER)
-        self.workers.setsockopt(zmq.LINGER, -1)
+        self.workers.setsockopt(zmq.LINGER, 1000)
 
         if self.opts["mworker_queue_niceness"] and not salt.utils.platform.is_windows():
             log.info(
@@ -431,9 +503,20 @@ class RequestServer(salt.transport.base.DaemonizedRequestServer):
             os.chmod(os.path.join(self.opts["sock_dir"], "workers.ipc"), 0o600)
         self.stream = zmq.eventloop.zmqstream.ZMQStream(self._socket, io_loop=io_loop)
         self.message_handler = message_handler
-        self.stream.on_recv_stream(self.handle_message)
 
-    @tornado.gen.coroutine
+        def _dispatch_handle_message(stream, payload):
+            # Drive the coroutine via Tornado's IOLoop rather than returning
+            # it to PyZMQ's _run_callback. PyZMQ wraps any Awaitable return
+            # value with asyncio.ensure_future, creating Tasks on the asyncio
+            # event loop which is never driven in MWorkers — causing permanent
+            # Task accumulation. Routing through spawn_callback lets Tornado's
+            # own _run_callback convert it to a Tornado Future and drive it to
+            # completion without touching asyncio.
+            io_loop.spawn_callback(self.handle_message, stream, payload)
+
+        self.stream.on_recv_stream(_dispatch_handle_message)
+
+    @salt.ext.tornado.gen.coroutine
     def handle_message(self, stream, payload):
         try:
             payload = self.decode_payload(payload)
@@ -452,7 +535,7 @@ class RequestServer(salt.transport.base.DaemonizedRequestServer):
         signal.signal(signal.SIGTERM, self._handle_signals)
 
     def _handle_signals(self, signum, sigframe):
-        msg = "{} received a ".format(self.__class__.__name__)
+        msg = f"{self.__class__.__name__} received a "
         if signum == signal.SIGINT:
             msg += "SIGINT"
         elif signum == signal.SIGTERM:
@@ -491,6 +574,42 @@ def _set_tcp_keepalive(zmq_socket, opts):
             zmq_socket.setsockopt(zmq.TCP_KEEPALIVE_INTVL, opts["tcp_keepalive_intvl"])
 
 
+# Defaults are intentionally generous: small enough to reap dead SUB peers
+# within seconds (rather than the ~2h15m kernel TCP keepalive default), but
+# large enough not to disrupt a healthy fleet of thousands of minions on a
+# laggy network.  Operators can tune via ``zmq_heartbeat_ivl`` /
+# ``zmq_heartbeat_timeout`` in milliseconds.
+_DEFAULT_ZMQ_HEARTBEAT_IVL = 10000  # 10s between heartbeats
+_DEFAULT_ZMQ_HEARTBEAT_TIMEOUT = 30000  # 30s with no response -> peer dead
+
+
+def _set_zmq_heartbeat(zmq_socket, opts):
+    """
+    Enable ZMTP heartbeats on a ZeroMQ socket.
+
+    Without ``ZMQ_HEARTBEAT_IVL`` / ``ZMQ_HEARTBEAT_TIMEOUT`` configured,
+    ZMQ relies on the kernel TCP keepalive to notice a peer that vanished
+    without sending FIN (host reboot, kernel panic, dropped firewall rule).
+    On Linux that's ~2h15m by default, during which the master's PUB
+    socket keeps buffering for the dead peer and ``netstat`` accumulates
+    ``CLOSE_WAIT`` entries on port 4505 — eventually the master stops
+    accepting new connections.  See
+    https://github.com/saltstack/salt/issues/66282.
+
+    Heartbeat opts are configured in milliseconds.  Setting ``ivl`` or
+    ``timeout`` to ``0`` disables the corresponding option (matching the
+    ZMQ defaults).
+    """
+    if not opts:
+        opts = {}
+    ivl = int(opts.get("zmq_heartbeat_ivl", _DEFAULT_ZMQ_HEARTBEAT_IVL))
+    timeout = int(opts.get("zmq_heartbeat_timeout", _DEFAULT_ZMQ_HEARTBEAT_TIMEOUT))
+    if hasattr(zmq, "HEARTBEAT_IVL"):
+        zmq_socket.setsockopt(zmq.HEARTBEAT_IVL, ivl)
+    if hasattr(zmq, "HEARTBEAT_TIMEOUT"):
+        zmq_socket.setsockopt(zmq.HEARTBEAT_TIMEOUT, timeout)
+
+
 # TODO: unit tests!
 class AsyncReqMessageClient:
     """
@@ -515,62 +634,84 @@ class AsyncReqMessageClient:
         self.addr = addr
         self.linger = linger
         if io_loop is None:
-            self.io_loop = tornado.ioloop.IOLoop.current()
+            self.io_loop = salt.ext.tornado.ioloop.IOLoop.current()
         else:
             self.io_loop = io_loop
-
-        self.context = zmq.Context()
-
-        self.send_queue = []
-        # mapping of message -> future
-        self.send_future_map = {}
-
-        self._closing = False
+        self.context = zmq.eventloop.future.Context()
+        self.socket = None
+        self._closed = False
+        self._queue = salt.ext.tornado.queues.Queue()
+        self._send_recv_exit_future = None
 
     def connect(self):
+        if self.context is None:
+            self.context = zmq.eventloop.future.Context()
+
+        if hasattr(self, "socket") and self.socket:
+            return
         # wire up sockets
         self._init_socket()
 
-    # TODO: timeout all in-flight sessions, or error
-    def close(self):
-        try:
-            if self._closing:
-                return
-        except AttributeError:
-            # We must have been called from __del__
-            # The python interpreter has nuked most attributes already
-            return
-        else:
-            self._closing = True
-            if hasattr(self, "stream") and self.stream is not None:
-                if ZMQ_VERSION_INFO < (14, 3, 0):
-                    # stream.close() doesn't work properly on pyzmq < 14.3.0
-                    if self.stream.socket:
-                        self.stream.socket.close()
-                    self.stream.io_loop.remove_handler(self.stream.socket)
-                    # set this to None, more hacks for messed up pyzmq
-                    self.stream.socket = None
-                    self.socket.close()
-                else:
-                    self.stream.close(1)
-                    self.socket = None
-                self.stream = None
-            if self.context.closed is False:
-                # This hangs if closing the stream causes an import error
-                self.context.term()
-
     def _init_socket(self):
-        if hasattr(self, "stream"):
-            self.stream.close()  # pylint: disable=E0203
-            self.socket.close()  # pylint: disable=E0203
-            del self.stream
-            del self.socket
-
         self.socket = self.context.socket(zmq.REQ)
 
         # socket options
         if hasattr(zmq, "RECONNECT_IVL_MAX"):
             self.socket.setsockopt(zmq.RECONNECT_IVL_MAX, 5000)
+
+        # Set a stable ZMQ routing identity so the master's ROUTER socket
+        # reuses an existing slot for this caller (combined with
+        # ROUTER_HANDOVER=1 on the master) rather than allocating a new
+        # entry in its per-peer table for every CLI invocation.  Without
+        # this, the master's libzmq peer-id hashtable grows unbounded
+        # under sustained CLI churn (about 6 MB/min in stress).
+        #
+        # Only do this for salt CLI tools (which do NOT set ``__role`` in
+        # opts).  All long-lived daemons -- minion, syndic, master --
+        # open multiple AsyncReqMessageClient instances concurrently from
+        # a single process: the minion at startup for auth + pillar +
+        # file requests, the syndic when relaying multiple downstream
+        # minions' returns upstream, and a master when forwarding to
+        # peer masters.  Giving them all the same stable identity would
+        # cause ROUTER_HANDOVER on the upstream ROUTER to silently drop
+        # any reply still in flight to the previous REQ as each new one
+        # arrived, hanging startup and breaking syndic relays.  Their
+        # own REQ churn is bounded anyway (one peer per daemon), so they
+        # can keep using libzmq's default per-connection random
+        # routing-ids.
+        _role = self.opts.get("__role")
+        _minion_id = self.opts.get("id")
+        if not _role:
+            role = _minion_id or "clir"
+            try:
+                uid = os.getuid()
+            except AttributeError:  # Windows
+                uid = 0
+            identity = "salt-req/{role}/{host}/{uid}/{slot}".format(
+                role=role,
+                host=socket.gethostname(),
+                uid=uid,
+                slot=os.getpid() % 256,
+            )
+            self.socket.setsockopt(zmq.IDENTITY, identity.encode("utf-8"))
+        elif _role in ("minion", "syndic") and _minion_id:
+            # Long-lived minion / syndic daemon.  Each AsyncReqMessageClient
+            # instance gets its own slot from a process-lifetime counter so
+            # concurrent siblings differ (avoiding the ROUTER_HANDOVER drop
+            # that caused the earlier syndic regression), while the slot is
+            # reused across ZMQ-level reconnects so the master's ROUTER
+            # replaces the prior peer entry instead of leaking one per
+            # reconnect.  Without this, ``MWorkerQueue`` was observed
+            # leaking ~23 GB / 2 days under sustained stress as libzmq
+            # never reclaims routing-id table entries.  On daemon restart
+            # slots replay in construction order and overwrite the prior
+            # master-side entries cleanly.
+            identity = "salt-req/{role}/{minion_id}/{slot}".format(
+                role=_role,
+                minion_id=_minion_id,
+                slot=next(_REQ_IDENTITY_SLOT),
+            )
+            self.socket.setsockopt(zmq.IDENTITY, identity.encode("utf-8"))
 
         _set_tcp_keepalive(self.socket, self.opts)
         if self.addr.startswith("tcp://["):
@@ -579,33 +720,188 @@ class AsyncReqMessageClient:
                 self.socket.setsockopt(zmq.IPV6, 1)
             elif hasattr(zmq, "IPV4ONLY"):
                 self.socket.setsockopt(zmq.IPV4ONLY, 0)
-        self.socket.linger = self.linger
+        self.socket.setsockopt(zmq.LINGER, self.linger)
         self.socket.connect(self.addr)
-        self.stream = zmq.eventloop.zmqstream.ZMQStream(
-            self.socket, io_loop=self.io_loop
-        )
+        self.io_loop.spawn_callback(self._send_recv, self.socket)
 
-    def timeout_message(self, message):
+    def _close_zmq_only(self):
+        """Close socket and ZMQ context only (no IOLoop / _send_recv coordination)."""
+        if hasattr(self, "socket") and self.socket is not None:
+            self.socket.close(0)
+            self.socket = None
+        if self.context is not None and self.context.closed is False:
+            self.context.term()
+            self.context = None
+
+    def close_future(self):
         """
-        Handle a message timeout by removing it from the sending queue
-        and informing the caller
+        Return a ``Future`` that completes after ZMQ resources are released.
 
-        :raises: SaltReqTimeoutError
+        Coroutine callers on the owning I/O loop thread should ``yield`` this future
+        (via ``salt.ext.tornado.gen.convert_yielded``) before allocating another
+        client on that loop—``close()`` schedules teardown asynchronously in that case.
         """
-        future = self.send_future_map.pop(message, None)
-        # In a race condition the message might have been sent by the time
-        # we're timing it out. Make sure the future is not None
-        if future is not None:
-            future.set_exception(SaltReqTimeoutError("Message timed out"))
+        self._initiate_async_req_close()
+        return self._close_completed_future
 
-    @tornado.gen.coroutine
+    def close(self):
+        """
+        Stop the send/recv coroutine and close ZMQ resources. Safe to call more
+        than once.
+
+        When no I/O loop iteration is active, uses ``run_sync`` around the graceful
+        shutdown coroutine (LocalClient/SyncWrapper and similar).
+
+        When the owning ``io_loop`` is already running—including on the master
+        event loop thread while short-lived REQ clients are torn down—you cannot
+        call ``run_sync``. In that case the shutdown future is queued with
+        ``add_callback`` / ``add_future``. If ``close()`` is invoked from another
+        thread while the loop is running, we block until shutdown completes.
+
+        On the owning I/O loop thread, prefer ``yield``-ing ``close_future()`` instead
+        of ``close()`` when you recreate clients immediately afterward.
+        """
+        cross_thread_evt = self._initiate_async_req_close()
+        if cross_thread_evt is not None:
+            cross_thread_evt.wait(timeout=30)
+
+    def _mark_teardown_finished(self):
+        fut = getattr(self, "_close_completed_future", None)
+        if fut is not None and not fut.done():
+            fut.set_result(None)
+
+    def _initiate_async_req_close(self):
+        """
+        Start teardown once.
+
+        Sets ``self._close_completed_future`` and returns ``None``, or an
+        ``threading.Event`` that unblocks after ``finalize()`` when the caller needs
+        to wait from a non-I/O-loop thread.
+        """
+        if getattr(self, "_close_completed_future", None) is not None:
+            return None
+
+        self._close_completed_future = salt.ext.tornado.concurrent.Future()
+        cross_thread_evt = None
+
+        def finalize():
+            self._send_recv_exit_future = None
+            self._close_zmq_only()
+            self._mark_teardown_finished()
+            if cross_thread_evt is not None:
+                cross_thread_evt.set()
+
+        def run_shutdown():
+            return self._graceful_shutdown_coro()
+
+        if self._closed:
+            finalize()
+            return None
+
+        self._closed = True
+        if self.socket is None:
+            finalize()
+            return None
+
+        self._send_recv_exit_future = salt.ext.tornado.concurrent.Future()
+
+        # _running and _thread_ident are upstream Tornado internals (mirrored in
+        # salt.ext.tornado). Prefer them for a fast path before run_sync; if a
+        # Tornado upgrade breaks this, re-check this branch and the RuntimeError
+        # "already running" fallback below.
+        try:
+            if not getattr(self.io_loop, "_running", False):
+                self.io_loop.run_sync(run_shutdown, timeout=30)
+                finalize()
+                return None
+        except RuntimeError as exc:
+            if "already running" not in str(exc).lower():
+                log.debug(
+                    "REQ client shutdown: run_sync aborted: %s",
+                    exc,
+                    exc_info=True,
+                )
+                finalize()
+                return None
+        except salt.ext.tornado.ioloop.TimeoutError:
+            log.debug("Graceful REQ message client shutdown timed out during run_sync")
+            finalize()
+            return None
+        except Exception:  # pylint: disable=broad-except
+            log.debug(
+                "Graceful REQ message client shutdown failed during run_sync",
+                exc_info=True,
+            )
+            finalize()
+            return None
+
+        try:
+            shutdown_future = salt.ext.tornado.gen.convert_yielded(
+                self._graceful_shutdown_coro()
+            )
+        except Exception:  # pylint: disable=broad-except
+            log.debug(
+                "Could not schedule REQ shutdown coroutine while loop is running",
+                exc_info=True,
+            )
+            finalize()
+            return None
+
+        ioloop_thread = getattr(self.io_loop, "_thread_ident", None)
+        same_thread = ioloop_thread == threading.get_ident()
+        cross_thread_evt = None if same_thread else threading.Event()
+
+        def on_done(future):
+            try:
+                future.result()
+            except Exception:  # pylint: disable=broad-except
+                log.debug(
+                    "Graceful REQ message client shutdown failed during async teardown",
+                    exc_info=True,
+                )
+            finally:
+                finalize()
+
+        def schedule():
+            self.io_loop.add_future(shutdown_future, on_done)
+
+        try:
+            self.io_loop.add_callback(schedule)
+        except Exception:  # pylint: disable=broad-except
+            log.debug(
+                "Graceful REQ message client shutdown failed scheduling callback",
+                exc_info=True,
+            )
+            finalize()
+            return None
+
+        return cross_thread_evt
+
+    @salt.ext.tornado.gen.coroutine
+    def _graceful_shutdown_coro(self):
+        try:
+            self._queue.put_nowait(
+                (salt.ext.tornado.concurrent.Future(), _REQ_QUEUE_SHUTDOWN)
+            )
+        except Exception:  # pylint: disable=broad-except
+            log.debug("Could not queue shutdown sentinel", exc_info=True)
+            if self._send_recv_exit_future and not self._send_recv_exit_future.done():
+                self._send_recv_exit_future.set_result(None)
+            raise salt.ext.tornado.gen.Return()
+        yield self._send_recv_exit_future
+
+    @salt.ext.tornado.gen.coroutine
     def send(self, message, timeout=None, callback=None):
         """
         Return a future which will be completed when the message has a response
         """
-        future = tornado.concurrent.Future()
+        future = salt.ext.tornado.concurrent.Future()
 
         message = salt.payload.dumps(message)
+
+        self._queue.put_nowait((future, message))
+
+        send_timeout = None
 
         if callback is not None:
 
@@ -615,27 +911,185 @@ class AsyncReqMessageClient:
 
             future.add_done_callback(handle_future)
 
-        # Add this future to the mapping
-        self.send_future_map[message] = future
-
         if self.opts.get("detect_mode") is True:
             timeout = 1
 
         if timeout is not None:
             send_timeout = self.io_loop.call_later(
-                timeout, self.timeout_message, message
+                timeout, self._timeout_message, future
             )
 
-        def mark_future(msg):
-            if not future.done():
-                data = salt.payload.loads(msg[0])
-                future.set_result(data)
-                self.send_future_map.pop(message)
+        try:
+            recv = yield future
+        finally:
+            if send_timeout is not None:
+                self.io_loop.remove_timeout(send_timeout)
 
-        self.stream.on_recv(mark_future)
-        yield self.stream.send(message)
-        recv = yield future
-        raise tornado.gen.Return(recv)
+        raise salt.ext.tornado.gen.Return(recv)
+
+    def _timeout_message(self, future):
+        if not future.done():
+            future.set_exception(SaltReqTimeoutError("Message timed out"))
+
+    @salt.ext.tornado.gen.coroutine
+    def _send_recv(self, socket, _TimeoutError=salt.ext.tornado.gen.TimeoutError):
+        """
+        Long-running send/receive coroutine. This should be started once for
+        each socket created. Once started, the coroutine will run until the
+        socket is closed. A future and message are pulled from the queue. The
+        message is sent and the reply socket is polled for a response while
+        checking the future to see if it was timed out.
+        """
+        send_recv_running = True
+        # Hold on to the socket so we'll still have a reference to it after the
+        # close method is called. This allows us to fail gracefully once it's
+        # been closed.
+        try:
+            while send_recv_running:
+                try:
+                    future, message = yield self._queue.get(
+                        timeout=datetime.timedelta(milliseconds=300)
+                    )
+                except _TimeoutError:
+                    try:
+                        # For some reason yielding here doesn't work becaues the
+                        # future always has a result?
+                        poll_future = socket.poll(0, zmq.POLLOUT)
+                        poll_future.result()
+                    except _TimeoutError:
+                        # This is what we expect if the socket is still alive
+                        pass
+                    except zmq.eventloop.future.CancelledError:
+                        log.trace("Loop closed while polling send socket.")
+                        # The ioloop was closed before polling finished.
+                        send_recv_running = False
+                        break
+                    except zmq.ZMQError:
+                        log.trace("Send socket closed while polling.")
+                        send_recv_running = False
+                        break
+                    continue
+
+                if message is _REQ_QUEUE_SHUTDOWN:
+                    send_recv_running = False
+                    break
+
+                try:
+                    yield socket.send(message)
+                except zmq.eventloop.future.CancelledError as exc:
+                    log.trace("Loop closed while sending.")
+                    # The ioloop was closed before polling finished.
+                    send_recv_running = False
+                    if not future.done():
+                        future.set_exception(exc)
+                    break
+                except zmq.ZMQError as exc:
+                    if exc.errno in [
+                        zmq.ENOTSOCK,
+                        zmq.ETERM,
+                        zmq.error.EINTR,
+                    ]:
+                        log.trace("Send socket closed while sending.")
+                        send_recv_running = False
+                        if not future.done():
+                            future.set_exception(exc)
+                    elif exc.errno == zmq.EFSM:
+                        log.error("Socket was found in invalid state.")
+                        send_recv_running = False
+                        if not future.done():
+                            future.set_exception(exc)
+                    else:
+                        log.error(
+                            "Unhandled Zeromq error durring send/receive: %s", exc
+                        )
+                        if not future.done():
+                            future.set_exception(exc)
+
+                if future.done():
+                    exc = future.exception()
+                    if isinstance(exc, SaltReqTimeoutError):
+                        log.trace("Request timed out while sending. reconnecting.")
+                    else:
+                        log.trace(
+                            "The request ended with an error while sending. reconnecting."
+                        )
+                    # Only reconnect if the client is still active. If close() was
+                    # already called externally (context is None), do not create a
+                    # new socket/context that would never be cleaned up.
+                    _should_reconnect = self.context is not None
+                    self._close_zmq_only()
+                    if _should_reconnect:
+                        self.connect()
+                    send_recv_running = False
+                    break
+
+                received = False
+                ready = False
+                while True:
+                    if future.done():
+                        break
+                    try:
+                        # Time is in milliseconds.
+                        ready = yield socket.poll(300, zmq.POLLIN)
+                    except zmq.eventloop.future.CancelledError as exc:
+                        log.trace(
+                            "Loop closed while polling receive socket.", exc_info=True
+                        )
+                        log.error("Master is unavailable (Connection Cancelled).")
+                        send_recv_running = False
+                        if not future.done():
+                            future.set_result(None)
+                    except zmq.ZMQError as exc:
+                        log.trace("Receive socket closed while polling.")
+                        send_recv_running = False
+                        if not future.done():
+                            future.set_exception(exc)
+
+                    if ready:
+                        try:
+                            recv = yield socket.recv()
+                            received = True
+                        except zmq.eventloop.future.CancelledError as exc:
+                            log.trace("Loop closed while receiving.")
+                            send_recv_running = False
+                            if not future.done():
+                                future.set_exception(exc)
+                        except zmq.ZMQError as exc:
+                            log.trace("Receive socket closed while receiving.")
+                            send_recv_running = False
+                            if not future.done():
+                                future.set_exception(exc)
+                        break
+                    elif future.done():
+                        break
+
+                if future.done():
+                    exc = future.exception()
+                    if isinstance(exc, SaltReqTimeoutError):
+                        log.trace(
+                            "Request timed out while waiting for a response. reconnecting."
+                        )
+                    else:
+                        log.trace("The request ended with an error. reconnecting.")
+                    # Only reconnect if the client is still active. If close() was
+                    # already called externally (context is None), do not create a
+                    # new socket/context that would never be cleaned up.
+                    _should_reconnect = self.context is not None
+                    self._close_zmq_only()
+                    if _should_reconnect:
+                        self.connect()
+                    send_recv_running = False
+                elif received:
+                    data = salt.payload.loads(recv)
+                    if not future.done():
+                        future.set_result(data)
+        finally:
+            if (
+                self._send_recv_exit_future is not None
+                and not self._send_recv_exit_future.done()
+            ):
+                self._send_recv_exit_future.set_result(None)
+        log.trace("Send and receive coroutine ending %s", socket)
 
 
 class ZeroMQSocketMonitor:
@@ -687,24 +1141,21 @@ class ZeroMQSocketMonitor:
         log.debug("ZeroMQ event: %s", evt)
         if evt["event"] == zmq.EVENT_MONITOR_STOPPED:
             self.stop()
-        elif evt["event"] == zmq.EVENT_DISCONNECTED:
-            if (
-                hasattr(self, "disconnect_callback")
-                and self.disconnect_callback is not None
-            ):
-                self.disconnect_callback()
 
     def stop(self):
         if self._socket is None:
             return
-        self._socket.disable_monitor()
+        try:
+            self._socket.disable_monitor()
+        except zmq.Error:
+            pass
         self._socket = None
-        if self._monitor_socket is not None:
-            self._monitor_socket.close()
-            self._monitor_socket = None
         if self._monitor_stream is not None:
             self._monitor_stream.close()
             self._monitor_stream = None
+        if self._monitor_socket is not None:
+            self._monitor_socket.close()
+            self._monitor_socket = None
         log.trace("Event monitor done!")
 
 
@@ -719,7 +1170,7 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
         self.opts = opts
 
     def connect(self):
-        return tornado.gen.sleep(5)
+        return salt.ext.tornado.gen.sleep(5)
 
     def publish_daemon(
         self,
@@ -729,9 +1180,9 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
     ):
         """
         This method represents the Publish Daemon process. It is intended to be
-        run in a thread or process as it creates and runs an it's own ioloop.
+        run in a thread or process as it creates and runs its own ioloop.
         """
-        ioloop = tornado.ioloop.IOLoop()
+        ioloop = salt.ext.tornado.ioloop.IOLoop()
         ioloop.make_current()
         self.io_loop = ioloop
         context = zmq.Context(1)
@@ -739,6 +1190,7 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
         monitor = ZeroMQSocketMonitor(pub_sock)
         monitor.start_io_loop(ioloop)
         _set_tcp_keepalive(pub_sock, self.opts)
+        _set_zmq_heartbeat(pub_sock, self.opts)
         self.dpub_sock = pub_sock = zmq.eventloop.zmqstream.ZMQStream(pub_sock)
         # if 2.1 >= zmq < 3.0, we only have one HWM setting
         try:
@@ -767,15 +1219,30 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
         with salt.utils.files.set_umask(0o177):
             pull_sock.bind(self.pull_uri)
 
-        @tornado.gen.coroutine
+        @salt.ext.tornado.gen.coroutine
         def on_recv(packages):
-            for package in packages:
-                payload = salt.payload.loads(package)
-                yield publish_payload(payload)
+            try:
+                for package in packages:
+                    payload = salt.payload.loads(package)
+                    yield publish_payload(payload)
+            except Exception as exc:  # pylint: disable=broad-except
+                log.error(
+                    "Un-handled error in publisher %s",
+                    exc,
+                    exc_info_on_loglevel=logging.DEBUG,
+                )
 
-        pull_sock.on_recv(on_recv)
+        def _dispatch_on_recv(packages):
+            # Same fix as in RequestServer: route through Tornado's IOLoop
+            # instead of returning the coroutine to PyZMQ's _run_callback,
+            # which would wrap it with asyncio.ensure_future.
+            ioloop.spawn_callback(on_recv, packages)
+
+        pull_sock.on_recv(_dispatch_on_recv)
         try:
             ioloop.start()
+        except (KeyboardInterrupt, SystemExit):
+            pass
         finally:
             pub_sock.close()
             pull_sock.close()
@@ -796,7 +1263,7 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
     def pub_uri(self):
         return "tcp://{interface}:{publish_port}".format(**self.opts)
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def publish_payload(self, payload, topic_list=None):
         payload = salt.payload.dumps(payload)
         if self.opts["zmq_filtering"]:
@@ -808,21 +1275,18 @@ class PublishServer(salt.transport.base.DaemonizedPublishServer):
                     htopic = salt.utils.stringutils.to_bytes(
                         hashlib.sha1(salt.utils.stringutils.to_bytes(topic)).hexdigest()
                     )
-                    yield self.dpub_sock.send(htopic, flags=zmq.SNDMORE)
-                    yield self.dpub_sock.send(payload)
+                    yield self.dpub_sock.send_multipart([htopic, payload])
                     log.trace("Filtered data has been sent")
                 # Syndic broadcast
                 if self.opts.get("order_masters"):
                     log.trace("Sending filtered data to syndic")
-                    yield self.dpub_sock.send(b"syndic", flags=zmq.SNDMORE)
-                    yield self.dpub_sock.send(payload)
+                    yield self.dpub_sock.send_multipart([b"syndic", payload])
                     log.trace("Filtered data has been sent to syndic")
             # otherwise its a broadcast
             else:
                 # TODO: constants file for "broadcast"
                 log.trace("Sending broadcasted data over publisher %s", self.pub_uri)
-                yield self.dpub_sock.send(b"broadcast", flags=zmq.SNDMORE)
-                yield self.dpub_sock.send(payload)
+                yield self.dpub_sock.send_multipart([b"broadcast", payload])
                 log.trace("Broadcasted data has been sent")
         else:
             log.trace("Sending ZMQ-unfiltered data over publisher %s", self.pub_uri)
@@ -918,6 +1382,7 @@ class RequestClient(salt.transport.base.RequestClient):
     ttype = "zeromq"
 
     def __init__(self, opts, io_loop):  # pylint: disable=W0231
+        super().__init__(opts, io_loop)
         self.opts = opts
         master_uri = self.get_master_uri(opts)
         self.message_client = AsyncReqMessageClient(
@@ -925,17 +1390,29 @@ class RequestClient(salt.transport.base.RequestClient):
             master_uri,
             io_loop=io_loop,
         )
+        self._closing = False
+        self._connect_called = False
 
+    @salt.ext.tornado.gen.coroutine
     def connect(self):
+        self._connect_called = True
         self.message_client.connect()
 
-    @tornado.gen.coroutine
-    def send(self, load, timeout=60):
-        self.connect()
+    @salt.ext.tornado.gen.coroutine
+    def send(self, load, timeout=REQUEST_TIMEOUT):
+        yield self.connect()
         ret = yield self.message_client.send(load, timeout=timeout)
-        raise tornado.gen.Return(ret)
+        raise salt.ext.tornado.gen.Return(ret)
+
+    def close_future(self):
+        fut = self.message_client.close_future()
+        self._closing = True
+        return fut
 
     def close(self):
+        if self._closing:
+            return
+        self._closing = True
         self.message_client.close()
 
     @staticmethod

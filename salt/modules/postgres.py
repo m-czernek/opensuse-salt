@@ -35,10 +35,6 @@ To prevent Postgres commands from running arbitrarily long, a timeout (in second
         postgres.bins_dir: '/usr/pgsql-9.5/bin/'
 """
 
-# This pylint error is popping up where there are no colons?
-# pylint: disable=E8203
-
-
 import base64
 import datetime
 import hashlib
@@ -49,10 +45,10 @@ import os
 import re
 import shlex
 import tempfile
+from collections import OrderedDict
 
 import salt.utils.files
 import salt.utils.itertools
-import salt.utils.odict
 import salt.utils.path
 import salt.utils.stringutils
 from salt.exceptions import CommandExecutionError, SaltInvocationError
@@ -100,8 +96,8 @@ _PRIVILEGES_MAP = {
     "X": "EXECUTE",
     "x": "REFERENCES",
     "d": "DELETE",
-    "m": "MAINTAIN",
     "*": "GRANT",
+    "m": "MAINTAIN",
 }
 _PRIVILEGES_OBJECTS = frozenset(
     (
@@ -131,13 +127,10 @@ def __virtual__():
     Only load this module if the psql bin exist.
     initdb bin might also be used, but its presence will be detected on runtime.
     """
-    utils = ["psql"]
     if not HAS_CSV:
         return False
-    for util in utils:
-        if not salt.utils.path.which(util):
-            if not _find_pg_binary(util):
-                return (False, f"{util} was not found")
+    if not _find_pg_binary("psql"):
+        return (False, "psql was not found")
     return True
 
 
@@ -148,12 +141,11 @@ def _find_pg_binary(util):
     Helper function to locate various psql related binaries
     """
     pg_bin_dir = __salt__["config.option"]("postgres.bins_dir")
-    util_bin = salt.utils.path.which(util)
-    if not util_bin:
-        if pg_bin_dir:
-            return salt.utils.path.which(os.path.join(pg_bin_dir, util))
-    else:
-        return util_bin
+    if pg_bin_dir:
+        util_bin = salt.utils.path.which(os.path.join(pg_bin_dir, util))
+        if util_bin:
+            return util_bin
+    return salt.utils.path.which(util)
 
 
 def _run_psql(cmd, runas=None, password=None, host=None, port=None, user=None):
@@ -274,7 +266,7 @@ def _run_initdb(
             "postgres.timeout", default=_DEFAULT_COMMAND_TIMEOUT_SECS
         ),
     )
-    cmdstr = " ".join([shlex.quote(c) for c in cmd])
+    cmdstr = shlex.join(cmd)
     ret = __salt__["cmd.run_all"](cmdstr, python_shell=False, **kwargs)
 
     if ret.get("retcode", 0) != 0:
@@ -619,7 +611,7 @@ def db_create(
     query = f'CREATE DATABASE "{name}"'
 
     # "With"-options to create a database
-    with_args = salt.utils.odict.OrderedDict(
+    with_args = OrderedDict(
         [
             ("TABLESPACE", _quote_ddl_value(tablespace, '"')),
             # owner needs to be enclosed in double quotes so postgres
@@ -1008,7 +1000,8 @@ def user_list(
         return False
 
     # will return empty string if return_password = False
-    _x = lambda s: s if return_password else ""
+    def _x(s):
+        return s if return_password else ""
 
     query = "".join(
         [

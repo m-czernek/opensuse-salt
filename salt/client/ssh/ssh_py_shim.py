@@ -41,7 +41,6 @@ ARGS = None
 # The below line is where OPTIONS can be redefined with internal options
 # (rather than cli arguments) when the shim is bundled by
 # client.ssh.Single._cmd_str()
-# pylint: disable=block-comment-should-start-with-cardinal-space
 #%%OPTS
 
 
@@ -67,14 +66,14 @@ def get_system_encoding():
         import locale
 
         try:
-            encoding = locale.getdefaultlocale()[-1]
-        except ValueError:
-            # A bad locale setting was most likely found:
-            #   https://github.com/saltstack/salt/issues/26063
-            pass
+            encoding = locale.getencoding()
+        except AttributeError:
+            # Python < 3.11
+            encoding = locale.getpreferredencoding(do_setlocale=True)
 
         # This is now garbage collectable
         del locale
+
         if not encoding:
             # This is most likely ascii which is not the best but we were
             # unable to find a better encoding. If this fails, we fall all
@@ -170,10 +169,7 @@ def unpack_thin(thin_path):
     """
     tfile = tarfile.TarFile.gzopen(thin_path)
     old_umask = os.umask(0o077)  # pylint: disable=blacklisted-function
-    if sys.version_info >= (3, 12):
-        tfile.extractall(path=OPTIONS.saltdir, filter="data")  # nosec B202
-    else:
-        tfile.extractall(path=OPTIONS.saltdir)  # nosec B202
+    tfile.extractall(path=OPTIONS.saltdir)  # nosec
     tfile.close()
     os.umask(old_umask)  # pylint: disable=blacklisted-function
     try:
@@ -200,10 +196,7 @@ def unpack_ext(ext_path):
     )
     tfile = tarfile.TarFile.gzopen(ext_path)
     old_umask = os.umask(0o077)  # pylint: disable=blacklisted-function
-    if sys.version_info >= (3, 12):
-        tfile.extractall(path=modcache, filter="data")  # nosec B202
-    else:
-        tfile.extractall(path=modcache)  # nosec B202
+    tfile.extractall(path=modcache)  # nosec
     tfile.close()
     os.umask(old_umask)  # pylint: disable=blacklisted-function
     os.unlink(ext_path)
@@ -236,7 +229,9 @@ def get_executable():
     Find executable which matches supported python version in the thin
     """
     pymap = {}
-    with open(os.path.join(OPTIONS.saltdir, "supported-versions")) as _fp:
+    with open(
+        os.path.join(OPTIONS.saltdir, "supported-versions"), encoding="utf-8"
+    ) as _fp:
         for line in _fp.readlines():
             ns, v_maj, v_min = line.strip().split(":")
             pymap[ns] = (int(v_maj), int(v_min))
@@ -285,97 +280,58 @@ def main(argv):  # pylint: disable=W0613
     """
     Main program body
     """
+    thin_path = os.path.join(OPTIONS.saltdir, THIN_ARCHIVE)
+    if os.path.isfile(thin_path):
+        if OPTIONS.checksum != get_hash(thin_path, OPTIONS.hashfunc):
+            need_deployment()
+        unpack_thin(thin_path)
+        # Salt thin now is available to use
+    else:
+        if not sys.platform.startswith("win"):
+            scpstat = subprocess.Popen(["/bin/sh", "-c", "command -v scp"]).wait()
+            if scpstat != 0:
+                sys.exit(EX_SCP_NOT_FOUND)
 
-    virt_env = os.getenv("VIRTUAL_ENV", None)
-    # VIRTUAL_ENV environment variable is defined by venv-salt-minion wrapper
-    # it's used to check if the shim is running under this wrapper
-    venv_salt_call = None
-    if virt_env and "venv-salt-minion" in virt_env:
-        venv_salt_call = os.path.join(virt_env, "bin", "salt-call")
-        if not os.path.exists(venv_salt_call):
-            venv_salt_call = None
-        elif not os.path.exists(OPTIONS.saltdir):
-            os.makedirs(OPTIONS.saltdir)
-            cache_dir = os.path.join(OPTIONS.saltdir, "running_data", "var", "cache")
-            os.makedirs(os.path.join(cache_dir, "salt"))
-            os.symlink(
-                "salt", os.path.relpath(os.path.join(cache_dir, "venv-salt-minion"))
+        if os.path.exists(OPTIONS.saltdir) and not os.path.isdir(OPTIONS.saltdir):
+            sys.stderr.write(
+                'ERROR: salt path "{0}" exists but is not a directory\n'.format(
+                    OPTIONS.saltdir
+                )
             )
-        if os.path.exists(OPTIONS.saltdir) and (
-            "SUDO_UID" in os.environ or "SUDO_GID" in os.environ
-        ):
-            try:
-                sudo_uid = int(os.environ.get("SUDO_UID", -1))
-            except ValueError:
-                sudo_uid = -1
-            try:
-                sudo_gid = int(os.environ.get("SUDO_GID", -1))
-            except ValueError:
-                sudo_gid = -1
-            dstat = os.stat(OPTIONS.saltdir)
-            if (sudo_uid != -1 and dstat.st_uid != sudo_uid) or (
-                sudo_gid != -1 and dstat.st_gid != sudo_gid
-            ):
-                os.chown(OPTIONS.saltdir, sudo_uid, sudo_gid)
-                for dir_path, dir_names, file_names in os.walk(OPTIONS.saltdir):
-                    for dir_name in dir_names:
-                        os.lchown(os.path.join(dir_path, dir_name), sudo_uid, sudo_gid)
-                    for file_name in file_names:
-                        os.lchown(os.path.join(dir_path, file_name), sudo_uid, sudo_gid)
+            sys.exit(EX_CANTCREAT)
 
-    if venv_salt_call is None:
-        # Use Salt thin only if Salt Bundle (venv-salt-minion) is not available
-        thin_path = os.path.join(OPTIONS.saltdir, THIN_ARCHIVE)
-        if os.path.isfile(thin_path):
-            if OPTIONS.checksum != get_hash(thin_path, OPTIONS.hashfunc):
-                need_deployment()
-            unpack_thin(thin_path)
-            # Salt thin now is available to use
-        else:
-            if not sys.platform.startswith("win"):
-                scpstat = subprocess.Popen(["/bin/sh", "-c", "command -v scp"]).wait()
-                if scpstat != 0:
-                    sys.exit(EX_SCP_NOT_FOUND)
-
-            if os.path.exists(OPTIONS.saltdir) and not os.path.isdir(OPTIONS.saltdir):
-                sys.stderr.write(
-                    'ERROR: salt path "{0}" exists but is'
-                    " not a directory\n".format(OPTIONS.saltdir)
-                )
-                sys.exit(EX_CANTCREAT)
-
-            if not os.path.exists(OPTIONS.saltdir):
-                need_deployment()
-
-            code_checksum_path = os.path.normpath(
-                os.path.join(OPTIONS.saltdir, "code-checksum")
-            )
-            if not os.path.exists(code_checksum_path) or not os.path.isfile(
-                code_checksum_path
-            ):
-                sys.stderr.write(
-                    "WARNING: Unable to locate current code checksum: {0}.\n".format(
-                        code_checksum_path
-                    )
-                )
-                need_deployment()
-            with open(code_checksum_path, "r") as vpo:
-                cur_code_cs = vpo.readline().strip()
-            if cur_code_cs != OPTIONS.code_checksum:
-                sys.stderr.write(
-                    "WARNING: current code checksum {0} is different to {1}.\n".format(
-                        cur_code_cs, OPTIONS.code_checksum
-                    )
-                )
-                need_deployment()
-            # Salt thin exists and is up-to-date - fall through and use it
-
-        salt_call_path = os.path.join(OPTIONS.saltdir, "salt-call")
-        if not os.path.isfile(salt_call_path):
-            sys.stderr.write('ERROR: thin is missing "{0}"\n'.format(salt_call_path))
+        if not os.path.exists(OPTIONS.saltdir):
             need_deployment()
 
-    with open(os.path.join(OPTIONS.saltdir, "minion"), "w") as config:
+        code_checksum_path = os.path.normpath(
+            os.path.join(OPTIONS.saltdir, "code-checksum")
+        )
+        if not os.path.exists(code_checksum_path) or not os.path.isfile(
+            code_checksum_path
+        ):
+            sys.stderr.write(
+                "WARNING: Unable to locate current code checksum: {0}.\n".format(
+                    code_checksum_path
+                )
+            )
+            need_deployment()
+        with open(code_checksum_path, "r", encoding="utf-8") as vpo:
+            cur_code_cs = vpo.readline().strip()
+        if cur_code_cs != OPTIONS.code_checksum:
+            sys.stderr.write(
+                "WARNING: current code checksum {0} is different to {1}.\n".format(
+                    cur_code_cs, OPTIONS.code_checksum
+                )
+            )
+            need_deployment()
+        # Salt thin exists and is up-to-date - fall through and use it
+
+    salt_call_path = os.path.join(OPTIONS.saltdir, "salt-call")
+    if not os.path.isfile(salt_call_path):
+        sys.stderr.write('ERROR: thin is missing "{0}"\n'.format(salt_call_path))
+        need_deployment()
+
+    with open(os.path.join(OPTIONS.saltdir, "minion"), "w", encoding="utf-8") as config:
         config.write(OPTIONS.config + "\n")
     if OPTIONS.ext_mods:
         ext_path = os.path.join(OPTIONS.saltdir, EXT_ARCHIVE)
@@ -385,7 +341,7 @@ def main(argv):  # pylint: disable=W0613
             version_path = os.path.join(OPTIONS.saltdir, "ext_version")
             if not os.path.exists(version_path) or not os.path.isfile(version_path):
                 need_ext()
-            with open(version_path, "r") as vpo:
+            with open(version_path, "r", encoding="utf-8") as vpo:
                 cur_version = vpo.readline().strip()
             if cur_version != OPTIONS.ext_mods:
                 need_ext()
@@ -396,8 +352,8 @@ def main(argv):  # pylint: disable=W0613
         argv_prepared = ARGS
 
     salt_argv = [
-        sys.executable if venv_salt_call is not None else get_executable(),
-        venv_salt_call if venv_salt_call is not None else salt_call_path,
+        get_executable(),
+        salt_call_path,
         "--retcode-passthrough",
         "--local",
         "--metadata",

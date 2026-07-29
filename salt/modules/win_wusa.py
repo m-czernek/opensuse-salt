@@ -8,7 +8,6 @@ Microsoft Update files management via wusa.exe
 .. versionadded:: 2018.3.4
 """
 
-
 import logging
 import os
 
@@ -41,7 +40,7 @@ def _pshell_json(cmd, cwd=None):
     in JSON format and load that into python
     """
     if "convertto-json" not in cmd.lower():
-        cmd = "{} | ConvertTo-Json".format(cmd)
+        cmd = f"{cmd} | ConvertTo-Json"
     log.debug("PowerShell: %s", cmd)
     ret = __salt__["cmd.run_all"](cmd, shell="powershell", cwd=cwd)
 
@@ -54,9 +53,7 @@ def _pshell_json(cmd, cwd=None):
 
     if "retcode" not in ret or ret["retcode"] != 0:
         # run_all logs an error to log.error, fail hard back to the user
-        raise CommandExecutionError(
-            "Issue executing PowerShell {}".format(cmd), info=ret
-        )
+        raise CommandExecutionError(f"Issue executing PowerShell {cmd}", info=ret)
 
     # Sometimes Powershell returns an empty string, which isn't valid JSON
     if ret["stdout"] == "":
@@ -77,10 +74,10 @@ def is_installed(name):
     Args:
 
         name (str):
-            The name of the KB to check
+            The name of the KB to check.
 
     Returns:
-        bool: ``True`` if installed, otherwise ``False``
+        bool: ``True`` if installed, otherwise ``False``.
 
     CLI Example:
 
@@ -90,7 +87,7 @@ def is_installed(name):
     """
     return (
         __salt__["cmd.retcode"](
-            cmd="Get-HotFix -Id {}".format(name),
+            cmd=f"Get-HotFix -Id {name}",
             shell="powershell",
             ignore_retcode=True,
         )
@@ -107,13 +104,15 @@ def install(path, restart=False):
         path (str):
             The full path to the msu file to install
 
-        restart (bool):
+        restart (:obj:`bool`, optional):
             ``True`` to force a restart if required by the installation. Adds
             the ``/forcerestart`` switch to the ``wusa.exe`` command. ``False``
-            will add the ``/norestart`` switch instead. Default is ``False``
+            will add the ``/norestart`` switch instead.
+
+            Default is ``False``.
 
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     Raise:
         CommandExecutionError: If the package is already installed or an error
@@ -138,7 +137,7 @@ def install(path, restart=False):
     # Check the ret_code
     file_name = os.path.basename(path)
     errors = {
-        2359302: "{} is already installed".format(file_name),
+        2359302: f"{file_name} is already installed",
         3010: (
             "{} correctly installed but server reboot is needed to complete"
             " installation".format(file_name)
@@ -148,7 +147,7 @@ def install(path, restart=False):
     if ret_code in errors:
         raise CommandExecutionError(errors[ret_code], ret_code)
     elif ret_code:
-        raise CommandExecutionError("Unknown error: {}".format(ret_code))
+        raise CommandExecutionError(f"Unknown error: {ret_code}")
 
     return True
 
@@ -163,13 +162,15 @@ def uninstall(path, restart=False):
             The full path to the msu file to uninstall. This can also be just
             the name of the KB to uninstall
 
-        restart (bool):
+        restart (:obj:`bool`, optional):
             ``True`` to force a restart if required by the installation. Adds
             the ``/forcerestart`` switch to the ``wusa.exe`` command. ``False``
-            will add the ``/norestart`` switch instead. Default is ``False``
+            will add the ``/norestart`` switch instead.
+
+            Default is ``False``.
 
     Returns:
-        bool: ``True`` if successful, otherwise ``False``
+        bool: ``True`` if successful, otherwise ``False``.
 
     Raises:
         CommandExecutionError: If an error is encountered
@@ -203,24 +204,24 @@ def uninstall(path, restart=False):
     # If you pass /quiet and specify /kb, you'll always get retcode 87 if there
     # is an error. Use the actual file to get a more descriptive error
     errors = {
-        -2145116156: "{} does not support uninstall".format(kb),
-        2359303: "{} not installed".format(kb),
+        -2145116156: f"{kb} does not support uninstall",
+        2359303: f"{kb} not installed",
         87: "Unknown error. Try specifying an .msu file",
     }
     if ret_code in errors:
         raise CommandExecutionError(errors[ret_code], ret_code)
     elif ret_code:
-        raise CommandExecutionError("Unknown error: {}".format(ret_code))
+        raise CommandExecutionError(f"Unknown error: {ret_code}")
 
     return True
 
 
 def list():
     """
-    Get a list of updates installed on the machine
+    Get a list of updates installed on the machine.
 
     Returns:
-        list: A list of installed updates
+        list: A list of installed updates.
 
     CLI Example:
 

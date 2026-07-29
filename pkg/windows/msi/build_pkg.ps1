@@ -73,17 +73,19 @@ function VerifyOrDownload ($local_file, $URL, $SHA256) {
 # Script Variables
 #-------------------------------------------------------------------------------
 
-$WEBCACHE_DIR = "$env:TEMP\msi_build_cache_dir"
-$DEPS_URL     = "https://repo.saltproject.io/windows/dependencies"
-$PROJECT_DIR  = $(git rev-parse --show-toplevel)
-$BUILD_DIR    = "$PROJECT_DIR\pkg\windows\build"
-$BUILDENV_DIR = "$PROJECT_DIR\pkg\windows\buildenv"
-$SCRIPTS_DIR  = "$BUILDENV_DIR\Scripts"
-$PYTHON_BIN   = "$SCRIPTS_DIR\python.exe"
-$BUILD_ARCH   = $(. $PYTHON_BIN -c "import platform; print(platform.architecture()[0])")
-$SCRIPT_DIR   = (Get-ChildItem "$($myInvocation.MyCommand.Definition)").DirectoryName
-$RUNTIME_DIR  = [System.Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()
-$CSC_BIN      = "$RUNTIME_DIR\csc.exe"
+$WEBCACHE_DIR   = "$env:TEMP\msi_build_cache_dir"
+$DEPS_URL       = "https://github.com/saltstack/salt-windows-deps/raw/refs/heads/main/vcredist"
+$PROJECT_DIR    = $(git rev-parse --show-toplevel)
+$BUILD_DIR      = "$PROJECT_DIR\pkg\windows\build"
+$BUILDENV_DIR   = "$PROJECT_DIR\pkg\windows\buildenv"
+$SCRIPTS_DIR    = "$BUILDENV_DIR\Scripts"
+$SITE_PKGS_DIR  = "$BUILDENV_DIR\Lib\site-packages"
+$BUILD_SALT_DIR = "$SITE_PKGS_DIR\salt"
+$PYTHON_BIN     = "$SCRIPTS_DIR\python.exe"
+$BUILD_ARCH     = $(. $PYTHON_BIN -c "import platform; print(platform.architecture()[0])")
+$SCRIPT_DIR     = (Get-ChildItem "$($myInvocation.MyCommand.Definition)").DirectoryName
+$RUNTIME_DIR    = [System.Runtime.InteropServices.RuntimeEnvironment]::GetRuntimeDirectory()
+$CSC_BIN        = "$RUNTIME_DIR\csc.exe"
 
 if ( $BUILD_ARCH -eq "64bit" ) {
     $BUILD_ARCH    = "AMD64"
@@ -159,14 +161,12 @@ if ( ! "$env:WIX" ) {
 #-------------------------------------------------------------------------------
 
 $RUNTIMES = @(
-    ("Microsoft_VC120_CRT_x64.msm", "64", "15FD10A495287505184B8913DF8D6A9CA461F44F78BC74115A0C14A5EDD1C9A7"),
-    ("Microsoft_VC120_CRT_x86.msm", "32", "26340B393F52888B908AC3E67B935A80D390E1728A31FF38EBCEC01117EB2579"),
-    ("Microsoft_VC140_CRT_x64.msm", "64", "E1344D5943FB2BBB7A56470ED0B7E2B9B212CD9210D3CC6FA82BC3DA8F11EDA8"),
-    ("Microsoft_VC140_CRT_x86.msm", "32", "0D36CFE6E9ABD7F530DBAA4A83841CDBEF9B2ADCB625614AF18208FDCD6B92A4")
+    ("Microsoft_VC143_CRT_x64.msm", "F209B8906063A79B0DFFBB55D3C20AC0A676252DD4F5377CFCD148C409C859EC"),
+    ("Microsoft_VC143_CRT_x86.msm", "B187BD73C7DC0BA353C5D3A6D9D4E63EF72435F8E68273466F30E5496C1A86F7")
 )
 $RUNTIMES | ForEach-Object {
-    $name, $arch, $hash = $_
-    VerifyOrDownload "$WEBCACHE_DIR\$name" "$DEPS_URL/$arch/$name" "$hash"
+    $name, $hash = $_
+    VerifyOrDownload "$WEBCACHE_DIR\$name" "$DEPS_URL/$name" "$hash"
 }
 
 #-------------------------------------------------------------------------------
@@ -263,6 +263,214 @@ Write-Host "Packaging *.dll's to *.CA.dll: " -NoNewline
     "$SCRIPT_DIR\CustomAction01\CustomAction.config" > build.tmp
 CheckExitCode
 
+#-------------------------------------------------------------------------------
+# Remove Non-Windows Execution Modules
+#-------------------------------------------------------------------------------
+Write-Host "Removing Non-Windows Execution Modules: " -NoNewline
+$modules = "acme",
+           "aix",
+           "alternatives",
+           "apcups",
+           "apf",
+           "apt",
+           "arista",
+           "at",
+           "bcache",
+           "blockdev",
+           "bluez",
+           "bridge",
+           "bsd",
+           "btrfs",
+           "ceph",
+           "container_resource",
+           "cron",
+           "csf",
+           "daemontools",
+           "deb*",
+           "devmap",
+           "dpkg",
+           "ebuild",
+           "eix",
+           "eselect",
+           "ethtool",
+           "extfs",
+           "firewalld",
+           "freebsd",
+           "genesis",
+           "gentoo",
+           "glusterfs",
+           "gnomedesktop",
+           "groupadd",
+           "grub_legacy",
+           "guestfs",
+           "htpasswd",
+           "ilo",
+           "img",
+           "incron",
+           "inspector",
+           "ipset",
+           "iptables",
+           "iwtools",
+           "k8s",
+           "kapacitor",
+           "keyboard",
+           "keystone",
+           "kmod",
+           "layman",
+           "linux",
+           "localemod",
+           "locate",
+           "logadm",
+           "logrotate",
+           "lvs",
+           "lxc",
+           "mac",
+           "makeconf",
+           "mdadm",
+           "mdata",
+           "monit",
+           "moosefs",
+           "mount",
+           "napalm",
+           "netbsd",
+           "netscaler",
+           "neutron",
+           "nfs3",
+           "nftables",
+           "nova",
+           "nspawn",
+           "openbsd",
+           "openstack",
+           "openvswitch",
+           "opkg",
+           "pacman",
+           "parallels",
+           "parted",
+           "pcs",
+           "pkgin",
+           "pkgng",
+           "pkgutil",
+           "portage_config",
+           "postfix",
+           "poudriere",
+           "powerpath",
+           "pw_",
+           "qemu_",
+           "quota",
+           "redismod",
+           "restartcheck",
+           "rh_",
+           "riak",
+           "rpm",
+           "runit",
+           "s6",
+           "scsi",
+           "sensors",
+           "service",
+           "shadow",
+           "smartos",
+           "smf",
+           "snapper",
+           "solaris",
+           "solr",
+           "ssh_",
+           "supervisord",
+           "sysbench",
+           "sysfs",
+           "sysrc",
+           "system",
+           "test_virtual",
+           "timezone",
+           "trafficserver",
+           "tuned",
+           "udev",
+           "upstart",
+           "useradd",
+           "uswgi",
+           "varnish",
+           "vbox",
+           "virt.py",  # We don't want to remove virtualenv_mod.py
+           "xapi",
+           "xbpspkg",
+           "xfs",
+           "yum*",
+           "zfs",
+           "znc",
+           "zpool",
+           "zypper"
+$modules | ForEach-Object {
+    Remove-Item -Path "$BUILD_SALT_DIR\modules\$_*" -Recurse
+    if ( Test-Path -Path "$BUILD_SALT_DIR\modules\$_*" ) {
+        Write-Result "Failed" -ForegroundColor Red
+        Write-Host "Failed to remove: $BUILD_SALT_DIR\modules\$_"
+        exit 1
+    }
+}
+Write-Result "Success" -ForegroundColor Green
+
+#-------------------------------------------------------------------------------
+# Remove Non-Windows State Modules
+#-------------------------------------------------------------------------------
+Write-Host "Removing Non-Windows State Modules: " -NoNewline
+$states = "acme",
+          "alternatives",
+          "apt",
+          "at",
+          "blockdev",
+          "ceph",
+          "cron",
+          "csf",
+          "deb",
+          "eselect",
+          "ethtool",
+          "firewalld",
+          "glusterfs",
+          "gnome",
+          "htpasswd",
+          "incron",
+          "ipset",
+          "iptables",
+          "k8s",
+          "kapacitor",
+          "keyboard",
+          "keystone",
+          "kmod",
+          "layman",
+          "linux",
+          "lxc",
+          "mac",
+          "makeconf",
+          "mdadm",
+          "monit",
+          "mount",
+          "nftables",
+          "pcs",
+          "pkgng",
+          "portage",
+          "powerpath",
+          "quota",
+          "redismod",
+          "smartos",
+          "snapper",
+          "ssh",
+          "supervisord",
+          "sysrc",
+          "trafficserver",
+          "tuned",
+          "vbox",
+          "virt.py",
+          "zfs",
+          "zpool"
+$states | ForEach-Object {
+    Remove-Item -Path "$BUILD_SALT_DIR\states\$_*" -Recurse
+    if ( Test-Path -Path "$BUILD_SALT_DIR\states\$_*" ) {
+        Write-Result "Failed" -ForegroundColor Red
+        Write-Host "Failed to remove: $BUILD_SALT_DIR\states\$_"
+        exit 1
+    }
+}
+Write-Result "Success" -ForegroundColor Green
+
 # move conf folder up one dir because it must not be discovered twice and xslt is difficult
 Write-Host "Remove configs from discovery: " -NoNewline
 Move-Item -Path "$DISCOVER_CONFDIR" `
@@ -288,7 +496,7 @@ Write-Host "Discovering install files: " -NoNewline
     -var var.DISCOVER_INSTALLDIR `
     -dr INSTALLDIR `
     -t "$SCRIPT_DIR\Product-discover-files.xsl" `
-    -nologo -indent 1 -gg -sfrag -sreg -srd -ke -template fragment
+    -nologo -indent 1 -ag -sfrag -sreg -srd -template fragment
 CheckExitCode
 
 # Move the configs back
@@ -305,7 +513,7 @@ Write-Host "Discovering config files: " -NoNewline
     -var var.DISCOVER_CONFDIR `
     -dr CONFDIR `
     -t "$SCRIPT_DIR\Product-discover-files-config.xsl" `
-    -nologo -indent 1 -gg -sfrag -sreg -srd -ke -template fragment
+    -nologo -indent 1 -ag -sfrag -sreg -srd -template fragment
 CheckExitCode
 
 Write-Host "Compiling *.wxs to $($ARCHITECTURE[$i]) *.wixobj: " -NoNewline

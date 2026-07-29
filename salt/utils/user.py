@@ -3,7 +3,6 @@ Functions for querying and modifying a user account and the groups to which it
 belongs.
 """
 
-
 import ctypes
 import getpass
 import logging
@@ -151,13 +150,13 @@ def get_specific_user():
     user = get_user()
     if salt.utils.platform.is_windows():
         if _win_current_user_is_admin():
-            return "sudo_{}".format(user)
+            return f"sudo_{user}"
     else:
         env_vars = ("SUDO_USER",)
         if user == "root":
             for evar in env_vars:
                 if evar in os.environ:
-                    return "sudo_{}".format(os.environ[evar])
+                    return f"sudo_{os.environ[evar]}"
     return user
 
 
@@ -175,7 +174,7 @@ def chugid(runas, group=None):
             target_pw_gid = grp.getgrnam(group).gr_gid
         except KeyError as err:
             raise CommandExecutionError(
-                "Failed to fetch the GID for {}. Error: {}".format(group, err)
+                f"Failed to fetch the GID for {group}. Error: {err}"
             )
     else:
         target_pw_gid = uinfo.pw_gid
@@ -350,11 +349,7 @@ def get_group_dict(user=None, include_default=True):
     group_dict = {}
     group_names = get_group_list(user, include_default=include_default)
     for group in group_names:
-        try:
-            group_dict.update({group: grp.getgrnam(group).gr_gid})
-        except KeyError:
-            # In case if imporer duplicate group was returned by get_group_list
-            pass
+        group_dict.update({group: grp.getgrnam(group).gr_gid})
     return group_dict
 
 

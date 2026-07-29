@@ -6,8 +6,8 @@
     ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 """
 
-
 import logging
+import textwrap
 
 import pytest
 
@@ -671,6 +671,147 @@ def test_grant_exists_all():
             assert ret
 
 
+def test_grant_exists_all_mysql_84_68567():
+    """
+    Regression test for #68567.
+
+    On MySQL 8.4 ``GRANT ALL PRIVILEGES ON *.*`` results in two ``SHOW GRANTS``
+    rows that, between them, no longer include ``SET_USER_ID`` (replaced in
+    8.4) and add a long list of new 8.4 dynamic privileges. ``grant_exists``
+    must still report that "all privileges" is present after the GRANT.
+    """
+    # Captured from the issue's debug output against MySQL 8.4.7.
+    mock_grants = [
+        "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, SHUTDOWN,"
+        " PROCESS, FILE, REFERENCES, INDEX, ALTER, SHOW DATABASES, SUPER,"
+        " CREATE TEMPORARY TABLES, LOCK TABLES, EXECUTE, REPLICATION SLAVE,"
+        " REPLICATION CLIENT, CREATE VIEW, SHOW VIEW, CREATE ROUTINE,"
+        " ALTER ROUTINE, CREATE USER, EVENT, TRIGGER, CREATE TABLESPACE,"
+        " CREATE ROLE, DROP ROLE ON *.* TO `myuser`@`localhost`",
+        "GRANT ALLOW_NONEXISTENT_DEFINER,APPLICATION_PASSWORD_ADMIN,"
+        "AUDIT_ABORT_EXEMPT,AUDIT_ADMIN,AUTHENTICATION_POLICY_ADMIN,"
+        "BACKUP_ADMIN,BINLOG_ADMIN,BINLOG_ENCRYPTION_ADMIN,CLONE_ADMIN,"
+        "CONNECTION_ADMIN,ENCRYPTION_KEY_ADMIN,FIREWALL_EXEMPT,"
+        "FLUSH_OPTIMIZER_COSTS,FLUSH_PRIVILEGES,FLUSH_STATUS,FLUSH_TABLES,"
+        "FLUSH_USER_RESOURCES,GROUP_REPLICATION_ADMIN,GROUP_REPLICATION_STREAM,"
+        "INNODB_REDO_LOG_ARCHIVE,INNODB_REDO_LOG_ENABLE,OPTIMIZE_LOCAL_TABLE,"
+        "PASSWORDLESS_USER_ADMIN,PERSIST_RO_VARIABLES_ADMIN,"
+        "REPLICATION_APPLIER,REPLICATION_SLAVE_ADMIN,RESOURCE_GROUP_ADMIN,"
+        "RESOURCE_GROUP_USER,ROLE_ADMIN,SENSITIVE_VARIABLES_OBSERVER,"
+        "SERVICE_CONNECTION_ADMIN,SESSION_VARIABLES_ADMIN,SET_ANY_DEFINER,"
+        "SHOW_ROUTINE,SYSTEM_USER,SYSTEM_VARIABLES_ADMIN,"
+        "TABLE_ENCRYPTION_ADMIN,TELEMETRY_LOG_ADMIN,TRANSACTION_GTID_TAG,"
+        "XA_RECOVER_ADMIN ON *.* TO `myuser`@`localhost`",
+    ]
+    # The privileges the MySQL 8.4 server reports via ``SHOW PRIVILEGES``;
+    # exactly the union of the two grant lines above (the fix queries this
+    # to know what "ALL" means on the connected server).
+    server_privs = [
+        "SELECT",
+        "INSERT",
+        "UPDATE",
+        "DELETE",
+        "CREATE",
+        "DROP",
+        "RELOAD",
+        "SHUTDOWN",
+        "PROCESS",
+        "FILE",
+        "REFERENCES",
+        "INDEX",
+        "ALTER",
+        "SHOW DATABASES",
+        "SUPER",
+        "CREATE TEMPORARY TABLES",
+        "LOCK TABLES",
+        "EXECUTE",
+        "REPLICATION SLAVE",
+        "REPLICATION CLIENT",
+        "CREATE VIEW",
+        "SHOW VIEW",
+        "CREATE ROUTINE",
+        "ALTER ROUTINE",
+        "CREATE USER",
+        "EVENT",
+        "TRIGGER",
+        "CREATE TABLESPACE",
+        "CREATE ROLE",
+        "DROP ROLE",
+        "ALLOW_NONEXISTENT_DEFINER",
+        "APPLICATION_PASSWORD_ADMIN",
+        "AUDIT_ABORT_EXEMPT",
+        "AUDIT_ADMIN",
+        "AUTHENTICATION_POLICY_ADMIN",
+        "BACKUP_ADMIN",
+        "BINLOG_ADMIN",
+        "BINLOG_ENCRYPTION_ADMIN",
+        "CLONE_ADMIN",
+        "CONNECTION_ADMIN",
+        "ENCRYPTION_KEY_ADMIN",
+        "FIREWALL_EXEMPT",
+        "FLUSH_OPTIMIZER_COSTS",
+        "FLUSH_PRIVILEGES",
+        "FLUSH_STATUS",
+        "FLUSH_TABLES",
+        "FLUSH_USER_RESOURCES",
+        "GROUP_REPLICATION_ADMIN",
+        "GROUP_REPLICATION_STREAM",
+        "INNODB_REDO_LOG_ARCHIVE",
+        "INNODB_REDO_LOG_ENABLE",
+        "OPTIMIZE_LOCAL_TABLE",
+        "PASSWORDLESS_USER_ADMIN",
+        "PERSIST_RO_VARIABLES_ADMIN",
+        "REPLICATION_APPLIER",
+        "REPLICATION_SLAVE_ADMIN",
+        "RESOURCE_GROUP_ADMIN",
+        "RESOURCE_GROUP_USER",
+        "ROLE_ADMIN",
+        "SENSITIVE_VARIABLES_OBSERVER",
+        "SERVICE_CONNECTION_ADMIN",
+        "SESSION_VARIABLES_ADMIN",
+        "SET_ANY_DEFINER",
+        "SHOW_ROUTINE",
+        "SYSTEM_USER",
+        "SYSTEM_VARIABLES_ADMIN",
+        "TABLE_ENCRYPTION_ADMIN",
+        "TELEMETRY_LOG_ADMIN",
+        "TRANSACTION_GTID_TAG",
+        "XA_RECOVER_ADMIN",
+    ]
+    with patch.object(mysql, "version", return_value="8.4.7"):
+        with patch.object(mysql, "user_grants", return_value=mock_grants):
+            with patch.object(
+                mysql, "_server_all_privileges", return_value=server_privs
+            ):
+                assert mysql.grant_exists("ALL", "*.*", "myuser", "localhost")
+                assert mysql.grant_exists(
+                    "all privileges", "*.*", "myuser", "localhost"
+                )
+
+    # When the SHOW PRIVILEGES query fails (returns None), fall back to the
+    # legacy hard-coded ``__all_privileges__`` list. With the 8.4 grants
+    # above this fallback will still report mismatch (SET_USER_ID missing),
+    # so we instead use grants compatible with the hard-coded list.
+    legacy_grants = [
+        "GRANT SELECT, INSERT, UPDATE, DELETE, CREATE, DROP, RELOAD, SHUTDOWN,"
+        " PROCESS, FILE, REFERENCES, INDEX, ALTER, SHOW DATABASES, SUPER,"
+        " CREATE TEMPORARY TABLES, LOCK TABLES, EXECUTE, REPLICATION SLAVE,"
+        " REPLICATION CLIENT, CREATE VIEW, SHOW VIEW, CREATE ROUTINE,"
+        " ALTER ROUTINE, CREATE USER, EVENT, TRIGGER, CREATE TABLESPACE,"
+        " CREATE ROLE, DROP ROLE ON *.* TO `myuser`@`localhost`",
+        "GRANT BACKUP_ADMIN,BINLOG_ADMIN,CONNECTION_ADMIN,"
+        "ENCRYPTION_KEY_ADMIN,GROUP_REPLICATION_ADMIN,"
+        "PERSIST_RO_VARIABLES_ADMIN,REPLICATION_SLAVE_ADMIN,"
+        "RESOURCE_GROUP_ADMIN,RESOURCE_GROUP_USER,ROLE_ADMIN,SET_USER_ID,"
+        "SYSTEM_VARIABLES_ADMIN,XA_RECOVER_ADMIN ON *.* "
+        "TO `myuser`@`localhost`",
+    ]
+    with patch.object(mysql, "version", return_value="8.0.10"):
+        with patch.object(mysql, "user_grants", return_value=legacy_grants):
+            with patch.object(mysql, "_server_all_privileges", return_value=None):
+                assert mysql.grant_exists("ALL", "*.*", "myuser", "localhost")
+
+
 @pytest.mark.skipif(True, reason="TODO: Mock up user_grants()")
 def test_grant_add():
     """
@@ -802,48 +943,60 @@ def test_sanitize_comment():
     """
     Test comment sanitization
     """
-    input_data = """/*
-    multiline
-    comment
-    */
-    CREATE TABLE test_update (a VARCHAR(25)); # end of line comment
-    # example comment
-    insert into test_update values ("some #hash value");            -- ending comment
-    insert into test_update values ("crazy -- not comment"); -- another ending comment
-    -- another comment type
-    """
-    expected_response = """CREATE TABLE test_update (a VARCHAR(25));
+    input_data = textwrap.dedent(
+        """\
+        /*
+        multiline
+        comment
+        */
+        CREATE TABLE test_update (a VARCHAR(25)); # end of line comment
+        # example comment
+        insert into test_update values ("some #hash value");            -- ending comment
+        insert into test_update values ("crazy -- not comment"); -- another ending comment
+        -- another comment type
+        """
+    )
+    expected_response = textwrap.dedent(
+        """\
+        CREATE TABLE test_update (a VARCHAR(25));
 
-insert into test_update values ("some #hash value");
-insert into test_update values ("crazy -- not comment");
+        insert into test_update values ("some #hash value");
+        insert into test_update values ("crazy -- not comment");
 
-"""
+        """
+    )
     output = mysql._sanitize_comments(input_data)
     assert output == expected_response
 
-    input_data = """-- --------------------------------------------------------
-                    -- SQL Commands to set up the pmadb as described in the documentation.
-                    --
-                    -- This file is meant for use with MySQL 5 and above!
-                    --
-                    -- This script expects the user pma to already be existing. If we would put a
-                    -- line here to create them too many users might just use this script and end
-                    -- up with having the same password for the controluser.
-                    --
-                    -- This user "pma" must be defined in config.inc.php (controluser/controlpass)
-                    --
-                    -- Please don't forget to set up the tablenames in config.inc.php
-                    --
-                    -- --------------------------------------------------------
-                    --
-                    CREATE DATABASE IF NOT EXISTS `phpmyadmin`
-                      DEFAULT CHARACTER SET utf8 COLLATE utf8_bin;
-                    USE phpmyadmin;
-    """
+    input_data = textwrap.dedent(
+        """\
+        -- --------------------------------------------------------
+        -- SQL Commands to set up the pmadb as described in the documentation.
+        --
+        -- This file is meant for use with MySQL 5 and above!
+        --
+        -- This script expects the user pma to already be existing. If we would put a
+        -- line here to create them too many users might just use this script and end
+        -- up with having the same password for the controluser.
+        --
+        -- This user "pma" must be defined in config.inc.php (controluser/controlpass)
+        --
+        -- Please don't forget to set up the tablenames in config.inc.php
+        --
+        -- --------------------------------------------------------
+        --
+        CREATE DATABASE IF NOT EXISTS `phpmyadmin`
+          DEFAULT CHARACTER SET utf8 COLLATE utf8_bin;
+        USE phpmyadmin;
+        """
+    )
 
-    expected_response = """CREATE DATABASE IF NOT EXISTS `phpmyadmin`
-                      DEFAULT CHARACTER SET utf8 COLLATE utf8_bin;
-                    USE phpmyadmin;"""
+    expected_response = textwrap.dedent(
+        """\
+        CREATE DATABASE IF NOT EXISTS `phpmyadmin`
+          DEFAULT CHARACTER SET utf8 COLLATE utf8_bin;
+        USE phpmyadmin;"""
+    )
 
     output = mysql._sanitize_comments(input_data)
     assert output == expected_response
@@ -861,7 +1014,7 @@ def _test_call(function, expected_sql, *args, **kwargs):
                     .execute("{}".format(expected_sql["sql"]), expected_sql["sql_args"])
                 )
             else:
-                calls = call().cursor().execute("{}".format(expected_sql))
+                calls = call().cursor().execute(f"{expected_sql}")
             connect_mock.assert_has_calls((calls,), True)
 
 

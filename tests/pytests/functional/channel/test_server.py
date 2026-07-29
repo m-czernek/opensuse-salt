@@ -14,14 +14,13 @@ from saltfactories.utils import random_string
 import salt.channel.client
 import salt.channel.server
 import salt.config
-import tornado.gen
-import tornado.ioloop
+import salt.ext.tornado.gen
+import salt.ext.tornado.ioloop
 import salt.master
 import salt.utils.platform
 import salt.utils.process
 import salt.utils.stringutils
-
-from salt import USE_VENDORED_TORNADO
+from tests.conftest import FIPS_TESTRUN
 
 log = logging.getLogger(__name__)
 
@@ -29,7 +28,8 @@ log = logging.getLogger(__name__)
 pytestmark = [
     pytest.mark.skip_on_spawning_platform(
         reason="These tests are currently broken on spawning platforms. Need to be rewritten.",
-    )
+    ),
+    pytest.mark.timeout_unless_on_windows(120),
 ]
 
 
@@ -52,7 +52,7 @@ def root_dir(tmp_path):
 
 
 def transport_ids(value):
-    return "transport({})".format(value)
+    return f"transport({value})"
 
 
 @pytest.fixture(params=["tcp", "zeromq"], ids=transport_ids)
@@ -66,6 +66,10 @@ def master_config(master_opts, transport):
         transport=transport,
         id="master",
         interface="127.0.0.1",
+        fips_mode=FIPS_TESTRUN,
+        publish_signing_algorithm=(
+            "PKCS1v15-SHA224" if FIPS_TESTRUN else "PKCS1v15-SHA1"
+        ),
     )
     salt.crypt.gen_keys(master_opts["pki_dir"], "master", 4096)
     yield master_opts
@@ -85,6 +89,9 @@ def minion_config(minion_opts, master_config, channel_minion_id):
         master_port=master_config["ret_port"],
         master_ip="127.0.0.1",
         master_uri="tcp://127.0.0.1:{}".format(master_config["ret_port"]),
+        fips_mode=FIPS_TESTRUN,
+        encryption_algorithm="OAEP-SHA224" if FIPS_TESTRUN else "OAEP-SHA1",
+        signing_algorithm="PKCS1v15-SHA224" if FIPS_TESTRUN else "PKCS1v15-SHA1",
     )
     pathlib.Path(minion_opts["pki_dir"]).mkdir(exist_ok=True)
     pathlib.Path(master_config["pki_dir"]).mkdir(exist_ok=True)
@@ -119,7 +126,7 @@ def master_secrets():
     salt.master.SMaster.secrets.pop("aes")
 
 
-@tornado.gen.coroutine
+@salt.ext.tornado.gen.coroutine
 def _connect_and_publish(
     io_loop, channel_minion_id, channel, server, received, timeout=60
 ):
@@ -136,14 +143,10 @@ def _connect_and_publish(
     server.publish({"tgt_type": "glob", "tgt": [channel_minion_id], "WTF": "SON"})
     start = time.time()
     while time.time() - start < timeout:
-        yield tornado.gen.sleep(1)
+        yield salt.ext.tornado.gen.sleep(1)
     io_loop.stop()
 
 
-@pytest.mark.skipif(
-    not USE_VENDORED_TORNADO,
-    reason="Could stuck with some versions of non-vendored tornado",
-)
 def test_pub_server_channel(
     io_loop,
     channel_minion_id,
@@ -163,12 +166,23 @@ def test_pub_server_channel(
         log.info("TEST - Req Server handle payload %r", payload)
 
     req_server_channel.post_fork(handle_payload, io_loop=io_loop)
+
     if master_config["transport"] == "zeromq":
-        p = Path(str(master_config["sock_dir"])) / "workers.ipc"
-        mode = os.lstat(p).st_mode
-        assert bool(os.lstat(p).st_mode & stat.S_IRUSR)
-        assert not bool(os.lstat(p).st_mode & stat.S_IRGRP)
-        assert not bool(os.lstat(p).st_mode & stat.S_IROTH)
+        time.sleep(1)
+        attempts = 5
+        while True:
+            try:
+                p = Path(str(master_config["sock_dir"])) / "workers.ipc"
+                mode = os.lstat(p).st_mode
+                assert bool(os.lstat(p).st_mode & stat.S_IRUSR)
+                assert not bool(os.lstat(p).st_mode & stat.S_IRGRP)
+                assert not bool(os.lstat(p).st_mode & stat.S_IROTH)
+                break
+            except FileNotFoundError as exc:
+                if not attempts:
+                    raise exc from None
+                attempts -= 1
+                time.sleep(2.5)
 
     pub_channel = salt.channel.client.AsyncPubChannel.factory(minion_config)
     received = []

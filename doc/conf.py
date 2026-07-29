@@ -3,12 +3,38 @@
 Sphinx documentation for Salt
 """
 import os
-import re
 import sys
+import urllib.parse
+
+# Sphinx crashes parsing docstring URLs like ``http://hostname[:port]`` because
+# urllib.parse.urlsplit raises ValueError("Invalid IPv6 URL") on the bracketed
+# host placeholder. Return a dummy SplitResult for that one case so the build
+# can proceed.
+_original_urlsplit = urllib.parse.urlsplit
+
+
+def _safe_urlsplit(url, scheme="", allow_fragments=True):
+    try:
+        return _original_urlsplit(url, scheme, allow_fragments)
+    except ValueError as exc:
+        if "Invalid IPv6 URL" in str(exc):
+            return urllib.parse.SplitResult(scheme, "", url, "", "")
+        raise
+
+
+urllib.parse.urlsplit = _safe_urlsplit
+
+import pathlib
+import re
+import shutil
+import textwrap
 import time
 import types
 
 from sphinx.directives.other import TocTree
+from sphinx.util import logging
+
+log = logging.getLogger(__name__)
 
 # -- Add paths to PYTHONPATH ---------------------------------------------------
 try:
@@ -152,17 +178,76 @@ extensions = [
     "sphinxcontrib.httpdomain",
     "saltrepo",
     "myst_parser",
-    "sphinxcontrib.spelling",
     #'saltautodoc', # Must be AFTER autodoc
 ]
+
+# Only enable spell-checking if enchant library is available
+# This is optional for package builds but useful during development
+try:
+    import enchant
+
+    extensions.append("sphinxcontrib.spelling")
+except ImportError:
+    log.info("Spell-checking disabled: enchant library not available")
 
 modindex_common_prefix = ["salt."]
 
 autosummary_generate = True
 autosummary_generate_overwrite = False
 
-# In case building docs throws import errors, please add the top level package name below
+# Smart dependency handling for documentation builds
+# For man pages (lightweight CLI docs), we auto-mock missing dependencies
+# For full HTML docs, we fail with helpful errors about what's missing
 autodoc_mock_imports = []
+
+# Detect if we're building man pages only (lightweight build)
+# Man pages only document CLI tools and don't need full Salt imports
+building_man_only = "man" in sys.argv and "html" not in sys.argv
+
+# External dependencies that Salt imports at module level
+# These need to be available for full HTML docs (autodoc) but can be mocked for man pages
+_SALT_DEPENDENCIES = [
+    "distro",
+    "jinja2",
+    "looseversion",
+    "msgpack",
+    "packaging",
+    "yaml",
+]
+
+if sys.version_info < (3, 13):
+    _SALT_DEPENDENCIES.append("backports")
+
+_missing_deps = []
+for dep in _SALT_DEPENDENCIES:
+    try:
+        __import__(dep)
+    except ImportError:
+        _missing_deps.append(dep)
+        # Always mock missing dependencies to allow build to proceed
+        autodoc_mock_imports.append(dep)
+
+if _missing_deps:
+    if building_man_only:
+        # For man pages, this is expected - they don't need Salt modules
+        log.info(
+            "Building man pages with mocked dependencies: %s (this is normal for man pages)",
+            ", ".join(_missing_deps),
+        )
+    else:
+        # For HTML/full builds, warn that docs may be incomplete
+        log.warning(
+            "\n"
+            "=" * 70 + "\n"
+            "WARNING: Missing dependencies for full documentation build:\n"
+            "  %s\n\n"
+            "Autodoc will use mocked modules. Documentation will be generated but\n"
+            "may be incomplete or show incorrect type hints.\n\n"
+            "For complete documentation, install with:\n"
+            "  pip install %s\n" + "=" * 70,
+            ", ".join(_missing_deps),
+            " ".join(_missing_deps),
+        )
 
 # strip git rev as there won't necessarily be a release based on it
 stripped_release = re.sub(r"-\d+-g[0-9a-f]+$", "", release)
@@ -174,21 +259,7 @@ rst_prolog = """\
 .. _`salt-users`: https://groups.google.com/forum/#!forum/salt-users
 .. _`salt-announce`: https://groups.google.com/forum/#!forum/salt-announce
 .. _`salt-packagers`: https://groups.google.com/forum/#!forum/salt-packagers
-.. _`salt-slack`: https://join.slack.com/t/saltstackcommunity/shared_invite/zt-3av8jjyf-oBQ2M0vhXOhJpNpRkPWBvg
-.. |windownload| raw:: html
-
-     <p>Python3 x86: <a
-     href="https://packages.broadcom.com/artifactory/saltproject-generic/windows/{release}/Salt-Minion-{release}-Py3-x86-Setup.exe"><strong>Salt-Minion-{release}-x86-Setup.exe</strong></a>
-      | <a href="https://packages.broadcom.com/artifactory/saltproject-generic/windows/{release}/Salt-Minion-{release}-Py3-x86-Setup.exe.md5"><strong>md5</strong></a></p>
-
-     <p>Python3 AMD64: <a
-     href="https://packages.broadcom.com/artifactory/saltproject-generic/windows/{release}/Salt-Minion-{release}-Py3-AMD64-Setup.exe"><strong>Salt-Minion-{release}-AMD64-Setup.exe</strong></a>
-      | <a href="https://packages.broadcom.com/artifactory/saltproject-generic/windows/{release}/Salt-Minion-{release}-Py3-AMD64-Setup.exe.md5"><strong>md5</strong></a></p>
-
-.. |osxdownloadpy3| raw:: html
-
-     <p>x86_64: <a href="https://packages.broadcom.com/artifactory/saltproject-generic/macos/{release}/salt-{release}-py3-x86_64.pkg"><strong>salt-{release}-py3-x86_64.pkg</strong></a>
-      | <a href="https://packages.broadcom.com/artifactory/saltproject-generic/macos/{release}/salt-{release}-py3-x86_64.pkg.md5"><strong>md5</strong></a></p>
+.. _`salt-discord`: https://discord.com/invite/J7b7EscrAs
 
 """.format(
     release=stripped_release
@@ -215,7 +286,7 @@ gettext_compact = False
 
 ### HTML options
 # set 'HTML_THEME=saltstack' to use previous theme
-html_theme = os.environ.get("HTML_THEME", "saltstack2")
+html_theme = os.environ.get("HTML_THEME", "pydata_sphinx_theme")
 html_theme_path = ["_themes"]
 html_title = ""
 html_short_title = "Salt"
@@ -243,18 +314,55 @@ html_default_sidebars = [
     "sourcelink.html",
     "saltstack.html",
 ]
-html_sidebars = {
-    "ref/**/all/salt.*": [
-        html_search_template,
-        "version.html",
-        "modules-sidebar.html",
-        "localtoc.html",
-        "relations.html",
-        "sourcelink.html",
-        "saltstack.html",
-    ],
-    "ref/formula/all/*": [],
-}
+if html_theme == "pydata_sphinx_theme":
+    html_theme_options = {
+        "logo": {
+            "image_light": "https://gitlab.com/saltstack/open/salt-branding-guide/-/raw/master/logos/SaltProject_altlogo_teal.png",
+            "image_dark": "https://gitlab.com/saltstack/open/salt-branding-guide/-/raw/master/logos/SaltProject_altlogo_teal.png",
+        },
+        "navbar_start": ["navbar-logo"],
+        "navbar_center": [
+            "navbar-nav",
+            "header-links",
+        ],  # navbar-nav provides structure, header-links provides logic
+        "navbar_end": ["version-switcher", "theme-switcher", "navbar-icon-links"],
+        "show_nav_level": 4,
+        "navigation_depth": 4,
+        "collapse_navigation": False,
+        "shorten_urls": False,  # Disable to avoid crashes on malformed URLs
+        "check_switcher": False,  # Disable to avoid warnings about local json file
+        "switcher": {
+            "json_url": "https://docs.saltproject.io/en/latest/_static/versions.json",
+            # Match an entry in versions.json by BUILD_TYPE: the published
+            # /en/latest/ build is "latest"; dev/master is "master"; release
+            # branches publish to /en/<major>/ (e.g. /en/3006/) and match the
+            # major version derived from `release`.
+            "version_match": (
+                "master"
+                if build_type == repo_primary_branch or build_type == "next"
+                else "latest" if build_type == "latest" else release.split(".", 1)[0]
+            ),
+        },
+    }
+    html_sidebars = {"**": ["globaltoc.html", "sidebar-ethical-ads"]}
+
+
+elif html_theme == "furo":
+    pass
+
+else:
+    html_sidebars = {
+        "ref/**/all/salt.*": [
+            html_search_template,
+            "version.html",
+            "modules-sidebar.html",
+            "localtoc.html",
+            "relations.html",
+            "sourcelink.html",
+            "saltstack.html",
+        ],
+        "ref/formula/all/*": [],
+    }
 
 html_context = {
     "on_saltstack": on_saltstack,
@@ -360,7 +468,6 @@ authors = [
 ]
 
 man_pages = [
-    ("contents", "salt", "Salt Documentation", authors, 7),
     ("ref/cli/salt", "salt", "salt", authors, 1),
     ("ref/cli/salt-master", "salt-master", "salt-master Documentation", authors, 1),
     ("ref/cli/salt-minion", "salt-minion", "salt-minion Documentation", authors, 1),
@@ -375,19 +482,6 @@ man_pages = [
     ("ref/cli/salt-api", "salt-api", "salt-api Command", authors, 1),
     ("ref/cli/spm", "spm", "Salt Package Manager Command", authors, 1),
 ]
-
-
-### epub options
-epub_title = "Salt Documentation"
-epub_author = "VMware, Inc."
-epub_publisher = epub_author
-epub_copyright = copyright
-
-epub_scheme = "URL"
-epub_identifier = "http://saltproject.io/"
-
-epub_tocdup = False
-# epub_tocdepth = 3
 
 
 def skip_mod_init_member(app, what, name, obj, skip, options):
@@ -415,6 +509,67 @@ class ReleasesTree(TocTree):
         return rst
 
 
+def copy_release_templates_pre(app):
+    app._copied_release_files = []
+    docs_path = pathlib.Path(docs_basepath)
+    release_files_dir = docs_path / "topics" / "releases"
+    release_template_files_dir = release_files_dir / "templates"
+    for fpath in release_template_files_dir.iterdir():
+        dest = release_files_dir / fpath.name.replace(".template", "")
+        if dest.exists():
+            continue
+        log.info(
+            "Copying '%s' -> '%s' just for this build ...",
+            fpath.relative_to(docs_path),
+            dest.relative_to(docs_path),
+        )
+        app._copied_release_files.append(dest)
+        shutil.copyfile(fpath, dest)
+
+
+def copy_release_templates_post(app, exception):
+    docs_path = pathlib.Path(docs_basepath)
+    for fpath in app._copied_release_files:
+        log.info(
+            "The release file '%s' was copied for the build, but its not in "
+            "version control system. Deleting.",
+            fpath.relative_to(docs_path),
+        )
+        fpath.unlink()
+
+
+def extract_module_deprecations(app, what, name, obj, options, lines):
+    """
+    Add a warning to the modules being deprecated into extensions.
+    """
+    # https://www.sphinx-doc.org/en/master/usage/extensions/autodoc.html#event-autodoc-process-docstring
+    if what != "module":
+        # We're only interested in module deprecations
+        return
+
+    try:
+        deprecated_info = obj.__deprecated__
+    except AttributeError:
+        # The module is not deprecated
+        return
+
+    _version, _extension, _url = deprecated_info
+    msg = textwrap.dedent(
+        f"""
+        .. warning::
+
+            This module will be removed from Salt in version {_version} in favor of
+            the `{_extension} Salt Extension <{_url}>`_.
+
+        """
+    )
+    # Modify the docstring lines in-place
+    lines[:] = msg.splitlines() + lines
+
+
 def setup(app):
     app.add_directive("releasestree", ReleasesTree)
     app.connect("autodoc-skip-member", skip_mod_init_member)
+    app.connect("builder-inited", copy_release_templates_pre)
+    app.connect("build-finished", copy_release_templates_post)
+    app.connect("autodoc-process-docstring", extract_module_deprecations)

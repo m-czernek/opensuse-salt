@@ -67,17 +67,19 @@ def _get_notifier(config):
     """
     Check the context for the notifier and construct it if not present
     """
-    if "inotify.notifier" not in __context__:
+    beacon_name = config.get("_beacon_name", "inotify")
+    notifier = f"{beacon_name}.notifier"
+    if notifier not in __context__:
         __context__["inotify.queue"] = collections.deque()
         wm = pyinotify.WatchManager()
-        __context__["inotify.notifier"] = pyinotify.Notifier(wm, _enqueue)
+        __context__[notifier] = pyinotify.Notifier(wm, _enqueue)
         if (
             "coalesce" in config
             and isinstance(config["coalesce"], bool)
             and config["coalesce"]
         ):
-            __context__["inotify.notifier"].coalesce_events()
-    return __context__["inotify.notifier"]
+            __context__[notifier].coalesce_events()
+    return __context__[notifier]
 
 
 def validate(config):
@@ -237,6 +239,9 @@ def beacon(config):
       being at the Notifier level in pyinotify.
     """
 
+    whitelist = ["_beacon_name"]
+    config = salt.utils.beacons.remove_hidden_options(config, whitelist)
+
     config = salt.utils.beacons.list_to_dict(config)
 
     ret = []
@@ -259,7 +264,7 @@ def beacon(config):
                     break
                 path = os.path.dirname(path)
 
-            excludes = config["files"][path].get("exclude", "")
+            excludes = config["files"].get(path, {}).get("exclude", "")
 
             if excludes and isinstance(excludes, list):
                 for exclude in excludes:
@@ -346,6 +351,9 @@ def beacon(config):
 
 
 def close(config):
-    if "inotify.notifier" in __context__:
-        __context__["inotify.notifier"].stop()
-        del __context__["inotify.notifier"]
+    config = salt.utils.beacons.list_to_dict(config)
+    beacon_name = config.get("_beacon_name", "inotify")
+    notifier = f"{beacon_name}.notifier"
+    if notifier in __context__:
+        __context__[notifier].stop()
+        del __context__[notifier]

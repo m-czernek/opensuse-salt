@@ -1,3 +1,0 @@
-"""
-Profiles for salt-support.
-"""

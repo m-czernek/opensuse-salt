@@ -5,6 +5,8 @@ import time
 
 import pytest
 
+from tests.conftest import FIPS_TESTRUN
+
 pytestmark = [
     pytest.mark.core_test,
     pytest.mark.skip_on_freebsd(reason="Processes are not properly killed on FreeBSD"),
@@ -12,10 +14,7 @@ pytestmark = [
 
 log = logging.getLogger(__name__)
 
-GITHUB_ACTIONS = bool(os.getenv("GITHUB_ACTIONS", False))
 
-
-@pytest.mark.skipif(GITHUB_ACTIONS, reason="Test is failing in GitHub Actions")
 def test_pki(salt_mm_failover_master_1, salt_mm_failover_master_2, caplog):
     """
     Verify https://docs.saltproject.io/en/latest/topics/tutorials/multimaster_pki.html
@@ -31,14 +30,17 @@ def test_pki(salt_mm_failover_master_1, salt_mm_failover_master_2, caplog):
     mm_master_2_addr = salt_mm_failover_master_2.config["interface"]
     config_overrides = {
         "master": [
-            "{}:{}".format(mm_master_1_addr, mm_master_1_port),
-            "{}:{}".format(mm_master_2_addr, mm_master_2_port),
+            f"{mm_master_1_addr}:{mm_master_1_port}",
+            f"{mm_master_2_addr}:{mm_master_2_port}",
         ],
         "publish_port": salt_mm_failover_master_1.config["publish_port"],
         "master_type": "failover",
         "master_alive_interval": 5,
         "master_tries": -1,
         "verify_master_pubkey_sign": True,
+        "fips_mode": FIPS_TESTRUN,
+        "encryption_algorithm": "OAEP-SHA224" if FIPS_TESTRUN else "OAEP-SHA1",
+        "signing_algorithm": "PKCS1v15-SHA224" if FIPS_TESTRUN else "PKCS1v15-SHA1",
     }
     factory = salt_mm_failover_master_1.salt_minion_daemon(
         "mm-failover-pki-minion-1",
@@ -97,7 +99,7 @@ def test_failover_to_second_master(
     event_patterns = [
         (
             salt_mm_failover_master_2.id,
-            "salt/minion/{}/start".format(salt_mm_failover_minion_1.id),
+            f"salt/minion/{salt_mm_failover_minion_1.id}/start",
         )
     ]
 
@@ -183,19 +185,19 @@ def test_minions_alive_with_no_master(
     event_patterns = [
         (
             salt_mm_failover_master_1.id,
-            "salt/minion/{}/start".format(salt_mm_failover_minion_1.id),
+            f"salt/minion/{salt_mm_failover_minion_1.id}/start",
         ),
         (
             salt_mm_failover_master_1.id,
-            "salt/minion/{}/start".format(salt_mm_failover_minion_2.id),
+            f"salt/minion/{salt_mm_failover_minion_2.id}/start",
         ),
         (
             salt_mm_failover_master_2.id,
-            "salt/minion/{}/start".format(salt_mm_failover_minion_1.id),
+            f"salt/minion/{salt_mm_failover_minion_1.id}/start",
         ),
         (
             salt_mm_failover_master_2.id,
-            "salt/minion/{}/start".format(salt_mm_failover_minion_2.id),
+            f"salt/minion/{salt_mm_failover_minion_2.id}/start",
         ),
     ]
     events = event_listener.wait_for_events(
@@ -207,7 +209,7 @@ def test_minions_alive_with_no_master(
     assert len(events.matches) >= 2
 
     expected_tags = {
-        "salt/minion/{}/start".format(salt_mm_failover_minion_1.id),
-        "salt/minion/{}/start".format(salt_mm_failover_minion_2.id),
+        f"salt/minion/{salt_mm_failover_minion_1.id}/start",
+        f"salt/minion/{salt_mm_failover_minion_2.id}/start",
     }
     assert {event.tag for event in events} == expected_tags

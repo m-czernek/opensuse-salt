@@ -4,14 +4,13 @@ Loader mechanism for caching data, with data expiration, etc.
 .. versionadded:: 2016.11.0
 """
 
-
 import logging
 import time
+from collections import OrderedDict
 
 import salt.config
 import salt.loader
 import salt.syspaths
-from salt.utils.odict import OrderedDict
 
 log = logging.getLogger(__name__)
 
@@ -70,7 +69,7 @@ class Cache:
 
     def __lazy_init(self):
         self._modules = salt.loader.cache(self.opts)
-        fun = "{}.init_kwargs".format(self.driver)
+        fun = f"{self.driver}.init_kwargs"
         if fun in self.modules:
             self._kwargs = self.modules[fun](self._kwargs)
         else:
@@ -81,6 +80,12 @@ class Cache:
         if self._modules is None:
             self.__lazy_init()
         return self._modules
+
+    def destroy(self):
+        if hasattr(self, "_modules") and self._modules is not None:
+            if hasattr(self._modules, "destroy"):
+                self._modules.destroy()
+            self._modules = None
 
     def cache(self, bank, key, fun, loop_fun=None, **kwargs):
         """
@@ -141,7 +146,7 @@ class Cache:
             Raises an exception if cache driver detected an error accessing data
             in the cache backend (auth, permissions, etc).
         """
-        fun = "{}.store".format(self.driver)
+        fun = f"{self.driver}.store"
         return self.modules[fun](bank, key, data, **self._kwargs)
 
     def fetch(self, bank, key):
@@ -165,7 +170,7 @@ class Cache:
             Raises an exception if cache driver detected an error accessing data
             in the cache backend (auth, permissions, etc).
         """
-        fun = "{}.fetch".format(self.driver)
+        fun = f"{self.driver}.fetch"
         return self.modules[fun](bank, key, **self._kwargs)
 
     def updated(self, bank, key):
@@ -189,7 +194,7 @@ class Cache:
             Raises an exception if cache driver detected an error accessing data
             in the cache backend (auth, permissions, etc).
         """
-        fun = "{}.updated".format(self.driver)
+        fun = f"{self.driver}.updated"
         return self.modules[fun](bank, key, **self._kwargs)
 
     def flush(self, bank, key=None):
@@ -210,7 +215,7 @@ class Cache:
             Raises an exception if cache driver detected an error accessing data
             in the cache backend (auth, permissions, etc).
         """
-        fun = "{}.flush".format(self.driver)
+        fun = f"{self.driver}.flush"
         return self.modules[fun](bank, key=key, **self._kwargs)
 
     def list(self, bank):
@@ -229,7 +234,7 @@ class Cache:
             Raises an exception if cache driver detected an error accessing data
             in the cache backend (auth, permissions, etc).
         """
-        fun = "{}.list".format(self.driver)
+        fun = f"{self.driver}.list"
         return self.modules[fun](bank, **self._kwargs)
 
     def contains(self, bank, key=None):
@@ -254,7 +259,7 @@ class Cache:
             Raises an exception if cache driver detected an error accessing data
             in the cache backend (auth, permissions, etc).
         """
-        fun = "{}.contains".format(self.driver)
+        fun = f"{self.driver}.contains"
         return self.modules[fun](bank, key, **self._kwargs)
 
 
@@ -289,7 +294,7 @@ class MemCache(Cache):
                     break
 
     def _get_storage_id(self):
-        fun = "{}.storage_id".format(self.driver)
+        fun = f"{self.driver}.storage_id"
         if fun in self.modules:
             return self.modules[fun](self.kwargs)
         else:

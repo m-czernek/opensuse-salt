@@ -1,15 +1,10 @@
-import os
-
 import pytest
 
 import salt.utils.versions
 
-INSIDE_CONTAINER = os.getenv("HOSTNAME", "") == "salt-test-container"
-
 pytestmark = [
     pytest.mark.slow_test,
     pytest.mark.skip_if_binaries_missing("dockerd"),
-    pytest.mark.skipif(INSIDE_CONTAINER, reason="No hwclock in a container"),
 ]
 
 # The swarm module need the docker-py library installed
@@ -20,11 +15,7 @@ pytest.importorskip("docker")
 def docker_version(shell, grains):
     ret = shell.run("docker", "--version")
     assert ret.returncode == 0
-    # Example output:
-    # Docker version 24.0.7-ce, build 311b9ff0aa93
-    return salt.utils.versions.Version(
-        ret.stdout.split(",")[0].split()[-1].split("-")[0].strip()
-    )
+    return salt.utils.versions.Version(ret.stdout.split(",")[0].split()[-1].strip())
 
 
 @pytest.fixture

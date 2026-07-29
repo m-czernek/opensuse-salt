@@ -47,7 +47,6 @@ Connection module for Amazon EFS
 :depends: boto3
 """
 
-
 import logging
 
 import salt.utils.versions
@@ -117,7 +116,7 @@ def create_file_system(
     profile=None,
     region=None,
     creation_token=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Creates a new, empty file system.
@@ -172,7 +171,7 @@ def create_mount_target(
     key=None,
     profile=None,
     region=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Creates a mount target for a file system.
@@ -352,7 +351,7 @@ def get_file_systems(
     profile=None,
     region=None,
     creation_token=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Get all EFS properties or a specific instance property
@@ -410,7 +409,7 @@ def get_mount_targets(
     key=None,
     profile=None,
     region=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Get all the EFS mount point properties for a specific filesystemid or
@@ -489,7 +488,7 @@ def set_security_groups(
     key=None,
     profile=None,
     region=None,
-    **kwargs
+    **kwargs,
 ):
     """
     Modifies the set of security groups in effect for a mount target

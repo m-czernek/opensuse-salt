@@ -1,0 +1,33 @@
+# IMPORTANT: The versions here must be compatible with the environment where
+# uv-pre-commit hooks run. We do not pin setuptools in .pre-commit-config.yaml
+# to allow uv to resolve a version that satisfies these constraints.
+wheel >= 0.47.0
+# Floor at the CVE fix: 78.1.1 patches GHSA-5rjg-fvgr-3xxf
+# (PYSEC-2025-49) -- path traversal in setuptools.PackageIndex.download.
+# A higher floor (e.g. 80.x) makes the 3.13 onedir build fail with
+# ResolutionImpossible: relenv ships pip 25.2 in the 3.13 onedir, and
+# pip 25.2 bootstraps PEP 517 build envs with ``setuptools == 78.1.1``.
+# Host-side pre-commit hooks (uv-resolved) still pick the latest
+# setuptools; this floor only relaxes what the onedir-bundled pip is
+# allowed to use.
+setuptools >= 78.1.1
+pip == 26.0.1
+markdown-it-py < 3.0.0; python_version == "3.9"
+# myst-docutils 4.x (the latest supporting Python 3.10) requires
+# markdown-it-py ~=3.0; the 5.x line that pairs with markdown-it-py 4.x
+# only supports Python >=3.11.
+markdown-it-py < 4.0.0; python_version == "3.10"
+# Onedir shipped on 3006.x is Python 3.11; cap a few transitive deps that
+# changed behaviour between the prior 3.10 lockfile and the latest 3.11
+# resolution. Keeping these aligned with the prior 3.10 floors avoids
+# test surface regressions from the python bump:
+#   - jsonschema 4.x rewrote validator error messages that
+#     tests/unit/utils/test_schema.py asserts on verbatim.
+#   - bcrypt 5.x rejects secrets > 72 bytes that passlib's CryptContext
+#     backend probe emits, breaking salt.utils.pycrypto tests.
+#   - junos-eznc 2.7.x dropped its yamlordereddictloader dep, leaving
+#     salt.modules.junos's optional import block setting HAS_JUNOS=False
+#     and breaking ~30 patched-attribute test_junos.py cases.
+jsonschema < 4; python_version == "3.11"
+bcrypt < 5; python_version == "3.11"
+junos-eznc < 2.7; python_version == "3.11"

@@ -1,19 +1,14 @@
-import os
 import pytest
 
 import salt.loader.context
 import salt.modules.state as statemod
 import salt.modules.transactional_update as tu
 from salt.exceptions import CommandExecutionError
-from tests.support.mock import MagicMock, patch
+from tests.support.mock import MagicMock, mock_open, patch
 
 pytestmark = [
     pytest.mark.skip_on_windows(reason="Not supported on Windows"),
 ]
-
-SALT_CALL_BINARY = "salt-call"
-if os.environ.get('VIRTUAL_ENV'):
-    SALT_CALL_BINARY = f"{os.environ.get('VIRTUAL_ENV')}/bin/salt-call"
 
 
 @pytest.fixture
@@ -28,7 +23,12 @@ def configure_loader_modules():
             ),
             "__opts__": {"extension_modules": "", "cachedir": "/tmp/"},
         },
-        statemod: {"__salt__": {}, "__context__": {}},
+        statemod: {
+            "__salt__": {},
+            "__context__": {},
+            "__opts__": {"cachedir": "/tmp/"},
+            "__utils__": {"atomicfile.atomic_rename": MagicMock()},
+        },
     }
 
 
@@ -183,9 +183,11 @@ def test_commands_with_global_params():
                     "--non-interactive",
                     "--drop-if-no-change",
                     "--no-selfupdate",
-                    cmd.replace("_", ".")
-                    if cmd.startswith("grub")
-                    else cmd.replace("_", "-"),
+                    (
+                        cmd.replace("_", ".")
+                        if cmd.startswith("grub")
+                        else cmd.replace("_", "-")
+                    ),
                 ]
             )
 
@@ -384,7 +386,7 @@ def test_call_fails_function():
                 "--continue",
                 "--quiet",
                 "run",
-                SALT_CALL_BINARY,
+                "salt-call",
                 "--out",
                 "json",
                 "-l",
@@ -416,7 +418,7 @@ def test_call_success_no_reboot():
                 "--continue",
                 "--quiet",
                 "run",
-                SALT_CALL_BINARY,
+                "salt-call",
                 "--out",
                 "json",
                 "-l",
@@ -459,7 +461,7 @@ def test_call_success_reboot():
                 "--continue",
                 "--quiet",
                 "run",
-                SALT_CALL_BINARY,
+                "salt-call",
                 "--out",
                 "json",
                 "-l",
@@ -493,7 +495,7 @@ def test_call_success_parameters():
                 "--continue",
                 "--quiet",
                 "run",
-                SALT_CALL_BINARY,
+                "salt-call",
                 "--out",
                 "json",
                 "-l",
@@ -535,8 +537,23 @@ def test_sls_queue_true():
     }
     with patch.dict(statemod.__salt__, salt_mock), patch(
         "salt.modules.transactional_update.call", MagicMock(return_value="result")
+    ), patch("salt.utils.state.acquire_queue_lock"), patch(
+        "salt.utils.atomicfile.atomic_rename"
+    ), patch(
+        "salt.utils.files.fopen", mock_open()
+    ), patch(
+        "salt.payload.dump"
+    ), patch(
+        "salt.utils.jid.gen_jid", return_value="test_jid"
     ):
-        assert tu.sls("module", queue=True) == "result"
+        expected = {
+            "result": True,
+            "comment": "Job queued for execution",
+            "queued": True,
+            "changes": {},
+            "__no_return__": True,
+        }
+        assert tu.sls("module", queue=True) == expected
 
 
 def test_sls_queue_false_failing():
@@ -592,8 +609,23 @@ def test_highstate_queue_true():
     }
     with patch.dict(statemod.__salt__, salt_mock), patch(
         "salt.modules.transactional_update.call", MagicMock(return_value="result")
+    ), patch("salt.utils.state.acquire_queue_lock"), patch(
+        "salt.utils.atomicfile.atomic_rename"
+    ), patch(
+        "salt.utils.files.fopen", mock_open()
+    ), patch(
+        "salt.payload.dump"
+    ), patch(
+        "salt.utils.jid.gen_jid", return_value="test_jid"
     ):
-        assert tu.highstate(queue=True) == "result"
+        expected = {
+            "result": True,
+            "comment": "Job queued for execution",
+            "queued": True,
+            "changes": {},
+            "__no_return__": True,
+        }
+        assert tu.highstate(queue=True) == expected
 
 
 def test_highstate_queue_false_failing():
@@ -673,49 +705,20 @@ def test_single_queue_true():
     }
     with patch.dict(statemod.__salt__, salt_mock), patch(
         "salt.modules.transactional_update.call", MagicMock(return_value="result")
+    ), patch("salt.utils.state.acquire_queue_lock"), patch(
+        "salt.utils.atomicfile.atomic_rename"
+    ), patch(
+        "salt.utils.files.fopen", mock_open()
+    ), patch(
+        "salt.payload.dump"
+    ), patch(
+        "salt.utils.jid.gen_jid", return_value="test_jid"
     ):
-        assert tu.single("pkg.installed", name="emacs", queue=True) == "result"
-
-
-@pytest.mark.parametrize(
-    "executable,salt_call_cmd",
-    [
-        ("/usr/bin/python3", "salt-call"),
-        (
-            "/usr/lib/venv-salt-minion/bin/python",
-            "/usr/lib/venv-salt-minion/bin/salt-call",
-        ),
-    ],
-)
-def test_call_which_salt_call_selected_with_executable(executable, salt_call_cmd):
-    """Test transactional_update.chroot which salt-call used"""
-    utils_mock = {
-        "json.find_json": MagicMock(return_value={"return": "result"}),
-    }
-    salt_mock = {
-        "cmd.run_all": MagicMock(return_value={"retcode": 0, "stdout": ""}),
-    }
-    with patch("sys.executable", executable), patch.dict(
-        tu.__utils__, utils_mock
-    ), patch.dict(tu.__salt__, salt_mock):
-        assert tu.call("test.ping") == "result"
-
-        salt_mock["cmd.run_all"].assert_called_with(
-            [
-                "transactional-update",
-                "--non-interactive",
-                "--drop-if-no-change",
-                "--no-selfupdate",
-                "--continue",
-                "--quiet",
-                "run",
-                salt_call_cmd,
-                "--out",
-                "json",
-                "-l",
-                "quiet",
-                "--no-return-event",
-                "--",
-                "test.ping",
-            ]
-        )
+        expected = {
+            "result": True,
+            "comment": "Job queued for execution",
+            "queued": True,
+            "changes": {},
+            "__no_return__": True,
+        }
+        assert tu.single("pkg.installed", name="emacs", queue=True) == expected

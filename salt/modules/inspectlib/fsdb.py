@@ -16,18 +16,13 @@
 """
     :codeauthor: Bo Maryniuk <bo@suse.de>
 """
-
-
 import csv
+import datetime
 import gzip
 import os
 import re
 import shutil
-import sys
-
-from salt.utils.odict import OrderedDict
-
-import salt.utils.timeutil
+from collections import OrderedDict
 
 
 class CsvDBEntity:
@@ -73,7 +68,7 @@ class CsvDB:
 
         :return:
         """
-        return salt.utils.timeutil.utcnow().strftime("%Y%m%d-%H%M%S")
+        return datetime.datetime.utcnow().strftime("%Y%m%d-%H%M%S")
 
     def new(self):
         """
@@ -183,12 +178,15 @@ class CsvDB:
         :param obj:
         :return:
         """
-        get_type = lambda item: str(type(item)).split("'")[1]
+
+        def get_type(item):
+            return str(type(item)).split("'")[1]
+
         if not os.path.exists(os.path.join(self.db_path, obj._TABLE)):
             with gzip.open(os.path.join(self.db_path, obj._TABLE), "wt") as table_file:
                 csv.writer(table_file).writerow(
                     [
-                        "{col}:{type}".format(col=elm[0], type=get_type(elm[1]))
+                        f"{elm[0]}:{get_type(elm[1])}"
                         for elm in tuple(obj.__dict__.items())
                     ]
                 )
@@ -271,7 +269,7 @@ class CsvDB:
     def _validate_object(self, obj):
         descr = self._tables.get(obj._TABLE)
         if descr is None:
-            raise Exception("Table {} not found.".format(obj._TABLE))
+            raise Exception(f"Table {obj._TABLE} not found.")
         return obj._serialize(self._tables[obj._TABLE])
 
     def __criteria(self, obj, matches=None, mt=None, lt=None, eq=None):
@@ -334,14 +332,10 @@ class CsvDB:
         return objects
 
     def _to_type(self, data, type):
-        if type == "int":
+        if type in ("int", "long"):
             data = int(data)
         elif type == "float":
             data = float(data)
-        elif type == "long":
-            # pylint: disable=undefined-variable,incompatible-py3-code
-            data = sys.version_info[0] == 2 and long(data) or int(data)
-            # pylint: enable=undefined-variable,incompatible-py3-code
         else:
             data = str(data)
         return data

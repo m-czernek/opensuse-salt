@@ -8,13 +8,14 @@ Tests for salt.modules.zfs
 :platform:      illumos,freebsd,linux
 """
 
+from collections import OrderedDict
+
 import pytest
 
 import salt.loader
 import salt.modules.zfs as zfs
 import salt.utils.zfs
 from salt.utils.dateutils import strftime
-from salt.utils.odict import OrderedDict
 from tests.support.mock import MagicMock, patch
 from tests.support.zfs import ZFSMockData
 
@@ -215,9 +216,9 @@ def test_create_error_missing_parent(utils_patch):
     )
     ret = {}
     ret["stdout"] = ""
-    ret[
-        "stderr"
-    ] = "cannot create 'myzpool/mydataset/mysubdataset': parent does not exist"
+    ret["stderr"] = (
+        "cannot create 'myzpool/mydataset/mysubdataset': parent does not exist"
+    )
     ret["retcode"] = 1
     mock_cmd = MagicMock(return_value=ret)
     with patch.dict(zfs.__salt__, {"cmd.run_all": mock_cmd}), patch.dict(

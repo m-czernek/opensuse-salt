@@ -94,7 +94,7 @@ def _publish(
             matching_master_uris = [
                 master
                 for master in __opts__["master_uri_list"]
-                if "//{}:".format(via_master) in master
+                if f"//{via_master}:" in master
             ]
 
             if not matching_master_uris:
@@ -141,7 +141,7 @@ def _publish(
         try:
             peer_data = channel.send(load)
         except SaltReqTimeoutError:
-            return "'{}' publish timed out".format(fun)
+            return f"'{fun}' publish timed out"
         if not peer_data:
             return {}
         # CLI args are passed as strings, re-cast to keep time.sleep happy
@@ -193,8 +193,6 @@ def _publish(
                 return cret
             else:
                 return ret
-
-    return {}
 
 
 def publish(
@@ -342,4 +340,4 @@ def runner(fun, arg=None, timeout=5):
         try:
             return channel.send(load)
         except SaltReqTimeoutError:
-            return "'{}' runner publish timed out".format(fun)
+            return f"'{fun}' runner publish timed out"

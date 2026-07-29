@@ -123,11 +123,11 @@ def verify_socket(interface, pub_port, ret_port):
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             sock.bind((interface, int(port)))
         except Exception as exc:  # pylint: disable=broad-except
-            msg = "Unable to bind socket {}:{}".format(interface, port)
+            msg = f"Unable to bind socket {interface}:{port}"
             if exc.args:
-                msg = "{}, error: {}".format(msg, str(exc))
+                msg = f"{msg}, error: {str(exc)}"
             else:
-                msg = "{}, this might not be a problem.".format(msg)
+                msg = f"{msg}, this might not be a problem."
             msg += "; Is there another salt-master running?"
             log.warning(msg)
             return False
@@ -208,7 +208,7 @@ def verify_files(files, user):
 
         except OSError as err:
             if os.path.isfile(dirname):
-                msg = "Failed to create path {}, is {} a file?".format(fn_, dirname)
+                msg = f"Failed to create path {fn_}, is {dirname} a file?"
                 raise SaltSystemExit(msg=msg)
             if err.errno != errno.EACCES:
                 raise
@@ -218,7 +218,7 @@ def verify_files(files, user):
             raise SaltSystemExit(msg=msg)
 
         except OSError as err:  # pylint: disable=duplicate-except
-            msg = 'Failed to create path "{}" - {}'.format(fn_, err)
+            msg = f'Failed to create path "{fn_}" - {err}'
             raise SaltSystemExit(msg=msg)
 
         stats = os.stat(fn_)
@@ -277,7 +277,7 @@ def verify_env(
                     os.chown(dir_, uid, gid)
             for subdir in [a for a in os.listdir(dir_) if "jobs" not in a]:
                 fsubdir = os.path.join(dir_, subdir)
-                if "{}jobs".format(os.path.sep) in fsubdir:
+                if f"{os.path.sep}jobs" in fsubdir:
                     continue
                 for root, dirs, files in salt.utils.path.os_walk(fsubdir):
                     for name in itertools.chain(files, dirs):
@@ -333,7 +333,7 @@ def check_user(user):
 
     try:
         if hasattr(os, "initgroups"):
-            os.initgroups(user, pwuser.pw_gid)  # pylint: disable=minimum-python-version
+            os.initgroups(user, pwuser.pw_gid)
         else:
             os.setgroups(salt.utils.user.get_gid_list(user, include_default=False))
         os.setgid(pwuser.pw_gid)
@@ -391,7 +391,7 @@ def check_path_traversal(path, user="root", skip_perm_errors=False):
     """
     for tpath in list_path_traversal(path):
         if not os.access(tpath, os.R_OK):
-            msg = "Could not access {}.".format(tpath)
+            msg = f"Could not access {tpath}."
             if not os.path.exists(tpath):
                 msg += " Path does not exist."
             else:
@@ -399,9 +399,9 @@ def check_path_traversal(path, user="root", skip_perm_errors=False):
                 # Make the error message more intelligent based on how
                 # the user invokes salt-call or whatever other script.
                 if user != current_user:
-                    msg += " Try running as user {}.".format(user)
+                    msg += f" Try running as user {user}."
                 else:
-                    msg += " Please give {} read permissions.".format(user)
+                    msg += f" Please give {user} read permissions."
 
             # We don't need to bail on config file permission errors
             # if the CLI
@@ -424,7 +424,10 @@ def check_max_open_files(opts):
         # and the python binding http://timgolden.me.uk/pywin32-docs/win32file.html
         mof_s = mof_h = win32file._getmaxstdio()
     else:
-        mof_s, mof_h = resource.getrlimit(resource.RLIMIT_NOFILE)
+
+        mof_s, mof_h = resource.getrlimit(  # pylint: disable=used-before-assignment
+            resource.RLIMIT_NOFILE
+        )
 
     accepted_keys_dir = os.path.join(opts.get("pki_dir"), "minions")
     accepted_count = len(os.listdir(accepted_keys_dir))
@@ -520,7 +523,8 @@ def clean_path(root, path, subdir=False, realpath=True):
     """
     Accepts the root the path needs to be under and verifies that the path is
     under said root. Pass in subdir=True if the path can result in a
-    subdirectory of the root instead of having to reside directly in the root
+    subdirectory of the root instead of having to reside directly in the root.
+    Pass realpath=False if filesystem links should not be resolved.
     """
     if not os.path.isabs(root):
         root = os.path.join(os.getcwd(), root)
@@ -579,6 +583,17 @@ def safe_py_code(code):
     return True
 
 
+def insecure_log():
+    """
+    Return the insecure logs types
+    """
+    insecure = []
+    for level, value in LOG_LEVELS.items():
+        if value < LOG_LEVELS.get("info", 20):
+            insecure.append(level)
+    return insecure
+
+
 def verify_log(opts):
     """
     If an insecre logging configuration is found, show a warning
@@ -610,7 +625,7 @@ def win_verify_env(path, dirs, permissive=False, pki_dir="", skip_extra=False):
     allow_path = "\\".join([system_root, "TEMP"])
     if not salt.utils.path.safe_path(path=path, allow_path=allow_path):
         raise CommandExecutionError(
-            "`file_roots` set to a possibly unsafe location: {}".format(path)
+            f"`file_roots` set to a possibly unsafe location: {path}"
         )
 
     # Create the root path directory if missing

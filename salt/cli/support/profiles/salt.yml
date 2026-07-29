@@ -1,9 +1,0 @@
-sysinfo:
-  - grains.items:
-      info: System grains
-
-logfile:
-  - filetree:
-      info: Add current logfile
-      args:
-        - {{salt('config.get', 'log_file')}}

@@ -571,7 +571,6 @@ def test_issue_38683_require_order_failhard_combination(state, state_tree):
         assert ret[state_id].comment == "Failure!"
 
 
-@pytest.mark.slow_test
 @pytest.mark.skip_on_windows
 def test_parallel_state_with_requires(state, state_tree):
     """
@@ -610,7 +609,7 @@ def test_parallel_state_with_requires(state, state_tree):
         assert (end_time - start_time) < 30
 
         for item in range(1, 10):
-            _id = "cmd_|-blah-{}_|-sleep 2_|-run".format(item)
+            _id = f"cmd_|-blah-{item}_|-sleep 2_|-run"
             assert "__parallel__" in ret[_id]
 
 
@@ -695,3 +694,42 @@ def test_issue_61121_extend_is_to_strict(state, state_tree):
         ret = state.sls("requisite")
         result = normalize_ret(ret.raw)
         assert result == expected_result
+
+
+def test_issue_30971_sls_empty_output_requisite_not_found(state, state_tree):
+    """
+    Requiring an SLS file that produces no output (empty) should not result
+    in a "requisites were not found" error.
+
+    Issue #30971: When an SLS file has conditional logic that results in no
+    states being generated (e.g., empty pillar data), a state that requires
+    that SLS file should still succeed since the SLS was processed.
+    """
+    empty_sls_contents = """
+    {% if False %}
+    test_state:
+      test.succeed_without_changes:
+        - name: test
+    {% endif %}
+    """
+
+    requiring_sls_contents = """
+    include:
+      - empty_sls
+
+    test_requiring_state:
+      test.succeed_without_changes:
+        - name: test_requiring
+        - require:
+          - sls: empty_sls
+    """
+
+    with pytest.helpers.temp_file(
+        "empty_sls.sls", empty_sls_contents, state_tree
+    ), pytest.helpers.temp_file("requiring.sls", requiring_sls_contents, state_tree):
+        ret = state.sls("requiring")
+        for state_return in ret:
+            assert (
+                state_return.result is True
+            ), f"State {state_return.name} failed: {state_return.comment}"
+            assert "The following requisites were not found" not in state_return.comment

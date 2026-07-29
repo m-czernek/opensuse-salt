@@ -1,49 +1,25 @@
 """
 Validate the virt module
 """
+
 import logging
-import os
 from numbers import Number
 from xml.etree import ElementTree
 
 import pytest
 
-import salt.version
-from salt.utils.versions import Version
+from tests.conftest import FIPS_TESTRUN
 from tests.support.virt import SaltVirtMinionContainerFactory
 
 docker = pytest.importorskip("docker")
 
 log = logging.getLogger(__name__)
 
-INSIDE_CONTAINER = os.getenv("HOSTNAME", "") == "salt-test-container"
-
 pytestmark = [
     pytest.mark.slow_test,
+    pytest.mark.timeout_unless_on_windows(120),
     pytest.mark.skip_if_binaries_missing("docker"),
-    pytest.mark.skipif(INSIDE_CONTAINER, reason="Cannot run in a container"),
-    pytest.mark.skipif(
-        Version(docker.__version__) < Version("4.0.0"),
-        reason="Test does not work in this version of docker-py",
-    ),
-    pytest.mark.skipif(
-        salt.version.__saltstack_version__.major <= 3006,
-        reason="CI containers are not compatible with this Salt version",
-    ),
 ]
-
-
-def _install_salt_dependencies(container):
-    dependencies = []
-    for package, version in salt.version.dependency_information():
-        if package not in ("packaging", "looseversion"):
-            # These are newer base dependencies which the container might not
-            # yet have
-            continue
-        dependencies.append(f"{package}=={version}")
-    if dependencies:
-        ret = container.run("python3", "-m", "pip", "install", *dependencies)
-        log.debug("Install missing dependecies ret: %s", ret)
 
 
 @pytest.fixture(scope="module")
@@ -67,7 +43,12 @@ def virt_minion_0(
         "open_mode": True,
         "transport": salt_master.config["transport"],
     }
-    config_overrides = {"user": "root"}
+    config_overrides = {
+        "user": "root",
+        "fips_mode": FIPS_TESTRUN,
+        "encryption_algorithm": "OAEP-SHA224" if FIPS_TESTRUN else "OAEP-SHA1",
+        "signing_algorithm": "PKCS1v15-SHA224" if FIPS_TESTRUN else "PKCS1v15-SHA1",
+    }
     factory = salt_master.salt_minion_daemon(
         virt_minion_0_id,
         name=virt_minion_0_id,
@@ -79,13 +60,13 @@ def virt_minion_0(
             "extra_hosts": {
                 virt_minion_0_id: "127.0.0.1",
                 virt_minion_1_id: "127.0.0.1",
-            }
+            },
+            "cgroupns": "host",
         },
         pull_before_start=True,
         skip_on_pull_failure=True,
         skip_if_docker_client_not_connectable=True,
     )
-    factory.before_start(_install_salt_dependencies, factory)
     factory.after_terminate(
         pytest.helpers.remove_stale_minion_key, salt_master, factory.id
     )
@@ -104,7 +85,12 @@ def virt_minion_1(
         "open_mode": True,
         "transport": salt_master.config["transport"],
     }
-    config_overrides = {"user": "root"}
+    config_overrides = {
+        "user": "root",
+        "fips_mode": FIPS_TESTRUN,
+        "encryption_algorithm": "OAEP-SHA224" if FIPS_TESTRUN else "OAEP-SHA1",
+        "signing_algorithm": "PKCS1v15-SHA224" if FIPS_TESTRUN else "PKCS1v15-SHA1",
+    }
     factory = salt_master.salt_minion_daemon(
         virt_minion_1_id,
         name=virt_minion_1_id,
@@ -116,13 +102,13 @@ def virt_minion_1(
             "extra_hosts": {
                 virt_minion_0_id: "127.0.0.1",
                 virt_minion_1_id: "127.0.0.1",
-            }
+            },
+            "cgroupns": "host",
         },
         pull_before_start=True,
         skip_on_pull_failure=True,
         skip_if_docker_client_not_connectable=True,
     )
-    factory.before_start(_install_salt_dependencies, factory)
     factory.after_terminate(
         pytest.helpers.remove_stale_minion_key, salt_master, factory.id
     )
@@ -263,10 +249,15 @@ class TestVirtTest:
         assert len(caps["guests"]) >= 1
         assert caps["guests"][0]["os_type"] in ["hvm", "xen", "xenpvh", "exe"]
 
-    def test_cpu_baseline(self, salt_cli, virt_minion_0):
+    def test_cpu_baseline(self, salt_cli, virt_minion_0, grains):
         """
         Test virt.cpu_baseline
         """
+        if grains.get("osarch", "") != "x86_64":
+            raise pytest.skip.Exception(
+                f"Test is only meant to run on 'x86_64' architecture, not '{grains['osarch']}'",
+                _use_item_location=True,
+            )
         vendors = ["Intel", "ARM", "AMD"]
         ret = salt_cli.run(
             "virt.cpu_baseline", out="libvirt", minion_tgt=virt_minion_0.id
@@ -351,7 +342,12 @@ def virt_domain():
 
 
 @pytest.fixture
-def prep_virt(salt_cli, virt_minion_0, virt_minion_1, virt_domain):
+def prep_virt(salt_cli, virt_minion_0, virt_minion_1, virt_domain, grains):
+    if grains.get("osarch", "") != "x86_64":
+        raise pytest.skip.Exception(
+            f"Test is only meant to run on 'x86_64' architecture, not '{grains['osarch']}'",
+            _use_item_location=True,
+        )
     try:
         ret = salt_cli.run("virt.list_domains", minion_tgt=virt_minion_0.id)
         assert ret.returncode == 0, ret
@@ -367,7 +363,7 @@ def prep_virt(salt_cli, virt_minion_0, virt_minion_1, virt_domain):
             salt_cli.run("virt.undefine", virt_domain, minion_tgt=virt_minion_1.id)
         ret = salt_cli.run(
             "virt.define_xml_path",
-            "/{}.xml".format(virt_domain),
+            f"/{virt_domain}.xml",
             minion_tgt=virt_minion_0.id,
         )
         assert ret.returncode == 0, ret
@@ -393,16 +389,21 @@ def prep_virt(salt_cli, virt_minion_0, virt_minion_1, virt_domain):
 @pytest.mark.slow_test
 @pytest.mark.skip_if_binaries_missing("docker")
 class TestVirtMigrateTest:
-    def test_define_xml_path(self, salt_cli, virt_minion_0, virt_domain):
+    def test_define_xml_path(self, salt_cli, virt_minion_0, virt_domain, grains):
         """
         Define a new domain with virt.define_xml_path,
         verify that the new domain is shown with virt.list_domains,
         remove the domain with virt.undefine, and verifies that
         domain is no longer shown with virt.list_domains.
         """
+        if grains.get("osarch", "") != "x86_64":
+            raise pytest.skip.Exception(
+                f"Test is only meant to run on 'x86_64' architecture, not '{grains['osarch']}'",
+                _use_item_location=True,
+            )
         ret = salt_cli.run(
             "virt.define_xml_path",
-            "/{}.xml".format(virt_domain),
+            f"/{virt_domain}.xml",
             minion_tgt=virt_minion_0.id,
         )
         assert ret.returncode == 0, ret
@@ -458,7 +459,7 @@ class TestVirtMigrateTest:
         ret = salt_cli.run(
             "virt.migrate",
             virt_domain,
-            "qemu+ssh://{}/system".format(virt_minion_1.uri),
+            f"qemu+ssh://{virt_minion_1.uri}/system",
             minion_tgt=virt_minion_0.id,
         )
         assert ret.returncode == 0, ret

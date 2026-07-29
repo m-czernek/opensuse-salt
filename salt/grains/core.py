@@ -11,6 +11,7 @@ as those returned here
 
 import datetime
 import hashlib
+import locale
 import logging
 import os
 import platform
@@ -20,7 +21,6 @@ import subprocess
 import sys
 import time
 import uuid
-import zlib
 from errno import EACCES, EPERM
 
 import salt.exceptions
@@ -33,14 +33,13 @@ import salt.modules.smbios
 import salt.utils.args
 import salt.utils.dns
 import salt.utils.files
-import salt.utils.locales
 import salt.utils.network
 import salt.utils.path
 import salt.utils.pkg.rpm
 import salt.utils.platform
-import salt.utils.timeutil
 import salt.utils.stringutils
 from salt.utils.network import _clear_interfaces, _get_interfaces
+from salt.utils.platform import get_machine_identifier as _get_machine_identifier
 from salt.utils.platform import linux_distribution as _linux_distribution
 
 try:
@@ -287,7 +286,12 @@ def _linux_gpu_data():
         "matrox",
         "aspeed",
     ]
-    gpu_classes = ("vga compatible controller", "3d controller", "display controller")
+    gpu_classes = (
+        "3d controller",
+        "display controller",
+        "processing accelerators",
+        "vga compatible controller",
+    )
 
     devs = []
     try:
@@ -479,7 +483,7 @@ def _bsd_cpudata(osdata):
     return grains
 
 
-def _sunos_cpudata():
+def _sunos_cpudata():  # pragma: no cover
     """
     Return the CPU information for Solaris-like systems
     """
@@ -511,7 +515,7 @@ def _sunos_cpudata():
     return grains
 
 
-def _aix_cpudata():
+def _aix_cpudata():  # pragma: no cover
     """
     Return CPU information for AIX systems
     """
@@ -614,7 +618,7 @@ def _bsd_memdata(osdata):
     return grains
 
 
-def _sunos_memdata():
+def _sunos_memdata():  # pragma: no cover
     """
     Return the memory information for SunOS-like systems
     """
@@ -638,7 +642,7 @@ def _sunos_memdata():
     return grains
 
 
-def _aix_memdata():
+def _aix_memdata():  # pragma: no cover
     """
     Return the memory information for AIX systems
     """
@@ -692,16 +696,16 @@ def _memdata(osdata):
         grains.update(_bsd_memdata(osdata))
     elif osdata["kernel"] == "Darwin":
         grains.update(_osx_memdata())
-    elif osdata["kernel"] == "SunOS":
-        grains.update(_sunos_memdata())
-    elif osdata["kernel"] == "AIX":
-        grains.update(_aix_memdata())
+    elif osdata["kernel"] == "SunOS":  # pragma: no cover
+        grains.update(_sunos_memdata())  # pragma: no cover
+    elif osdata["kernel"] == "AIX":  # pragma: no cover
+        grains.update(_aix_memdata())  # pragma: no cover
     elif osdata["kernel"] == "Windows" and HAS_WMI:
         grains.update(_windows_memdata())
     return grains
 
 
-def _aix_get_machine_id():
+def _aix_get_machine_id():  # pragma: no cover
     """
     Parse the output of lsattr -El sys0 for os_uuid
     """
@@ -731,49 +735,62 @@ def _windows_virtual(osdata):
     if osdata["kernel"] != "Windows":
         return grains
 
-    grains["virtual"] = osdata.get("virtual", "physical")
+    # Set the default virtual environment to physical, meaning not a VM
+    grains["virtual"] = "physical"
 
-    # It is possible that the 'manufacturer' and/or 'productname' grains
-    # exist but have a value of None.
+    # It is possible that the 'manufacturer' and/or 'productname' grains exist
+    # but have a value of None
     manufacturer = osdata.get("manufacturer", "")
     if manufacturer is None:
         manufacturer = ""
-    productname = osdata.get("productname", "")
-    if productname is None:
-        productname = ""
+    product_name = osdata.get("productname", "")
+    if product_name is None:
+        product_name = ""
+    bios_string = osdata.get("biosstring", "")
+    if bios_string is None:
+        bios_string = ""
 
     if "QEMU" in manufacturer:
         # FIXME: Make this detect between kvm or qemu
         grains["virtual"] = "kvm"
-    if "Bochs" in manufacturer:
+    elif "VRTUAL" in bios_string:  # (not a typo)
+        grains["virtual"] = "HyperV"
+    elif "A M I" in bios_string:
+        grains["virtual"] = "VirtualPC"
+    elif "Xen" in bios_string:
+        grains["virtual"] = "Xen"
+        if "HVM domU" in product_name:
+            grains["virtual_subtype"] = "HVM domU"
+    elif "AMAZON" in bios_string:
+        grains["virtual"] = "EC2"
+    elif "Bochs" in manufacturer:
         grains["virtual"] = "kvm"
     # Product Name: (oVirt) www.ovirt.org
     # Red Hat Community virtualization Project based on kvm
-    elif "oVirt" in productname:
+    elif "oVirt" in product_name:
         grains["virtual"] = "kvm"
         grains["virtual_subtype"] = "oVirt"
     # Red Hat Enterprise Virtualization
-    elif "RHEV Hypervisor" in productname:
+    elif "RHEV Hypervisor" in product_name:
         grains["virtual"] = "kvm"
         grains["virtual_subtype"] = "rhev"
     # Product Name: VirtualBox
-    elif "VirtualBox" in productname:
+    elif "VirtualBox" in product_name:
         grains["virtual"] = "VirtualBox"
     # Product Name: VMware Virtual Platform
-    elif "VMware" in productname:
+    elif "VMware" in product_name:
         grains["virtual"] = "VMware"
     # Manufacturer: Microsoft Corporation
     # Product Name: Virtual Machine
-    elif "Microsoft" in manufacturer and "Virtual Machine" in productname:
+    elif "Microsoft" in manufacturer and "Virtual Machine" in product_name:
         grains["virtual"] = "VirtualPC"
+    elif "OpenStack" in product_name:
+        grains["virtual"] = "OpenStack"
     # Manufacturer: Parallels Software International Inc.
     elif "Parallels" in manufacturer:
         grains["virtual"] = "Parallels"
-    elif "Nutanix" in manufacturer and "AHV" in product_name:
-        grains["virtual"] = "kvm"
-        grains["virtual_subtype"] = "Nutanix AHV"
     # Apache CloudStack
-    elif "CloudStack KVM Hypervisor" in productname:
+    elif "CloudStack KVM Hypervisor" in product_name:
         grains["virtual"] = "kvm"
         grains["virtual_subtype"] = "cloudstack"
     return grains
@@ -916,6 +933,10 @@ def _virtual(osdata):
                 grains["virtual"] = "container"
                 grains["virtual_subtype"] = "Podman"
                 break
+            elif "docker" in output:
+                grains["virtual"] = "container"
+                grains["virtual_subtype"] = "Docker"
+                break
             elif "amazon" in output:
                 grains["virtual"] = "Nitro"
                 grains["virtual_subtype"] = "Amazon EC2"
@@ -929,15 +950,15 @@ def _virtual(osdata):
                     grains["virtual"] = "container"
                     grains["virtual_subtype"] = "LXC"
                     break
+                elif "docker" in line:
+                    grains["virtual"] = "container"
+                    grains["virtual_subtype"] = "Docker"
+                    break
                 elif "vmware" in line:
                     grains["virtual"] = "VMware"
                     break
                 elif "parallels" in line:
                     grains["virtual"] = "Parallels"
-                    break
-                elif "nutanix" in line:
-                    grains["virtual"] = "kvm"
-                    grains["virtual_subtype"] = "Nutanix AHV"
                     break
                 elif "hyperv" in line:
                     grains["virtual"] = "HyperV"
@@ -990,9 +1011,6 @@ def _virtual(osdata):
                 grains["virtual"] = "Parallels"
             elif "Manufacturer: Google" in output:
                 grains["virtual"] = "kvm"
-            elif "Manufacturer: Nutanix" in output and "Product Name: AHV" in output:
-                grains["virtual"] = "kvm"
-                grains["virtual_subtype"] = "Nutanix AHV"
             # Proxmox KVM
             elif "Vendor: SeaBIOS" in output:
                 grains["virtual"] = "kvm"
@@ -1249,7 +1267,6 @@ def _virtual(osdata):
         grains["virtual"] = "virtual"
 
     # Try to detect if the instance is running on Amazon EC2
-    # or Nutanix AHV
     if grains["virtual"] in ("qemu", "kvm", "xen", "amazon"):
         dmidecode = salt.utils.path.which("dmidecode")
         if dmidecode:
@@ -1269,15 +1286,13 @@ def _virtual(osdata):
             elif re.match(r".*Version: [^\r\n]+\.amazon.*", output, flags=re.DOTALL):
                 grains["virtual_subtype"] = "Amazon EC2"
 
-            elif "Manufacturer: Nutanix" in output and "Product Name: AHV" in output:
-                grains["virtual_subtype"] = "Nutanix AHV"
-
     for command in failed_commands:
         log.info(
             "Although '%s' was found in path, the current user "
             "cannot execute it. Grains output might not be "
             "accurate.",
             command,
+            once=True,
         )
     return grains
 
@@ -1517,88 +1532,143 @@ def _windows_platform_data():
     if not HAS_WMI:
         return {}
 
+    grains = {}
     with salt.utils.winapi.Com():
         wmi_c = wmi.WMI()
-        # http://msdn.microsoft.com/en-us/library/windows/desktop/aa394102%28v=vs.85%29.aspx
-        systeminfo = wmi_c.Win32_ComputerSystem()[0]
-        # https://msdn.microsoft.com/en-us/library/aa394239(v=vs.85).aspx
-        osinfo = wmi_c.Win32_OperatingSystem()[0]
-        # http://msdn.microsoft.com/en-us/library/windows/desktop/aa394077(v=vs.85).aspx
-        biosinfo = wmi_c.Win32_BIOS()[0]
-        # http://msdn.microsoft.com/en-us/library/windows/desktop/aa394498(v=vs.85).aspx
-        timeinfo = wmi_c.Win32_TimeZone()[0]
-        # https://docs.microsoft.com/en-us/windows/win32/cimwin32prov/win32-computersystemproduct
-        csproductinfo = wmi_c.Win32_ComputerSystemProduct()[0]
+        try:
+            # http://msdn.microsoft.com/en-us/library/windows/desktop/aa394102%28v=vs.85%29.aspx
+            systeminfo = wmi_c.Win32_ComputerSystem()[0]
+            grains.update(
+                {
+                    "manufacturer": _clean_value(
+                        "manufacturer", systeminfo.Manufacturer
+                    ),
+                    "productname": _clean_value("productname", systeminfo.Model),
+                }
+            )
+        except IndexError:
+            grains.update({"manufacturer": None, "productname": None})
+            log.warning("Computer System info not available on this system")
+
+        try:
+            # https://msdn.microsoft.com/en-us/library/aa394239(v=vs.85).aspx
+            osinfo = wmi_c.Win32_OperatingSystem()[0]
+            os_release = _windows_os_release_grain(
+                caption=osinfo.Caption, product_type=osinfo.ProductType
+            )
+            grains.update(
+                {
+                    "kernelrelease": _clean_value("kernelrelease", osinfo.Version),
+                    "osfullname": _clean_value("osfullname", osinfo.Caption),
+                    "osmanufacturer": _clean_value(
+                        "osmanufacturer", osinfo.Manufacturer
+                    ),
+                    "osrelease": _clean_value("osrelease", os_release),
+                    "osversion": _clean_value("osversion", osinfo.Version),
+                }
+            )
+        except IndexError:
+            grains.update(
+                {
+                    "kernelrelease": None,
+                    "osfullname": None,
+                    "osmanufacturer": None,
+                    "osrelease": None,
+                    "osversion": None,
+                }
+            )
+            log.warning("Operating System info not available on this system")
+
+        try:
+            # http://msdn.microsoft.com/en-us/library/windows/desktop/aa394077(v=vs.85).aspx
+            biosinfo = wmi_c.Win32_BIOS()[0]
+            grains.update(
+                {
+                    # bios name had a bunch of whitespace appended to it in my testing
+                    # 'PhoenixBIOS 4.0 Release 6.0     '
+                    "biosversion": _clean_value("biosversion", biosinfo.Name.strip()),
+                    "biosstring": _clean_value("string", biosinfo.Version),
+                    "serialnumber": _clean_value("serialnumber", biosinfo.SerialNumber),
+                }
+            )
+        except IndexError:
+            grains.update(
+                {"biosstring": None, "biosversion": None, "serialnumber": None}
+            )
+            log.warning("BIOS info not available on this system")
+
+        try:
+            # http://msdn.microsoft.com/en-us/library/windows/desktop/aa394498(v=vs.85).aspx
+            timeinfo = wmi_c.Win32_TimeZone()[0]
+            grains.update(
+                {
+                    "timezone": _clean_value("timezone", timeinfo.Description),
+                }
+            )
+        except IndexError:
+            grains.update({"timezone": None})
+            log.warning("TimeZone info not available on this system")
+
+        try:
+            # https://docs.microsoft.com/en-us/windows/win32/cimwin32prov/win32-computersystemproduct
+            csproductinfo = wmi_c.Win32_ComputerSystemProduct()[0]
+            grains.update(
+                {
+                    "uuid": _clean_value("uuid", csproductinfo.UUID.lower()),
+                }
+            )
+        except IndexError:
+            grains.update({"uuid": None})
+            log.warning("Computer System Product info not available on this system")
 
         # http://msdn.microsoft.com/en-us/library/windows/desktop/aa394072(v=vs.85).aspx
-        motherboard = {"product": None, "serial": None}
         try:
             motherboardinfo = wmi_c.Win32_BaseBoard()[0]
-            motherboard["product"] = motherboardinfo.Product
-            motherboard["serial"] = motherboardinfo.SerialNumber
+            grains.update(
+                {
+                    "motherboard": {
+                        "productname": _clean_value(
+                            "motherboard.productname", motherboardinfo.Product
+                        ),
+                        "serialnumber": _clean_value(
+                            "motherboard.serialnumber", motherboardinfo.SerialNumber
+                        ),
+                    },
+                }
+            )
         except IndexError:
+            grains.update(
+                {
+                    "motherboard": {"productname": None, "serialnumber": None},
+                }
+            )
             log.debug("Motherboard info not available on this system")
 
-        kernel_version = platform.version()
-        info = salt.utils.win_osinfo.get_os_version_info()
+        grains.update(
+            {
+                "kernelversion": _clean_value("kernelversion", platform.version()),
+            }
+        )
         net_info = salt.utils.win_osinfo.get_join_info()
-
-        service_pack = None
-        if info["ServicePackMajor"] > 0:
-            service_pack = "".join(["SP", str(info["ServicePackMajor"])])
-
-        os_release = _windows_os_release_grain(
-            caption=osinfo.Caption, product_type=osinfo.ProductType
+        grains.update(
+            {
+                "windowsdomain": _clean_value("windowsdomain", net_info["Domain"]),
+                "windowsdomaintype": _clean_value(
+                    "windowsdomaintype", net_info["DomainType"]
+                ),
+            }
         )
 
-        grains = {
-            "kernelrelease": _clean_value("kernelrelease", osinfo.Version),
-            "kernelversion": _clean_value("kernelversion", kernel_version),
-            "osversion": _clean_value("osversion", osinfo.Version),
-            "osrelease": _clean_value("osrelease", os_release),
-            "osservicepack": _clean_value("osservicepack", service_pack),
-            "osmanufacturer": _clean_value("osmanufacturer", osinfo.Manufacturer),
-            "manufacturer": _clean_value("manufacturer", systeminfo.Manufacturer),
-            "productname": _clean_value("productname", systeminfo.Model),
-            # bios name had a bunch of whitespace appended to it in my testing
-            # 'PhoenixBIOS 4.0 Release 6.0     '
-            "biosversion": _clean_value("biosversion", biosinfo.Name.strip()),
-            "serialnumber": _clean_value("serialnumber", biosinfo.SerialNumber),
-            "osfullname": _clean_value("osfullname", osinfo.Caption),
-            "timezone": _clean_value("timezone", timeinfo.Description),
-            "uuid": _clean_value("uuid", csproductinfo.UUID.lower()),
-            "windowsdomain": _clean_value("windowsdomain", net_info["Domain"]),
-            "windowsdomaintype": _clean_value(
-                "windowsdomaintype", net_info["DomainType"]
-            ),
-            "motherboard": {
-                "productname": _clean_value(
-                    "motherboard.productname", motherboard["product"]
-                ),
-                "serialnumber": _clean_value(
-                    "motherboard.serialnumber", motherboard["serial"]
-                ),
-            },
-        }
-
-        # test for virtualized environments
-        # I only had VMware available so the rest are unvalidated
-        if "VRTUAL" in biosinfo.Version:  # (not a typo)
-            grains["virtual"] = "HyperV"
-        elif "A M I" in biosinfo.Version:
-            grains["virtual"] = "VirtualPC"
-        elif "VMware" in systeminfo.Model:
-            grains["virtual"] = "VMware"
-        elif "VirtualBox" in systeminfo.Model:
-            grains["virtual"] = "VirtualBox"
-        elif "Xen" in biosinfo.Version:
-            grains["virtual"] = "Xen"
-            if "HVM domU" in systeminfo.Model:
-                grains["virtual_subtype"] = "HVM domU"
-        elif "OpenStack" in systeminfo.Model:
-            grains["virtual"] = "OpenStack"
-        elif "AMAZON" in biosinfo.Version:
-            grains["virtual"] = "EC2"
+        info = salt.utils.win_osinfo.get_os_version_info()
+        if info["ServicePackMajor"] > 0:
+            service_pack = "".join(["SP", str(info["ServicePackMajor"])])
+            grains.update(
+                {
+                    "osservicepack": _clean_value("osservicepack", service_pack),
+                }
+            )
+        else:
+            grains.update({"osservicepack": None})
 
     return grains
 
@@ -1739,6 +1809,7 @@ _OS_NAME_MAP = {
     "rocky": "Rocky",
     "alibabaclo": "Alinux",
     "mendel": "Mendel",
+    "photon": "VMware Photon OS",
 }
 
 # This dictionary maps the pair of os-release ID and NAME to the 'os' grain
@@ -1815,6 +1886,7 @@ _OS_FAMILY_MAP = {
     "SLES_SAP": "Suse",
     "Arch ARM": "Arch",
     "Manjaro": "Arch",
+    "Manjaro ARM": "Arch",
     "Antergos": "Arch",
     "EndeavourOS": "Arch",
     "ALT": "RedHat",
@@ -1846,7 +1918,6 @@ _OS_FAMILY_MAP = {
     "Alinux": "RedHat",
     "Mendel": "Debian",
     "OSMC": "Debian",
-    "openEuler": "RedHat",
 }
 
 
@@ -2117,9 +2188,11 @@ def _os_release_quirks_for_osrelease(os_release):
     if os_release["ID"] in ("mendel",):
         # Mendel sets VERSION_CODENAME but not VERSION_ID.
         # Only PRETTY_NAME mentions the version number.
-        match = _PRETTY_NAME_RE.match(os_release["PRETTY_NAME"])
-        if match:
-            return match.group("version")
+        # for example: Mendel GNU/Linux 5 (Eagle)
+        test_strg = os_release["PRETTY_NAME"].split()
+        if len(test_strg) >= 3:
+            return test_strg[2]
+
     return None
 
 
@@ -2191,8 +2264,9 @@ def _linux_distribution_data():
             "rocky",
             "ubuntu",
         ):
-            # Solely use os-release data. See description of the function.
-            return grains
+            if lsb_has_error is False:
+                # Solely use os-release data. See description of the function.
+                return grains
 
     except OSError:
         os_release = {}
@@ -2246,6 +2320,10 @@ def _legacy_linux_distribution_data(grains, os_release, lsb_has_error):
                             cpe.get("version") and cpe.get("vendor") == "opensuse"
                         ):  # Keep VERSION_ID for SLES
                             grains["lsb_distrib_release"] = cpe["version"]
+                if "ID" in os_release and os_release["ID"].strip() == "mendel":
+                    test_strg = os_release["PRETTY_NAME"].split()
+                    if len(test_strg) >= 3:
+                        grains["lsb_distrib_release"] = test_strg[2]
 
             elif os.path.isfile("/etc/SuSE-release"):
                 log.trace("Parsing distrib info from /etc/SuSE-release")
@@ -2295,15 +2373,6 @@ def _legacy_linux_distribution_data(grains, os_release, lsb_has_error):
                 log.trace("Parsing distrib info from /etc/centos-release")
                 # CentOS Linux
                 grains["lsb_distrib_id"] = "CentOS"
-                # Maybe CentOS Linux; could also be SUSE Expanded Support.
-                # SUSE ES has both, centos-release and redhat-release.
-                if os.path.isfile("/etc/redhat-release"):
-                    with salt.utils.files.fopen("/etc/redhat-release") as ifile:
-                        for line in ifile:
-                            if "red hat enterprise linux server" in line.lower():
-                                # This is a SUSE Expanded Support Rhel installation
-                                grains["lsb_distrib_id"] = "RedHat"
-                                break
                 with salt.utils.files.fopen("/etc/centos-release") as ifile:
                     for line in ifile:
                         # Need to pull out the version and codename
@@ -2336,10 +2405,10 @@ def _legacy_linux_distribution_data(grains, os_release, lsb_has_error):
                             "Please report this, as it is likely a bug."
                         )
                     else:
-                        grains[
-                            "osrelease"
-                        ] = "{majorversion}.{minorversion}-{buildnumber}".format(
-                            **synoinfo
+                        grains["osrelease"] = (
+                            "{majorversion}.{minorversion}-{buildnumber}".format(
+                                **synoinfo
+                            )
                         )
 
     log.trace(
@@ -2372,23 +2441,25 @@ def _legacy_linux_distribution_data(grains, os_release, lsb_has_error):
         ):
             grains.pop("lsb_distrib_release", None)
         grains["osrelease"] = grains.get("lsb_distrib_release", osrelease).strip()
+
+    # allow for codename being within brackets on certain OS
+    if grains.get("lsb_distrib_codename", "") and (
+        any(os in grains.get("os", "") for os in ["Rocky", "AlmaLinux", "AstraLinuxSE"])
+    ):
+        test_strg = grains["lsb_distrib_codename"].split("(", maxsplit=1)
+        if len(test_strg) >= 2:
+            test_strg_2 = test_strg[1].split(")", maxsplit=1)
+            if grains["os"] == "AstraLinuxSE":
+                # AstraLinuxSE has version aka 'Smolensk 1.6'
+                grains["lsb_distrib_codename"] = test_strg_2[0].split()[0].lower()
+            else:
+                grains["lsb_distrib_codename"] = test_strg_2[0]
+
     grains["oscodename"] = grains.get("lsb_distrib_codename", "").strip() or oscodename
     if "Red Hat" in grains["oscodename"]:
         grains["oscodename"] = oscodename
     if "os" not in grains:
         grains["os"] = _derive_os_grain(grains["osfullname"])
-    if "SUSE_SUPPORT_PRODUCT" in os_release and "SUSE_SUPPORT_PRODUCT_VERSION":
-        # It's a workaround for very specific case of SL Micro 6.2
-        # SL Micro 6.2 is different than prevoius ones and identifies itself
-        # as SLES-16, but transactional. This workaround was made to make the grains
-        # of SL Micro 6.2 aligned with the previous versions.
-        grains["oscodename"] = os_release.get(
-            "SUSE_PRETTY_NAME",
-            f"{os_release['SUSE_SUPPORT_PRODUCT']} {os_release['SUSE_SUPPORT_PRODUCT_VERSION']}",
-        )
-        grains["osrelease"] = os_release["SUSE_SUPPORT_PRODUCT_VERSION"]
-        if os_release["SUSE_SUPPORT_PRODUCT"] == "SUSE Linux Micro":
-            grains["osfullname"] = "SL-Micro"
     # this assigns family names based on the os name
     # family defaults to the os name if not found
     grains["os_family"] = _OS_FAMILY_MAP.get(grains["os"], grains["os"])
@@ -2519,7 +2590,7 @@ def _smartos_os_data():
     return grains
 
 
-def _sunos_release():
+def _sunos_release():  # pragma: no cover
     grains = {}
     with salt.utils.files.fopen("/etc/release", "r") as fp_:
         rel_data = fp_.read()
@@ -2628,6 +2699,7 @@ def os_data():
             osrelease_info[1] = osrelease_info[1].lstrip("R")
         else:
             osrelease_info = grains["osrelease"].split(".")
+        osrelease_info = [s for s in osrelease_info if s]
 
         for idx, value in enumerate(osrelease_info):
             if not value.isdigit():
@@ -2709,11 +2781,13 @@ def os_data():
             # freebsd-version was introduced in 10.0.
             # derive osrelease from kernelversion prior to that
             grains["osrelease"] = grains["kernelrelease"].split("-")[0]
+        grains["osfullname"] = "{} {}".format(grains["kernel"], grains["osrelease"])
         grains.update(_bsd_cpudata(grains))
     elif grains["kernel"] in ("OpenBSD", "NetBSD"):
         grains["os_family"] = grains["os"] = grains["kernel"]
         grains.update(_bsd_cpudata(grains))
         grains["osrelease"] = grains["kernelrelease"].split("-")[0]
+        grains["osfullname"] = "{} {}".format(grains["kernel"], grains["osrelease"])
         if grains["kernel"] == "NetBSD":
             grains.update(_netbsd_gpu_data())
     else:
@@ -2756,10 +2830,8 @@ def locale_info():
         (
             grains["locale_info"]["defaultlanguage"],
             grains["locale_info"]["defaultencoding"],
-        ) = salt.utils.locales.getdefaultlocale()
+        ) = locale.getlocale()
     except Exception:  # pylint: disable=broad-except
-        # locale.getdefaultlocale can ValueError!! Catch anything else it
-        # might do, per #2205
         grains["locale_info"]["defaultlanguage"] = "unknown"
         grains["locale_info"]["defaultencoding"] = "unknown"
     grains["locale_info"]["detectedencoding"] = __salt_system_encoding__
@@ -2848,14 +2920,16 @@ def fqdns():
     opt = {"fqdns": []}
     if __opts__.get(
         "enable_fqdns_grains",
-        False
-        if salt.utils.platform.is_windows()
-        or salt.utils.platform.is_proxy()
-        or salt.utils.platform.is_sunos()
-        or salt.utils.platform.is_aix()
-        or salt.utils.platform.is_junos()
-        or salt.utils.platform.is_darwin()
-        else True,
+        (
+            False
+            if salt.utils.platform.is_windows()
+            or salt.utils.platform.is_proxy()
+            or salt.utils.platform.is_sunos()
+            or salt.utils.platform.is_aix()
+            or salt.utils.platform.is_junos()
+            or salt.utils.platform.is_darwin()
+            else True
+        ),
     ):
         opt = __salt__["network.fqdns"]()
     return opt
@@ -2878,12 +2952,12 @@ def ip_fqdn():
         if not ret["ipv" + ipv_num]:
             ret[key] = []
         else:
+            start_time = datetime.datetime.utcnow()
             try:
-                start_time = salt.utils.timeutil.utcnow()
                 info = socket.getaddrinfo(_fqdn, None, socket_type)
                 ret[key] = list({item[4][0] for item in info})
             except (OSError, UnicodeError):
-                timediff = salt.utils.timeutil.utcnow() - start_time
+                timediff = datetime.datetime.utcnow() - start_time
                 if timediff.seconds > 5 and __opts__["__role"] == "master":
                     log.warning(
                         'Unable to find IPv%s record for "%s" causing a %s '
@@ -3024,13 +3098,7 @@ def get_machine_id():
     if platform.system() == "AIX":
         return _aix_get_machine_id()
 
-    locations = ["/etc/machine-id", "/var/lib/dbus/machine-id"]
-    existing_locations = [loc for loc in locations if os.path.exists(loc)]
-    if not existing_locations:
-        return {}
-    else:
-        with salt.utils.files.fopen(existing_locations[0]) as machineid:
-            return {"machine_id": machineid.read().strip()}
+    return _get_machine_identifier()
 
 
 def cwd():
@@ -3150,23 +3218,6 @@ def _hw_data(osdata):
         return {}
 
     grains = {}
-
-    # For Xen para-virtualized guests read UUID from /sys/hypervisor/uuid
-    if osdata["kernel"] == "Linux" and os.path.exists("/sys/hypervisor/uuid"):
-        try:
-            with salt.utils.files.fopen("/sys/hypervisor/uuid", "rb") as ifile:
-                hypervisor_uuid = salt.utils.stringutils.to_unicode(
-                    ifile.read().strip(), errors="replace"
-                )
-                if hypervisor_uuid:
-                    grains["uuid"] = hypervisor_uuid.lower()
-                    log.debug(
-                        "Read UUID from /sys/hypervisor/uuid for para-virtualized guest: %s",
-                        grains["uuid"],
-                    )
-        except OSError as err:
-            log.debug("Unable to read /sys/hypervisor/uuid: %s", err)
-
     if osdata["kernel"] == "Linux" and os.path.exists("/sys/class/dmi/id"):
         # On many Linux distributions basic firmware information is available via sysfs
         # requires CONFIG_DMIID to be enabled in the Linux kernel configuration
@@ -3181,9 +3232,6 @@ def _hw_data(osdata):
             "serialnumber": "product_serial",
         }
         for key, fw_file in sysfs_firmware_info.items():
-            # Skip UUID if already read from /sys/hypervisor/uuid (Xen PV guests)
-            if key == "uuid" and "uuid" in grains:
-                continue
             contents_file = os.path.join("/sys/class/dmi/id", fw_file)
             if os.path.exists(contents_file):
                 try:
@@ -3214,20 +3262,18 @@ def _hw_data(osdata):
     ):
         # On SmartOS (possibly SunOS also) smbios only works in the global zone
         # smbios is also not compatible with linux's smbios (smbios -s = print summarized)
-        uuid = __salt__["smbios.get"]("system-uuid")
-        if uuid is not None:
-            uuid = uuid.lower()
-        else:
-            uuid = grains.get("uuid")
         grains = {
             "biosversion": __salt__["smbios.get"]("bios-version"),
             "biosvendor": __salt__["smbios.get"]("bios-vendor"),
             "productname": __salt__["smbios.get"]("system-product-name"),
             "manufacturer": __salt__["smbios.get"]("system-manufacturer"),
             "biosreleasedate": __salt__["smbios.get"]("bios-release-date"),
-            "uuid": uuid,
+            "uuid": __salt__["smbios.get"]("system-uuid"),
         }
         grains = {key: val for key, val in grains.items() if val is not None}
+        uuid = __salt__["smbios.get"]("system-uuid")
+        if uuid is not None:
+            grains["uuid"] = uuid.lower()
         for serial in (
             "system-serial-number",
             "chassis-serial-number",
@@ -3308,7 +3354,7 @@ def _hw_data(osdata):
         # of information.  With that said, consolidate the output from various
         # commands and attempt various lookups.
         data = ""
-        for (cmd, args) in (
+        for cmd, args in (
             ("/usr/sbin/prtdiag", "-v"),
             ("/usr/sbin/prtconf", "-vp"),
             ("/usr/sbin/virtinfo", "-a"),
@@ -3453,36 +3499,6 @@ def _hw_data(osdata):
     return grains
 
 
-def _get_hash_by_shell():
-    """
-    Shell-out Python 3 for compute reliable hash
-    :return:
-    """
-    id_ = __opts__.get("id", "")
-    id_hash = None
-    py_ver = sys.version_info[:2]
-    if py_ver >= (3, 3):
-        # Python 3.3 enabled hash randomization, so we need to shell out to get
-        # a reliable hash.
-        id_hash = __salt__["cmd.run"](
-            [sys.executable, "-c", 'print(hash("{}"))'.format(id_)],
-            env={"PYTHONHASHSEED": "0"},
-        )
-        try:
-            id_hash = int(id_hash)
-        except (TypeError, ValueError):
-            log.debug(
-                "Failed to hash the ID to get the server_id grain. Result of hash command: %s",
-                id_hash,
-            )
-            id_hash = None
-    if id_hash is None:
-        # Python < 3.3 or error encountered above
-        id_hash = hash(id_)
-
-    return abs(id_hash % (2 ** 31))
-
-
 def get_server_id():
     """
     Provides an integer based on the FQDN of a machine.
@@ -3493,19 +3509,10 @@ def get_server_id():
     #   server_id
 
     if salt.utils.platform.is_proxy():
-        server_id = {}
-    else:
-        use_crc = __opts__.get("server_id_use_crc")
-        if bool(use_crc):
-            id_hash = (
-                getattr(zlib, use_crc, zlib.adler32)(__opts__.get("id", "").encode())
-                & 0xFFFFFFFF
-            )
-        else:
-            id_hash = _get_hash_by_shell()
-        server_id = {"server_id": id_hash}
-
-    return server_id
+        return {}
+    id_ = __opts__.get("id", "")
+    hash_ = int(hashlib.sha256(id_.encode()).hexdigest(), 16)
+    return {"server_id": abs(hash_ % (2**31))}
 
 
 def get_master():

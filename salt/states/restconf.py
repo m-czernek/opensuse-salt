@@ -11,14 +11,12 @@ This state module was designed to manage RESTCONF states.
 This module relies on the RESTCONF proxy module to interface with the devices.
 """
 
-
 import difflib
 import json
 import logging
+from collections import OrderedDict
 
 import yaml
-
-import salt.utils.odict
 
 log = logging.getLogger(__file__)
 
@@ -88,7 +86,7 @@ def config_manage(
         ret["comment"] = "CRITICAL: method is required"
         log.critical("method is required")
         return ret
-    if not isinstance(config, salt.utils.odict.OrderedDict):
+    if not isinstance(config, OrderedDict):
         ret["comment"] = "CRITICAL: config must be an OrderedDict type"
         log.critical(
             "config is required, config must be a salt OrderedDict, not a %s",

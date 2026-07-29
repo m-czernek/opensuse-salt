@@ -2,7 +2,7 @@ import pytest
 import zmq
 
 import salt.config
-import tornado.ioloop
+import salt.ext.tornado.ioloop
 import salt.utils.event
 import salt.utils.stringutils
 

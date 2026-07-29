@@ -15,7 +15,7 @@ import time
 import traceback
 import types
 from collections.abc import MutableMapping
-from zipimport import zipimporter
+from zipimport import zipimporter  # pylint: disable=no-name-in-module
 
 import salt.config
 import salt.defaults.events
@@ -29,7 +29,6 @@ import salt.utils.dictupdate
 import salt.utils.event
 import salt.utils.files
 import salt.utils.lazy
-import salt.utils.odict
 import salt.utils.platform
 import salt.utils.stringutils
 import salt.utils.versions
@@ -70,6 +69,10 @@ PY3_PRE_EXT = re.compile(r"\.cpython-{}{}(\.opt-[1-9])?".format(*sys.version_inf
 
 # Will be set to pyximport module at runtime if cython is enabled in config.
 pyximport = None
+
+# Track loaders currently being cleaned to prevent infinite recursion
+# from circular loader references (e.g., when loaders reference each other in pack)
+_cleaning_loaders = set()
 
 
 def _generate_module(name):
@@ -144,12 +147,37 @@ class LoadedFunc:
 
     def __call__(self, *args, **kwargs):
         run_func = self.func
+        # Get the module object - it might have been removed from sys.modules by clean_modules()
+        # but the function still has a reference to it via __globals__
+        mod = sys.modules.get(run_func.__module__)
+        if mod is None:
+            # Module was cleaned from sys.modules, but we can get it from the function's globals
+            # The function's __globals__ is the module's namespace dict
+            import types
+
+            mod = types.ModuleType(run_func.__module__)
+            mod.__dict__.update(run_func.__globals__)
+        # All modules we've imported should have __opts__ defined. There are
+        # cases in the test suite where mod ends up being something other than
+        # a module we've loaded.
+        set_test = False
+        if hasattr(mod, "__opts__"):
+            if not isinstance(mod.__opts__, salt.loader.context.NamedLoaderContext):
+                if "test" in self.loader.opts:
+                    if self.loader.opts["test"] is False:
+                        mod.__opts__["test"] = False
+                    else:
+                        mod.__opts__["test"] = True
+                    set_test = True
         if self.loader.inject_globals:
             run_func = global_injector_decorator(self.loader.inject_globals)(run_func)
-        return self.loader.run(run_func, *args, **kwargs)
+        ret = self.loader.run(run_func, *args, **kwargs)
+        if set_test:
+            self.loader.opts["test"] = mod.__opts__["test"]
+        return ret
 
     def __repr__(self):
-        return "<{} name={!r}>".format(self.__class__.__name__, self.name)
+        return f"<{self.__class__.__name__} name={self.name!r}>"
 
 
 class LoadedMod:
@@ -172,10 +200,10 @@ class LoadedMod:
         Run the wrapped function in the loader's context.
         """
         try:
-            return self.loader["{}.{}".format(self.mod, name)]
+            return self.loader[f"{self.mod}.{name}"]
         except KeyError:
             raise AttributeError(
-                "No attribute by the name of {} was found on {}".format(name, self.mod)
+                f"No attribute by the name of {name} was found on {self.mod}"
             )
 
     def __repr__(self):
@@ -305,7 +333,7 @@ class LazyLoader(salt.utils.lazy.LazyDict):
         # A list to determine precedence of extensions
         # Prefer packages (directories) over modules (single files)!
         self.suffix_order = [""]
-        for (suffix, mode, kind) in SUFFIXES:
+        for suffix, mode, kind in SUFFIXES:
             self.suffix_map[suffix] = (suffix, mode, kind)
             self.suffix_order.append(suffix)
 
@@ -315,18 +343,104 @@ class LazyLoader(salt.utils.lazy.LazyDict):
 
         super().__init__()  # late init the lazy loader
         # create all of the import namespaces
-        _generate_module("{}.int".format(self.loaded_base_name))
-        _generate_module("{}.int.{}".format(self.loaded_base_name, tag))
-        _generate_module("{}.ext".format(self.loaded_base_name))
-        _generate_module("{}.ext.{}".format(self.loaded_base_name, tag))
+        _generate_module(f"{self.loaded_base_name}.int")
+        _generate_module(f"{self.loaded_base_name}.int.{tag}")
+        _generate_module(f"{self.loaded_base_name}.ext")
+        _generate_module(f"{self.loaded_base_name}.ext.{tag}")
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.destroy()
+
+    def destroy(self):
+        """
+        Destroy the loader and clean up modules
+        """
+        self.clean_modules()
+        if hasattr(self, "context_dict") and self.context_dict is not None:
+            if hasattr(self.context_dict, "destroy"):
+                self.context_dict.destroy()
+        if hasattr(self, "pack") and isinstance(self.pack, dict):
+            self.pack.clear()
+        if hasattr(self, "_dict"):
+            self._dict.clear()
+        if hasattr(self, "loaded_modules"):
+            self.loaded_modules.clear()
+        if hasattr(self, "missing_modules"):
+            self.missing_modules.clear()
 
     def clean_modules(self):
         """
-        Clean modules
+        Clean modules and free memory for this loader's tag only.
+
+        Removes loaded modules from sys.modules to allow garbage collection,
+        but only for modules belonging to this loader's tag (e.g., 'grains', 'modules').
+        This prevents interfering with other active loaders (e.g., runners, states).
+
+        Base stub modules are preserved as they are shared infrastructure.
+
+        Note: This method does NOT clear the loader's internal state (_dict, loaded_modules, etc.)
+        as the loader may still be referenced and used after cleanup. The modules will be
+        garbage collected when they're no longer referenced.
+
+        Note: Injected loaders in pack (e.g., __utils__, __salt__, __states__) are
+        NOT cleaned up because they are shared infrastructure. They will be cleaned
+        up when explicitly destroyed.
         """
-        for name in list(sys.modules):
-            if name.startswith(self.loaded_base_name):
-                del sys.modules[name]
+        # Prevent infinite recursion from circular loader references
+        # (e.g., when loaders reference each other in pack)
+        loader_id = id(self)
+        if loader_id in _cleaning_loaders:
+            return
+        _cleaning_loaders.add(loader_id)
+
+        try:
+            # Note: We do NOT recursively clean up injected loaders in pack
+            # (like __utils__, __salt__, __states__) because they are shared
+            # infrastructure used by multiple loaders. They will be cleaned up
+            # when explicitly destroyed, not as a side effect of cleaning this loader.
+
+            # Build list of base stub modules that should be preserved
+            # These are shared across loaders and should not be removed
+            base_stubs = {
+                f"{self.loaded_base_name}.int",
+                f"{self.loaded_base_name}.int.{self.tag}",
+                f"{self.loaded_base_name}.ext",
+                f"{self.loaded_base_name}.ext.{self.tag}",
+            }
+
+            # Prefixes for modules belonging to this loader's tag
+            tag_prefixes = [
+                f"{self.loaded_base_name}.int.{self.tag}.",
+                f"{self.loaded_base_name}.ext.{self.tag}.",
+            ]
+
+            # Remove from sys.modules, but only for this loader's tag
+            for name in list(sys.modules):
+                # Only consider modules under our base name
+                if name.startswith(self.loaded_base_name):
+                    # Don't remove base stub modules - they're shared
+                    if name in base_stubs:
+                        continue
+
+                    # Only remove modules that belong to this loader's tag
+                    # e.g., for grains loader with tag='grains', only remove:
+                    #   salt.loaded.int.grains.core, salt.loaded.ext.grains.custom, etc.
+                    # but NOT salt.loaded.int.runners.test or salt.loaded.int.modules.test
+                    for prefix in tag_prefixes:
+                        if name.startswith(prefix):
+                            del sys.modules[name]
+                            break
+
+            # Note: We do NOT clear internal loader state (self._dict, self.loaded_modules, etc.)
+            # because the loader object may still be referenced and used after cleanup.
+            # Python's garbage collector will clean up the modules once they're no longer
+            # referenced anywhere.
+        finally:
+            # Always remove from tracking set, even if an exception occurs
+            _cleaning_loaders.discard(loader_id)
 
     def __getitem__(self, item):
         """
@@ -376,19 +490,19 @@ class LazyLoader(salt.utils.lazy.LazyDict):
         """
         mod_name = function_name.split(".")[0]
         if mod_name in self.loaded_modules:
-            return "'{}' is not available.".format(function_name)
+            return f"'{function_name}' is not available."
         else:
             try:
                 reason = self.missing_modules[mod_name]
             except KeyError:
-                return "'{}' is not available.".format(function_name)
+                return f"'{function_name}' is not available."
             else:
                 if reason is not None:
                     return "'{}' __virtual__ returned False: {}".format(
                         mod_name, reason
                     )
                 else:
-                    return "'{}' __virtual__ returned False".format(mod_name)
+                    return f"'{mod_name}' __virtual__ returned False"
 
     def _refresh_file_mapping(self):
         """
@@ -424,8 +538,8 @@ class LazyLoader(salt.utils.lazy.LazyDict):
         self.suffix_map[""] = ("", "", MODULE_KIND_PKG_DIRECTORY)
 
         # create mapping of filename (without suffix) to (path, suffix)
-        # The files are added in order of priority, so order *must* be retained.
-        self.file_mapping = salt.utils.odict.OrderedDict()
+        # The files are added in order of priority; dict preserves insertion order.
+        self.file_mapping = {}
 
         opt_match = []
 
@@ -501,7 +615,7 @@ class LazyLoader(salt.utils.lazy.LazyDict):
                         for suffix in self.suffix_order:
                             if "" == suffix:
                                 continue  # Next suffix (__init__ must have a suffix)
-                            init_file = "__init__{}".format(suffix)
+                            init_file = f"__init__{suffix}"
                             if init_file in subfiles:
                                 break
                         else:
@@ -610,9 +724,11 @@ class LazyLoader(salt.utils.lazy.LazyDict):
                 yield k
 
         # anyone else? Bueller?
-        for k in self.file_mapping:
-            if mod_name not in k:
-                yield k
+        # Skip expensive Bueller fallback search if strict matching is enabled
+        if not self.opts.get("lazy_loader_strict_matching", False):
+            for k in self.file_mapping:
+                if mod_name not in k:
+                    yield k
 
     def _reload_submodules(self, mod):
         submodules = (
@@ -685,9 +801,12 @@ class LazyLoader(salt.utils.lazy.LazyDict):
 
         self.loaded_files.add(name)
         fpath_dirname = os.path.dirname(fpath)
+        fpath_appended = False
         try:
             self.__populate_sys_path()
-            sys.path.append(fpath_dirname)
+            if fpath_dirname not in sys.path:
+                sys.path.append(fpath_dirname)
+                fpath_appended = True
             if suffix == ".pyx":
                 mod = pyximport.load_module(name, fpath, tempfile.gettempdir())
             elif suffix == ".o":
@@ -824,7 +943,8 @@ class LazyLoader(salt.utils.lazy.LazyDict):
             self.missing_modules[name] = error
             return False
         finally:
-            sys.path.remove(fpath_dirname)
+            if fpath_appended:
+                sys.path.remove(fpath_dirname)
             self.__clean_sys_path()
 
         loader_context = salt.loader.context.LoaderContext()
@@ -920,10 +1040,27 @@ class LazyLoader(salt.utils.lazy.LazyDict):
 
                 # if _process_virtual returned a non-True value then we are
                 # supposed to not process this module
-                if virtual_ret is not True and module_name not in self.missing_modules:
-                    # If a module has information about why it could not be loaded, record it
-                    self.missing_modules[module_name] = virtual_err
+                if virtual_ret is not True:
+                    # Always record the per-file reason; `name` is unique.
                     self.missing_modules[name] = virtual_err
+                    # The virtualname (module_name) can collide when multiple
+                    # files declare the same __virtualname__ (e.g. x509 and
+                    # x509_v2 both use "x509"). If we've already recorded a
+                    # reason for this virtualname, append the new one so the
+                    # user sees every failure, not just the first.
+                    if module_name not in self.missing_modules:
+                        self.missing_modules[module_name] = virtual_err
+                    elif virtual_err is not None:
+                        existing = self.missing_modules[module_name]
+                        if existing is None:
+                            self.missing_modules[module_name] = virtual_err
+                        else:
+                            existing_str = str(existing)
+                            new_str = str(virtual_err)
+                            if new_str and new_str not in existing_str.split("; "):
+                                self.missing_modules[module_name] = (
+                                    f"{existing_str}; {new_str}"
+                                )
                     return False
         else:
             virtual_aliases = ()
@@ -972,10 +1109,8 @@ class LazyLoader(salt.utils.lazy.LazyDict):
         mod_names = [module_name] + list(virtual_aliases)
 
         for attr in funcs_to_load:
-            if attr.startswith("_") and attr != "__call__":
-                # private functions are skipped,
-                # except __call__ which is default entrance
-                # for multi-function batch-like state syntax
+            if attr.startswith("_"):
+                # private functions are skipped
                 continue
             func = getattr(mod, attr)
             if not inspect.isfunction(func) and not isinstance(func, functools.partial):
@@ -1002,7 +1137,7 @@ class LazyLoader(salt.utils.lazy.LazyDict):
                 try:
                     full_funcname = ".".join((tgt_mod, funcname))
                 except TypeError:
-                    full_funcname = "{}.{}".format(tgt_mod, funcname)
+                    full_funcname = f"{tgt_mod}.{funcname}"
                 # Save many references for lookups
                 # Careful not to overwrite existing (higher priority) functions
                 if full_funcname not in self._dict:
@@ -1029,7 +1164,7 @@ class LazyLoader(salt.utils.lazy.LazyDict):
         if not isinstance(key, str):
             raise KeyError("The key must be a string.")
         if "." not in key:
-            raise KeyError("The key '{}' should contain a '.'".format(key))
+            raise KeyError(f"The key '{key}' should contain a '.'")
         mod_name, _ = key.split(".", 1)
         with self._lock:
             # It is possible that the key is in the dictionary after
@@ -1173,6 +1308,16 @@ class LazyLoader(salt.utils.lazy.LazyDict):
                             mod.__name__,
                             module_name,
                         )
+
+                    # If the module explicitly declares __virtualname__, report
+                    # the failure under that name so the caller can detect
+                    # collisions with other modules claiming the same name.
+                    if (
+                        hasattr(mod, "__virtualname__")
+                        and isinstance(virtualname, str)
+                        and virtualname
+                    ):
+                        module_name = virtualname
 
                     return (False, module_name, error_reason, virtual_aliases)
 

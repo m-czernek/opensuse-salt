@@ -1,6 +1,7 @@
 """
 These commands are used to release Salt.
 """
+
 # pylint: disable=resource-leakage,broad-except,3rd-party-module-not-gated
 from __future__ import annotations
 
@@ -8,26 +9,15 @@ import json
 import logging
 import os
 import pathlib
-import sys
 import tempfile
 import time
 
+import boto3
 import virustotal3.core
+from botocore.exceptions import ClientError
 from ptscripts import Context, command_group
 
 import tools.utils
-
-try:
-    import boto3
-    from botocore.exceptions import ClientError
-except ImportError:
-    print(
-        "\nPlease run 'python -m pip install -r "
-        "requirements/static/ci/py{}.{}/tools.txt'\n".format(*sys.version_info),
-        file=sys.stderr,
-        flush=True,
-    )
-    raise
 
 log = logging.getLogger(__name__)
 
@@ -86,7 +76,7 @@ def upload_artifacts(ctx: Context, salt_version: str, artifacts_path: pathlib.Pa
                     Delete={"Objects": objects},
                 )
             except ClientError:
-                log.exception(f"Failed to delete '{bucket_uri}'")
+                log.exception("Failed to delete '%s'", bucket_uri)
             finally:
                 progress.update(task, advance=1)
 
@@ -115,6 +105,93 @@ def upload_artifacts(ctx: Context, salt_version: str, artifacts_path: pathlib.Pa
                 )
     except KeyboardInterrupt:
         pass
+
+
+@release.command(
+    name="download-onedir-artifact",
+    arguments={
+        "salt_version": {
+            "help": "The salt version to release.",
+        },
+        "platform": {
+            "help": "The onedir platform archive to download.",
+            "required": True,
+            "choices": ("linux", "windows", "darwin", "macos"),
+        },
+        "arch": {
+            "help": "The onedir arch archive to download.",
+            "required": True,
+        },
+    },
+)
+def download_onedir_artifact(
+    ctx: Context, salt_version: str, platform: str = "linux", arch: str = "x86_64"
+):
+    """
+    Download onedir artifact from staging bucket.
+    """
+    s3 = boto3.client("s3")
+    if platform == "darwin":
+        platform = "macos"
+    if arch == "aarch64":
+        arch = "arm64"
+    arch = arch.lower()
+    platform = platform.lower()
+    if platform in ("linux", "macos") and arch not in ("x86_64", "arm64"):
+        ctx.error(
+            f"The 'arch' value for {platform} must be one of: 'x86_64', 'aarch64', 'aarch64'"
+        )
+        ctx.exit(1)
+    if platform == "windows" and arch not in ("x86", "amd64"):
+        ctx.error(f"The 'arch' value for {platform} must be one of: 'x86', 'amd64'")
+        ctx.exit(1)
+
+    archive_name = f"salt-{salt_version}-onedir-{platform}-{arch}.tar.xz"
+    archive_path = tools.utils.REPO_ROOT / "artifacts" / archive_name
+    if "rc" in salt_version:
+        prefix = "salt_rc/salt"
+    else:
+        prefix = "salt"
+    remote_path = f"{prefix}/py3/onedir/minor/{salt_version}/{archive_name}"
+    archive_path.parent.mkdir()
+    try:
+        ret = s3.head_object(Bucket=tools.utils.STAGING_BUCKET_NAME, Key=remote_path)
+        size = ret["ContentLength"]
+        with archive_path.open("wb") as wfh:
+            ctx.info(
+                f"Downloading s3://{tools.utils.STAGING_BUCKET_NAME}/{remote_path} to {archive_path} ..."
+            )
+            with tools.utils.create_progress_bar(file_progress=True) as progress:
+                task = progress.add_task(
+                    description="Downloading ...",
+                    total=size,
+                )
+                s3.download_fileobj(
+                    Bucket=tools.utils.STAGING_BUCKET_NAME,
+                    Key=remote_path,
+                    Fileobj=wfh,
+                    Callback=tools.utils.UpdateProgress(progress, task),
+                )
+    except ClientError as exc:
+        if "Error" not in exc.response:
+            log.exception("Error downloading %s: %s", remote_path, exc)
+            ctx.exit(1)
+        if exc.response["Error"]["Code"] == "404":
+            ctx.error(f"Could not find {remote_path} in bucket.")
+            ctx.exit(1)
+        elif exc.response["Error"]["Code"].startswith("4"):
+            ctx.error(f"Could not download {remote_path} from bucket: {exc}")
+            ctx.exit(1)
+        else:
+            log.exception("Failed to download %s: %s", remote_path, exc)
+            ctx.exit(1)
+
+    if not archive_path.exists():
+        ctx.error(f"The {archive_path} does not exist")
+        ctx.exit(1)
+    if not archive_path.stat().st_size:
+        ctx.error(f"The {archive_path} size is zero!")
+        ctx.exit(1)
 
 
 @release.command(
@@ -151,7 +228,7 @@ def upload_virustotal(ctx: Context, salt_version: str):
             files_to_copy = json.loads(local_release_files_path.read_text())
         except ClientError as exc:
             if "Error" not in exc.response:
-                log.exception(f"Error downloading {repo_release_files_path}: {exc}")
+                log.exception("Error downloading %s: %s", repo_release_files_path, exc)
                 ctx.exit(1)
             if exc.response["Error"]["Code"] == "404":
                 ctx.error(f"Could not find {repo_release_files_path} in bucket.")
@@ -161,7 +238,7 @@ def upload_virustotal(ctx: Context, salt_version: str):
                     f"Could not download {repo_release_files_path} from bucket: {exc}"
                 )
                 ctx.exit(1)
-            log.exception(f"Error downloading {repo_release_files_path}: {exc}")
+            log.exception("Error downloading %s: %s", repo_release_files_path, exc)
             ctx.exit(1)
 
     # If we get approval, we can add RPM and DEB
@@ -199,7 +276,7 @@ def upload_virustotal(ctx: Context, salt_version: str):
                     )
             except ClientError as exc:
                 if "Error" not in exc.response:
-                    log.exception(f"Error downloading {download_file}: {exc}")
+                    log.exception("Error downloading %s: %s", download_file, exc)
                     ctx.exit(1)
                 if exc.response["Error"]["Code"] == "404":
                     ctx.error(f"Could not find {download_file} in bucket.")
@@ -207,7 +284,7 @@ def upload_virustotal(ctx: Context, salt_version: str):
                 if exc.response["Error"]["Code"] == "400":
                     ctx.error(f"Could not download {download_file} from bucket: {exc}")
                     ctx.exit(1)
-                log.exception(f"Error downloading {download_file}: {exc}")
+                log.exception("Error downloading %s: %s", download_file, exc)
                 ctx.exit(1)
 
             # API key should be an environment variable

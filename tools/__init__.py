@@ -1,16 +1,70 @@
+import json
 import logging
+import os
+import pathlib
+import sys
+import textwrap
 
 import ptscripts
+from ptscripts.models import DefaultPipConfig, VirtualEnvPipConfig
 
+REPO_ROOT = pathlib.Path(__file__).resolve().parent.parent
+REQUIREMENTS_FILES_PATH = REPO_ROOT / "requirements"
+STATIC_REQUIREMENTS_PATH = REQUIREMENTS_FILES_PATH / "static"
+CI_REQUIREMENTS_FILES_PATH = (
+    STATIC_REQUIREMENTS_PATH / "ci" / "py{}.{}".format(*sys.version_info)
+)
+if os.environ.get("PRE_COMMIT") == "1":
+    DEFAULT_REQS_CONFIG = DefaultPipConfig(
+        requirements=["pip"],
+    )
+else:
+    DEFAULT_REQS_CONFIG = DefaultPipConfig(
+        install_args=[
+            f"--constraint={REQUIREMENTS_FILES_PATH / 'constraints.txt'}",
+        ],
+        requirements_files=[
+            STATIC_REQUIREMENTS_PATH / "ci" / "tools.txt",
+        ],
+    )
+if os.environ.get("PRE_COMMIT") == "1":
+    RELEASE_VENV_CONFIG = VirtualEnvPipConfig(
+        pip_requirement="pip>=24.2",
+        requirements=["pip"],
+        add_as_extra_site_packages=True,
+    )
+else:
+    RELEASE_VENV_CONFIG = VirtualEnvPipConfig(
+        pip_requirement="pip>=24.2",
+        install_args=[
+            f"--constraint={REQUIREMENTS_FILES_PATH / 'constraints.txt'}",
+        ],
+        requirements_files=[
+            STATIC_REQUIREMENTS_PATH / "ci" / "tools-virustotal.txt",
+        ],
+        add_as_extra_site_packages=True,
+    )
+ptscripts.set_default_config(DEFAULT_REQS_CONFIG)
 ptscripts.register_tools_module("tools.changelog")
 ptscripts.register_tools_module("tools.ci")
+ptscripts.register_tools_module("tools.container")
 ptscripts.register_tools_module("tools.docs")
+ptscripts.register_tools_module("tools.gh")
 ptscripts.register_tools_module("tools.pkg")
-ptscripts.register_tools_module("tools.pkg.repo")
 ptscripts.register_tools_module("tools.pkg.build")
-ptscripts.register_tools_module("tools.pre_commit")
-ptscripts.register_tools_module("tools.release")
-ptscripts.register_tools_module("tools.vm")
+ptscripts.register_tools_module("tools.precommit")
+ptscripts.register_tools_module("tools.precommit.changelog")
+ptscripts.register_tools_module("tools.precommit.workflows")
+ptscripts.register_tools_module("tools.precommit.docs")
+ptscripts.register_tools_module("tools.precommit.docstrings")
+ptscripts.register_tools_module("tools.precommit.filemap")
+ptscripts.register_tools_module("tools.precommit.loader")
+ptscripts.register_tools_module("tools.release", venv_config=RELEASE_VENV_CONFIG)
+ptscripts.register_tools_module("tools.testsuite")
+ptscripts.register_tools_module("tools.testsuite.download")
+ptscripts.register_tools_module("tools.testsuite.pytest")
+ptscripts.register_tools_module("tools.testsuite.ci_failure")
+ptscripts.register_tools_module("tools.testsuite.container_test")
 
 for name in ("boto3", "botocore", "urllib3"):
     logging.getLogger(name).setLevel(logging.INFO)

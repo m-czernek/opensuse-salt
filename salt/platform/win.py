@@ -9,12 +9,16 @@ Much of what is here was adapted from the following:
     http://stackoverflow.com/questions/29566330
 """
 
+import base64
 import collections
 import ctypes
 import logging
 import os
+import re
+import subprocess
 from ctypes import wintypes
 
+# pylint: disable=3rd-party-module-not-gated
 import ntsecuritycon
 import psutil
 import win32api
@@ -22,6 +26,8 @@ import win32con
 import win32process
 import win32security
 import win32service
+
+# pylint: enable=3rd-party-module-not-gated
 
 # Set up logging
 log = logging.getLogger(__name__)
@@ -154,7 +160,7 @@ class NTSTATUS(wintypes.LONG):
     def __repr__(self):
         name = self.__class__.__name__
         status = wintypes.ULONG.from_buffer(self)
-        return "{}({})".format(name, status.value)
+        return f"{name}({status.value})"
 
 
 PNTSTATUS = ctypes.POINTER(NTSTATUS)
@@ -163,7 +169,7 @@ PNTSTATUS = ctypes.POINTER(NTSTATUS)
 class BOOL(wintypes.BOOL):
     def __repr__(self):
         name = self.__class__.__name__
-        return "{}({})".format(name, bool(self))
+        return f"{name}({bool(self)})"
 
 
 class HANDLE(wintypes.HANDLE):
@@ -182,12 +188,17 @@ class HANDLE(wintypes.HANDLE):
 
     def Close(self, CloseHandle=kernel32.CloseHandle):
         if self and not getattr(self, "closed", False):
-            CloseHandle(self.Detach())
+            try:
+                CloseHandle(self.Detach())
+            except OSError:
+                # Suppress the error when there is no handle (WinError 6)
+                if ctypes.get_last_error() == 6:
+                    pass
 
     __del__ = Close
 
     def __repr__(self):
-        return "{}({})".format(self.__class__.__name__, int(self))
+        return f"{self.__class__.__name__}({int(self)})"
 
 
 class LARGE_INTEGER(wintypes.LARGE_INTEGER):
@@ -202,7 +213,7 @@ class LARGE_INTEGER(wintypes.LARGE_INTEGER):
 
     def __repr__(self):
         name = self.__class__.__name__
-        return "{}({})".format(name, self.value)
+        return f"{name}({self.value})"
 
     def as_time(self):
         time100ns = self.value - self._unix_epoch
@@ -258,7 +269,7 @@ class LUID(ctypes.Structure):
 
     def __repr__(self):
         name = self.__class__.__name__
-        return "{}({})".format(name, int(self))
+        return f"{name}({int(self)})"
 
 
 LPLUID = ctypes.POINTER(LUID)
@@ -309,7 +320,7 @@ class TOKEN_SOURCE(ctypes.Structure):
 LPTOKEN_SOURCE = ctypes.POINTER(TOKEN_SOURCE)
 py_source_context = TOKEN_SOURCE(b"PYTHON  ")
 py_origin_name = __name__.encode()
-py_logon_process_name = "{}-{}".format(py_origin_name, os.getpid())
+py_logon_process_name = f"{py_origin_name}-{os.getpid()}"
 SIZE_T = ctypes.c_size_t
 
 
@@ -340,7 +351,7 @@ class ContiguousUnicode(ctypes.Structure):
 
     def _get_unicode_string(self, name):
         wchar_size = ctypes.sizeof(WCHAR)
-        s = getattr(self, "_{}".format(name))
+        s = getattr(self, f"_{name}")
         length = s.Length // wchar_size
         buf = s.Buffer
         if buf:
@@ -372,7 +383,7 @@ class ContiguousUnicode(ctypes.Structure):
         addr = ctypes.addressof(self) + ctypes.sizeof(cls)
         for n, v in zip(self._string_names_, values):
             ptr = ctypes.cast(addr, PWCHAR)
-            ustr = getattr(self, "_{}".format(n))
+            ustr = getattr(self, f"_{n}")
             length = ustr.Length = len(v) * wchar_size
             full_length = length + wchar_size
             if (n == name and value is None) or (
@@ -398,13 +409,13 @@ class ContiguousUnicode(ctypes.Structure):
 
     @classmethod
     def from_address_copy(cls, address, size=None):
-        x = ctypes.Structure.__new__(cls)
+        x = ctypes.Structure.__new__(cls)  # pylint: disable=no-value-for-parameter
         if size is not None:
             ctypes.resize(x, size)
         ctypes.memmove(ctypes.byref(x), address, ctypes.sizeof(x))
         delta = ctypes.addressof(x) - address
         for n in cls._string_names_:
-            ustr = getattr(x, "_{}".format(n))
+            ustr = getattr(x, f"_{n}")
             addr = ctypes.c_void_p.from_buffer(ustr.Buffer)
             if addr:
                 addr.value += delta
@@ -1107,7 +1118,7 @@ def grant_winsta_and_desktop(th):
     """
     current_sid = win32security.GetTokenInformation(th, win32security.TokenUser)[0]
     # Add permissions for the sid to the current windows station and thread id.
-    # This prevents windows error 0xC0000142.
+    # This prevents Windows error 0xC0000142.
     winsta = win32process.GetProcessWindowStation()
     set_user_perm(winsta, WINSTA_ALL, current_sid)
     desktop = win32service.GetThreadDesktop(win32api.GetCurrentThreadId())
@@ -1154,10 +1165,7 @@ def CreateProcessWithTokenW(
         ctypes.byref(process_info),
     )
     if ret == 0:
-        winerr = win32api.GetLastError()
-        exc = OSError(win32api.FormatMessage(winerr))
-        exc.winerror = winerr
-        raise exc
+        raise ctypes.WinError(ctypes.get_last_error())
     return process_info
 
 
@@ -1328,3 +1336,99 @@ def CreateProcessWithLogonW(
         ctypes.byref(process_info),
     )
     return process_info
+
+
+def _cmd_exe_cswitch_quoted_argument(payload: str) -> str:
+    """
+    Wrap ``payload`` for use as the argument to ``cmd.exe``'s ``/c`` switch.
+
+    Doubles embedded double quotes per ``cmd.exe`` parsing rules so the entire
+    payload is one argument when passed through ``CreateProcess`` /
+    ``CreateProcessWithTokenW`` command lines (so ``&``, ``|``, etc. are not
+    parsed at the outer process level).
+    """
+    return '"' + payload.replace('"', '""') + '"'
+
+
+def prepend_cmd(
+    win_shell,
+    cmd,
+    quote_c_payload=True,
+    msvc_quote_bare_path_string=False,
+):
+    """
+    Prep cmd when shell is cmd.exe. Always use a command string instead of a
+    list to satisfy both :class:`subprocess.Popen` and CreateProcess.
+
+    Args:
+        win_shell: Path to ``cmd.exe``.
+        cmd: String or argv sequence. Lists/tuples are passed through
+            ``list2cmdline`` first.
+        quote_c_payload: If ``True`` (default), wrap the entire user payload
+            in double quotes after ``/c`` and double internal double quotes so
+            the whole command is a single argument (required for
+            ``CreateProcessWithTokenW`` and :mod:`win_runas <salt.utils.win_runas>`).
+            If ``False``, use ``cmd /c`` without the big ``_cmd_exe_cswitch`` wrap
+            (so batch ``%1``/``%2`` match the non-runas path). A *string* without
+            ``&``/``|`` is then either passed raw (so ``echo "a b"`` works with
+            ``python_shell``) or as one :func:`subprocess.list2cmdline` token
+            (see *msvc_quote_bare_path_string*). Compound *strings* use the
+            raw tail so ``cmd`` still parses ``&`` and ``|``. List/tuple payloads
+            use ``list2cmdline`` as above.
+        msvc_quote_bare_path_string: When ``quote_c_payload`` is false and
+            *cmd* is a string, if true and the payload has no ``&``/``|``,
+            wrap the entire string with ``list2cmdline`` so a *single* path
+            with spaces is one token (``runas`` and no ``python_shell``). If
+            false (default), use the string as the raw ``/c`` tail (e.g.
+            ``python_shell`` and ``echo`` with quotes).
+
+    Returns:
+        A full command line string starting with ``win_shell``.
+    """
+    if isinstance(cmd, (list, tuple)):
+        args = subprocess.list2cmdline(cmd)
+    else:
+        # cmd.exe treats newlines as command separators even within a command-line
+        # string, so a multiline command passed via the command line only executes
+        # its first line. Collapse CRLF/LF to a single space so the entire command
+        # reaches the target process (e.g. a PowerShell -Command script block).
+        args = cmd.replace("\r\n", " ").replace("\n", " ")
+        # When PowerShell's stdout is piped (non-interactive), the -Command { block }
+        # form evaluates the script block as an expression and returns the ScriptBlock
+        # object instead of executing it. Converting to -EncodedCommand avoids this
+        # and also sidesteps cmd.exe quoting issues with double quotes inside the block.
+        args = _maybe_encode_powershell_block(args)
+    if not quote_c_payload:
+        if isinstance(cmd, (list, tuple)):
+            c_payload = args
+        else:
+            if ("&" in args) or ("|" in args):
+                c_payload = args
+            elif msvc_quote_bare_path_string:
+                c_payload = subprocess.list2cmdline([args])
+            else:
+                c_payload = args
+        return f"{win_shell} /c {c_payload}"
+    return f"{win_shell} /c {_cmd_exe_cswitch_quoted_argument(args)}"
+
+
+# Matches: powershell[-Command { block }] when the block is the last argument.
+# The executable name check prevents false positives on non-PowerShell commands.
+_PS_BLOCK_RE = re.compile(r"-Command\s+\{(.*)\}\s*$", re.IGNORECASE | re.DOTALL)
+_PS_EXE_RE = re.compile(r"(?:^|[\\/])(?:powershell|pwsh)(?:\.exe)?\b", re.IGNORECASE)
+
+
+def _maybe_encode_powershell_block(cmd):
+    """
+    If *cmd* is a PowerShell invocation that uses ``-Command { block }`` syntax,
+    replace it with ``-EncodedCommand <base64>`` so the script block is executed
+    rather than returned as a ScriptBlock object when stdout is not a console.
+    """
+    if not _PS_EXE_RE.search(cmd):
+        return cmd
+    m = _PS_BLOCK_RE.search(cmd)
+    if not m:
+        return cmd
+    content = m.group(1)
+    encoded = base64.b64encode(content.encode("utf-16-le")).decode("ascii")
+    return cmd[: m.start()] + f"-EncodedCommand {encoded}"

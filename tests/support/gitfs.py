@@ -5,7 +5,9 @@ Base classes for gitfs/git_pillar integration tests
 import errno
 import logging
 import os
+import pathlib
 import shutil
+import subprocess
 import tempfile
 import textwrap
 
@@ -32,6 +34,32 @@ log = logging.getLogger(__name__)
 
 USERNAME = "gitpillaruser"
 PASSWORD = "saltrules"
+
+# Path to the static SSH host key the git_pillar.ssh.server state copies into
+# the running sshd's config_dir. We read its public-key blob directly into
+# the known_hosts entry so set_known_host doesn't have to run ``ssh-keyscan``
+# against the test sshd. ``ssh-keyscan -t ssh-rsa`` fails on FIPS-aware
+# OpenSSH builds because the legacy ssh-rsa (SHA1) signing algorithm is
+# excluded from HostKeyAlgorithms and the handshake cannot complete.
+SSHD_HOST_PUBKEY_FILE = (
+    pathlib.Path(RUNTIME_VARS.FILES)
+    / "file"
+    / "base"
+    / "git_pillar"
+    / "ssh"
+    / "server"
+    / "files"
+    / "ssh_host_rsa_key.pub"
+)
+
+
+def _sshd_host_pubkey_blob():
+    """
+    Return the base64-encoded public-key blob from ssh_host_rsa_key.pub.
+    """
+    with salt.utils.files.fopen(SSHD_HOST_PUBKEY_FILE, encoding="utf-8") as fp:
+        return fp.read().strip().split()[1]
+
 
 _OPTS = freeze(
     {
@@ -64,6 +92,8 @@ _OPTS = freeze(
             "+refs/tags/*:refs/tags/*",
         ],
         "git_pillar_includes": True,
+        "fileserver_backend": "roots",
+        "cachedir": "",
     }
 )
 
@@ -124,15 +154,21 @@ class Sshd(_Sshd):
             pytest.fail("Failed to apply the 'git_pillar.ssh' state")
 
     def set_known_host(self, salt_call_cli, username):
+        # Pass ``key`` directly rather than letting set_known_host run
+        # ``ssh-keyscan -t ssh-rsa``. On FIPS-aware OpenSSH builds the legacy
+        # ssh-rsa (SHA1) signing algorithm is dropped from HostKeyAlgorithms
+        # and the keyscan handshake cannot complete -- the static RSA host
+        # key the test serves is fine, only the signature negotiation fails.
+        # Feeding the public key blob directly skips ssh-keyscan entirely.
         ret = salt_call_cli.run(
             "ssh.set_known_host",
             user=username,
             hostname="127.0.0.1",
             port=self.listen_port,
             enc="ssh-rsa",
-            fingerprint="fd:6f:7f:5d:06:6b:f2:06:0d:26:93:9e:5a:b5:19:46",
+            key=_sshd_host_pubkey_blob(),
             hash_known_hosts=False,
-            fingerprint_hash_type="md5",
+            fingerprint_hash_type="sha256",
         )
         if ret.returncode != 0:
             pytest.fail("Failed to run 'ssh.set_known_host'")
@@ -323,9 +359,9 @@ class GitPillarTestBase(GitTestBase, LoaderModuleMockMixin):
     def make_repo(self, root_dir, user=None):
         log.info("Creating test Git repo....")
         self.bare_repo = os.path.join(root_dir, "repo.git")
-        self.bare_repo_backup = "{}.backup".format(self.bare_repo)
+        self.bare_repo_backup = f"{self.bare_repo}.backup"
         self.admin_repo = os.path.join(root_dir, "admin")
-        self.admin_repo_backup = "{}.backup".format(self.admin_repo)
+        self.admin_repo_backup = f"{self.admin_repo}.backup"
 
         for dirname in (self.bare_repo, self.admin_repo):
             shutil.rmtree(dirname, ignore_errors=True)
@@ -489,9 +525,9 @@ class GitPillarTestBase(GitTestBase, LoaderModuleMockMixin):
     def make_extra_repo(self, root_dir, user=None):
         log.info("Creating extra test Git repo....")
         self.bare_extra_repo = os.path.join(root_dir, "extra_repo.git")
-        self.bare_extra_repo_backup = "{}.backup".format(self.bare_extra_repo)
+        self.bare_extra_repo_backup = f"{self.bare_extra_repo}.backup"
         self.admin_extra_repo = os.path.join(root_dir, "admin_extra")
-        self.admin_extra_repo_backup = "{}.backup".format(self.admin_extra_repo)
+        self.admin_extra_repo_backup = f"{self.admin_extra_repo}.backup"
 
         for dirname in (self.bare_extra_repo, self.admin_extra_repo):
             shutil.rmtree(dirname, ignore_errors=True)
@@ -586,13 +622,19 @@ class GitPillarSSHTestBase(GitPillarTestBase):
         """
         log.info("%s.setUp() started...", self.__class__.__name__)
         super().setUp()
-        root_dir = os.path.expanduser("~{}".format(self.username))
+        root_dir = os.path.expanduser(f"~{self.username}")
         if root_dir.startswith("~"):
             raise AssertionError(
-                "Unable to resolve homedir for user '{}'".format(self.username)
+                f"Unable to resolve homedir for user '{self.username}'"
             )
         self.make_repo(root_dir, user=self.username)
         self.make_extra_repo(root_dir, user=self.username)
+        # Force git repo ownership to prevent "fatal: detected dubious
+        # ownership in repository" errors.
+        subprocess.run(
+            ["chown", "-R", f"{self.username}:users", f"/home/{self.username}"],
+            check=True,
+        )
         log.info("%s.setUp() complete.", self.__class__.__name__)
 
     def get_pillar(self, ext_pillar_conf):

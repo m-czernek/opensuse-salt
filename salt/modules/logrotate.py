@@ -13,6 +13,19 @@ from salt.exceptions import SaltInvocationError
 _LOG = logging.getLogger(__name__)
 _DEFAULT_CONF = "/etc/logrotate.conf"
 
+# Directives that introduce a multi-line shell script body terminated by
+# ``endscript``. The body must be kept opaque (not parsed as key/value
+# settings) so that lines like ``invoke-rc.d syslog-ng reload`` or repeated
+# ``endscript`` terminators do not collapse into bogus dict keys. See
+# the logrotate(8) manpage for the full list of script directives.
+_SCRIPT_DIRECTIVES = (
+    "firstaction",
+    "lastaction",
+    "prerotate",
+    "postrotate",
+    "preremove",
+)
+
 
 # Define a function alias in order not to shadow built-in's
 __func_alias__ = {"set_": "set"}
@@ -61,10 +74,31 @@ def _parse_conf(conf_file=_DEFAULT_CONF):
     multi_names = []
     multi = {}
     prev_comps = None
+    # When inside a ``prerotate``/``postrotate``/... block, collect the raw
+    # script body lines here and stash them on the enclosing dict under the
+    # script directive name once ``endscript`` is seen.
+    script_directive = None
+    script_body = []
 
     with salt.utils.files.fopen(conf_file, "r") as ifile:
         for line in ifile:
-            line = salt.utils.stringutils.to_unicode(line).strip()
+            line = salt.utils.stringutils.to_unicode(line).rstrip("\r\n")
+            stripped = line.strip()
+
+            if script_directive is not None:
+                # Inside a script block: lines are opaque shell content until
+                # the ``endscript`` terminator. Do not strip comments or skip
+                # blank lines — they are part of the script.
+                if stripped == "endscript":
+                    target = multi if mode == "multi" else ret
+                    target[script_directive] = list(script_body)
+                    script_directive = None
+                    script_body = []
+                    continue
+                script_body.append(stripped)
+                continue
+
+            line = stripped
             if not line:
                 continue
             if line.startswith("#"):
@@ -105,6 +139,15 @@ def _parse_conf(conf_file=_DEFAULT_CONF):
                     for file_key in include_conf:
                         ret[file_key] = include_conf[file_key]
                         ret["include files"][include].append(file_key)
+
+            # Recognize the start of a script block. The body that follows
+            # (up to ``endscript``) is kept opaque so embedded shell commands
+            # don't get parsed as settings and so a second script block's
+            # ``endscript`` is not lost to a duplicate-key collision.
+            if comps[0] in _SCRIPT_DIRECTIVES and len(comps) == 1:
+                script_directive = comps[0]
+                script_body = []
+                continue
 
             prev_comps = comps
             if len(comps) > 2:
@@ -211,7 +254,7 @@ def set_(key, value, setting=None, conf_file=_DEFAULT_CONF):
         "flags": 8,
         "backup": False,
         "path": conf_file,
-        "pattern": "^{}.*".format(key),
+        "pattern": f"^{key}.*",
         "show_changes": False,
     }
 
@@ -232,7 +275,7 @@ def set_(key, value, setting=None, conf_file=_DEFAULT_CONF):
         if value is True:
             new_line = key
         elif value:
-            new_line = "{} {}".format(key, value)
+            new_line = f"{key} {value}"
 
         kwargs.update({"prepend_if_not_found": True})
     else:
@@ -259,7 +302,7 @@ def set_(key, value, setting=None, conf_file=_DEFAULT_CONF):
 
         kwargs.update(
             {
-                "pattern": "^{0}.*?{{.*?}}".format(key),
+                "pattern": f"^{key}.*?{{.*?}}",
                 "flags": 24,
                 "append_if_not_found": True,
             }
@@ -277,7 +320,20 @@ def _dict_to_stanza(key, stanza):
     """
     ret = ""
     for skey in stanza:
-        if stanza[skey] is True:
+        value = stanza[skey]
+        # Script directives (``prerotate``/``postrotate``/...) are stored as
+        # a list of opaque body lines; emit them as a script block followed
+        # by an ``endscript`` terminator. Without this, a stanza containing
+        # both ``prerotate`` and ``postrotate`` would lose the second
+        # ``endscript`` on round-trip — see issue #68293.
+        if skey in _SCRIPT_DIRECTIVES and isinstance(value, list):
+            ret += f"    {skey}\n"
+            for body_line in value:
+                ret += f"        {body_line}\n"
+            ret += "    endscript\n"
+            continue
+        if value is True:
+            value = ""
             stanza[skey] = ""
-        ret += "    {} {}\n".format(skey, stanza[skey])
-    return "{0} {{\n{1}}}".format(key, ret)
+        ret += f"    {skey} {value}\n"
+    return f"{key} {{\n{ret}}}"

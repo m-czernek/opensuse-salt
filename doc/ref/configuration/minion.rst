@@ -1199,8 +1199,8 @@ seconds each iteration.
 
 Default: ``False``
 
-If the master rejects the minion's public key, retry instead of exiting.
-Rejected keys will be handled the same as waiting on acceptance.
+If the master denies or rejects the minion's public key, retry instead of
+exiting.  These keys will be handled the same as waiting on acceptance.
 
 .. code-block:: yaml
 
@@ -1306,6 +1306,36 @@ restart.
 .. code-block:: yaml
 
     auth_safemode: False
+
+.. conf_minion:: request_channel_timeout
+
+``request_channel_timeout``
+---------------------------
+
+.. versionadded:: 3006.2
+
+Default: ``30``
+
+The default timeout timeout for request channel requests. This setting can be used to tune minions to better handle long running pillar and file client requests.
+
+.. code-block:: yaml
+
+    request_channel_timeout: 30
+
+``request_channel_tries``
+-------------------------
+
+.. versionadded:: 3006.2
+
+Default: ``3``
+
+The default number of times the minion will try request channel requests. This
+setting can be used to tune minions to better handle long running pillar and
+file client requests by retrying them after a timeout happens.
+
+.. code-block:: yaml
+
+    request_channel_tries: 3
 
 .. conf_minion:: ping_interval
 
@@ -1776,6 +1806,33 @@ the priority of optimization level(s) Salt's module loader should prefer.
       - 2
       - 0
       - 1
+
+.. conf_minion:: lazy_loader_strict_matching
+
+``lazy_loader_strict_matching``
+-------------------------------
+
+.. versionadded:: 3006.19
+
+Default: ``False``
+
+.. versionchanged:: 3008.0
+    The default will change to ``True`` in version 3008.0.
+
+Reduces memory usage by skipping expensive module file searches.
+
+When disabled (default), the loader searches for modules in three stages:
+
+1. Exact filename match (e.g., ``test.py`` for module ``test``)
+2. Partial filename matches (files containing "test" in the name)
+3. Expensive search through every module file
+
+When enabled, stage 3 is skipped. Virtual module names (``__virtualname__``)
+continue to work if stages 1 or 2 find the module file.
+
+.. code-block:: yaml
+
+    lazy_loader_strict_matching: True
 
 Minion Execution Module Management
 ==================================
@@ -2286,8 +2343,12 @@ Default: ``False``
 
 Instead of failing immediately when another state run is in progress, a value
 of ``True`` will queue the new state run to begin running once the other has
-finished. This option starts a new thread for each queued state run, so use
-this option sparingly.
+finished.
+
+The queue is implemented as a disk-based FIFO queue, minimizing memory usage
+regardless of queue depth. Jobs in the state queue are processed by a background
+thread and will bypass :conf_minion:`process_count_max` limits when they are
+ready to execute, ensuring they are not starved by other workloads.
 
 .. code-block:: yaml
 
@@ -2440,10 +2501,7 @@ enabled and can be disabled by changing this value to ``False``.
     ``saltenv`` will take its value. If both are used, ``environment`` will be
     ignored and ``saltenv`` will be used.
 
-Normally the minion is not isolated to any single environment on the master
-when running states, but the environment can be isolated on the minion side
-by statically setting it. Remember that the recommended way to manage
-environments is to isolate via the top file.
+The default fileserver environment to use when copying files and applying states.
 
 .. code-block:: yaml
 
@@ -3144,6 +3202,28 @@ constant names without ssl module prefix: ``CERT_REQUIRED`` or ``PROTOCOL_SSLv23
         certfile: <path_to_certfile>
         ssl_version: PROTOCOL_TLSv1_2
 
+``encryption_algorithm``
+------------------------
+
+.. versionadded:: 3006.9
+
+Default: OAEP-SHA1
+
+The RSA encryption algorithm used by this minion when connecting to the
+master's request channel. Valid values are ``OAEP-SHA1`` and ``OAEP-SHA224``
+
+
+``signing_algorithm``
+------------------------
+
+.. versionadded:: 3006.9
+
+Default: PKCS1v15-SHA1
+
+The RSA signing algorithm used by this minion when connecting to the
+master's request channel. Valid values are ``PKCS1v15-SHA1`` and
+``PKCS1v15-SHA224``
+
 
 Reactor Settings
 ================
@@ -3233,8 +3313,14 @@ Default: ``-1``
 
 Limit the maximum amount of processes or threads created by ``salt-minion``.
 This is useful to avoid resource exhaustion in case the minion receives more
-publications than it is able to handle, as it limits the number of spawned
-processes or threads. ``-1`` is the default and disables the limit.
+publications than it is able to handle.
+
+When this limit is reached, new jobs are queued to a disk-based FIFO queue and
+processed as slots become available. ``-1`` is the default and disables the limit.
+
+.. note::
+    State runs managed by :conf_minion:`state_queue` will bypass this limit
+    once they are released from the state queue.
 
 .. code-block:: yaml
 
@@ -3283,6 +3369,12 @@ The level of messages to send to the console. See also :conf_log:`log_level`.
 
     log_level: warning
 
+Any log level below the `info` level is INSECURE and may log sensitive data. This currently includes:
+#. profile
+#. debug
+#. trace
+#. garbage
+#. all
 
 .. conf_minion:: log_level_logfile
 
@@ -3299,6 +3391,12 @@ it will inherit the level set by :conf_log:`log_level` option.
 
     log_level_logfile: warning
 
+Any log level below the `info` level is INSECURE and may log sensitive data. This currently includes:
+#. profile
+#. debug
+#. trace
+#. garbage
+#. all
 
 .. conf_minion:: log_datefmt
 

@@ -18,7 +18,6 @@ from tests.support.unit import TestCase
 
 # pylint: disable=import-error,no-name-in-module
 try:
-    import boto
     import boto3
     from botocore import __version__ as found_botocore_version
     from botocore.exceptions import ClientError
@@ -26,6 +25,10 @@ try:
     HAS_BOTO = True
 except ImportError:
     HAS_BOTO = False
+
+pytestmark = [
+    pytest.mark.skip_on_fips_enabled_platform,
+]
 
 # pylint: enable=import-error,no-name-in-module
 
@@ -225,7 +228,7 @@ class BotoLambdaFunctionTestCase(BotoLambdaTestCaseBase, BotoLambdaTestCaseMixin
                     Role="myrole",
                     Handler="file.method",
                     ZipFile=zipfile,
-                    **conn_parameters
+                    **conn_parameters,
                 )
 
         self.assertTrue(lambda_creation_result["created"])
@@ -248,7 +251,7 @@ class BotoLambdaFunctionTestCase(BotoLambdaTestCaseBase, BotoLambdaTestCaseMixin
                 Handler="file.method",
                 S3Bucket="bucket",
                 S3Key="key",
-                **conn_parameters
+                **conn_parameters,
             )
 
         self.assertTrue(lambda_creation_result["created"])
@@ -273,7 +276,7 @@ class BotoLambdaFunctionTestCase(BotoLambdaTestCaseBase, BotoLambdaTestCaseMixin
                     Runtime="python2.7",
                     Role="myrole",
                     Handler="file.method",
-                    **conn_parameters
+                    **conn_parameters,
                 )
 
     def test_that_when_creating_a_function_with_zipfile_and_s3_raises_a_salt_invocation_error(
@@ -300,7 +303,7 @@ class BotoLambdaFunctionTestCase(BotoLambdaTestCaseBase, BotoLambdaTestCaseMixin
                         ZipFile=zipfile,
                         S3Bucket="bucket",
                         S3Key="key",
-                        **conn_parameters
+                        **conn_parameters,
                     )
 
     def test_that_when_creating_a_function_fails_the_create_function_method_returns_error(
@@ -323,7 +326,7 @@ class BotoLambdaFunctionTestCase(BotoLambdaTestCaseBase, BotoLambdaTestCaseMixin
                     Role="myrole",
                     Handler="file.method",
                     ZipFile=zipfile,
-                    **conn_parameters
+                    **conn_parameters,
                 )
         self.assertEqual(
             lambda_creation_result.get("error", {}).get("message"),
@@ -425,7 +428,7 @@ class BotoLambdaFunctionTestCase(BotoLambdaTestCaseBase, BotoLambdaTestCaseMixin
             result = boto_lambda.update_function_config(
                 FunctionName=function_ret["FunctionName"],
                 Role="myrole",
-                **conn_parameters
+                **conn_parameters,
             )
 
         self.assertTrue(result["updated"])
@@ -466,7 +469,7 @@ class BotoLambdaFunctionTestCase(BotoLambdaTestCaseBase, BotoLambdaTestCaseMixin
                 result = boto_lambda.update_function_code(
                     FunctionName=function_ret["FunctionName"],
                     ZipFile=zipfile,
-                    **conn_parameters
+                    **conn_parameters,
                 )
 
         self.assertTrue(result["updated"])
@@ -486,7 +489,7 @@ class BotoLambdaFunctionTestCase(BotoLambdaTestCaseBase, BotoLambdaTestCaseMixin
                 FunctionName="testfunction",
                 S3Bucket="bucket",
                 S3Key="key",
-                **conn_parameters
+                **conn_parameters,
             )
 
         self.assertTrue(result["updated"])
@@ -527,7 +530,7 @@ class BotoLambdaFunctionTestCase(BotoLambdaTestCaseBase, BotoLambdaTestCaseMixin
                 FunctionName="testfunction",
                 S3Bucket="bucket",
                 S3Key="key",
-                **conn_parameters
+                **conn_parameters,
             )
         self.assertEqual(
             result.get("error", {}).get("message"),
@@ -614,7 +617,7 @@ class BotoLambdaAliasTestCase(BotoLambdaTestCaseBase, BotoLambdaTestCaseMixin):
             FunctionName="testfunction",
             Name=alias_ret["Name"],
             FunctionVersion=alias_ret["FunctionVersion"],
-            **conn_parameters
+            **conn_parameters,
         )
 
         self.assertTrue(result["created"])
@@ -630,7 +633,7 @@ class BotoLambdaAliasTestCase(BotoLambdaTestCaseBase, BotoLambdaTestCaseMixin):
             FunctionName="testfunction",
             Name=alias_ret["Name"],
             FunctionVersion=alias_ret["FunctionVersion"],
-            **conn_parameters
+            **conn_parameters,
         )
         self.assertEqual(
             result.get("error", {}).get("message"), error_message.format("create_alias")
@@ -748,7 +751,7 @@ class BotoLambdaAliasTestCase(BotoLambdaTestCaseBase, BotoLambdaTestCaseMixin):
             FunctionName="testfunctoin",
             Name=alias_ret["Name"],
             Description=alias_ret["Description"],
-            **conn_parameters
+            **conn_parameters,
         )
 
         self.assertTrue(result["updated"])
@@ -793,7 +796,7 @@ class BotoLambdaEventSourceMappingTestCase(
             EventSourceArn=event_source_mapping_ret["EventSourceArn"],
             FunctionName=event_source_mapping_ret["FunctionArn"],
             StartingPosition="LATEST",
-            **conn_parameters
+            **conn_parameters,
         )
 
         self.assertTrue(result["created"])
@@ -811,7 +814,7 @@ class BotoLambdaEventSourceMappingTestCase(
             EventSourceArn=event_source_mapping_ret["EventSourceArn"],
             FunctionName=event_source_mapping_ret["FunctionArn"],
             StartingPosition="LATEST",
-            **conn_parameters
+            **conn_parameters,
         )
         self.assertEqual(
             result.get("error", {}).get("message"),
@@ -830,7 +833,7 @@ class BotoLambdaEventSourceMappingTestCase(
         result = boto_lambda.get_event_source_mapping_ids(
             EventSourceArn=event_source_mapping_ret["EventSourceArn"],
             FunctionName=event_source_mapping_ret["FunctionArn"],
-            **conn_parameters
+            **conn_parameters,
         )
 
         self.assertTrue(result)
@@ -845,7 +848,7 @@ class BotoLambdaEventSourceMappingTestCase(
         result = boto_lambda.get_event_source_mapping_ids(
             EventSourceArn=event_source_mapping_ret["EventSourceArn"],
             FunctionName=event_source_mapping_ret["FunctionArn"],
-            **conn_parameters
+            **conn_parameters,
         )
         self.assertFalse(result)
 
@@ -861,7 +864,7 @@ class BotoLambdaEventSourceMappingTestCase(
         result = boto_lambda.get_event_source_mapping_ids(
             EventSourceArn=event_source_mapping_ret["EventSourceArn"],
             FunctionName=event_source_mapping_ret["FunctionArn"],
-            **conn_parameters
+            **conn_parameters,
         )
         self.assertEqual(
             result.get("error", {}).get("message"),
@@ -894,7 +897,7 @@ class BotoLambdaEventSourceMappingTestCase(
         result = boto_lambda.delete_event_source_mapping(
             EventSourceArn=event_source_mapping_ret["EventSourceArn"],
             FunctionName=event_source_mapping_ret["FunctionArn"],
-            **conn_parameters
+            **conn_parameters,
         )
         self.assertTrue(result["deleted"])
 
@@ -1016,7 +1019,7 @@ class BotoLambdaEventSourceMappingTestCase(
         result = boto_lambda.update_event_source_mapping(
             UUID=event_source_mapping_ret["UUID"],
             FunctionName=event_source_mapping_ret["FunctionArn"],
-            **conn_parameters
+            **conn_parameters,
         )
 
         self.assertTrue(result["updated"])
@@ -1033,7 +1036,7 @@ class BotoLambdaEventSourceMappingTestCase(
         result = boto_lambda.update_event_source_mapping(
             UUID=event_source_mapping_ret["UUID"],
             FunctionName=event_source_mapping_ret["FunctionArn"],
-            **conn_parameters
+            **conn_parameters,
         )
         self.assertEqual(
             result.get("error", {}).get("message"),

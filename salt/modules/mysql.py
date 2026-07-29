@@ -28,7 +28,6 @@ Module to provide MySQL compatibility to salt.
     Additionally, it is now possible to setup a user with no password.
 """
 
-
 import copy
 import hashlib
 import logging
@@ -264,7 +263,7 @@ def __virtual__():
 
 def __mysql_hash_password(password):
     _password = hashlib.sha1(password.encode()).digest()
-    _password = "*{}".format(hashlib.sha1(_password).hexdigest().upper())
+    _password = f"*{hashlib.sha1(_password).hexdigest().upper()}"
     return _password
 
 
@@ -276,7 +275,7 @@ def __check_table(name, table, **connection_args):
     s_name = quote_identifier(name)
     s_table = quote_identifier(table)
     # identifiers cannot be used as values
-    qry = "CHECK TABLE {}.{}".format(s_name, s_table)
+    qry = f"CHECK TABLE {s_name}.{s_table}"
     _execute(cur, qry)
     results = cur.fetchall()
     log.debug(results)
@@ -291,7 +290,7 @@ def __repair_table(name, table, **connection_args):
     s_name = quote_identifier(name)
     s_table = quote_identifier(table)
     # identifiers cannot be used as values
-    qry = "REPAIR TABLE {}.{}".format(s_name, s_table)
+    qry = f"REPAIR TABLE {s_name}.{s_table}"
     _execute(cur, qry)
     results = cur.fetchall()
     log.debug(results)
@@ -306,7 +305,7 @@ def __optimize_table(name, table, **connection_args):
     s_name = quote_identifier(name)
     s_table = quote_identifier(table)
     # identifiers cannot be used as values
-    qry = "OPTIMIZE TABLE {}.{}".format(s_name, s_table)
+    qry = f"OPTIMIZE TABLE {s_name}.{s_table}"
     _execute(cur, qry)
     results = cur.fetchall()
     log.debug(results)
@@ -387,7 +386,7 @@ def _connect(**kwargs):
                     name = name[len(prefix) :]
                 except IndexError:
                     return
-            val = __salt__["config.option"]("mysql.{}".format(name), None)
+            val = __salt__["config.option"](f"mysql.{name}", None)
             if val is not None:
                 connargs[key] = val
 
@@ -582,7 +581,7 @@ def _grant_to_tokens(grant):
                     if not column:
                         current_grant = token
                     else:
-                        token = "{}.{}".format(current_grant, token)
+                        token = f"{current_grant}.{token}"
                     grant_tokens.append(token)
             else:  # This is a multi-word, ala LOCK TABLES
                 multiword_statement.append(token)
@@ -1250,7 +1249,7 @@ def db_tables(name, **connection_args):
     cur = dbc.cursor()
     s_name = quote_identifier(name)
     # identifiers cannot be used as values
-    qry = "SHOW TABLES IN {}".format(s_name)
+    qry = f"SHOW TABLES IN {s_name}"
     try:
         _execute(cur, qry)
     except MySQLdb.OperationalError as exc:
@@ -1329,7 +1328,7 @@ def db_create(name, character_set=None, collate=None, **connection_args):
     cur = dbc.cursor()
     s_name = quote_identifier(name)
     # identifiers cannot be used as values
-    qry = "CREATE DATABASE IF NOT EXISTS {}".format(s_name)
+    qry = f"CREATE DATABASE IF NOT EXISTS {s_name}"
     args = {}
     if character_set is not None:
         qry += " CHARACTER SET %(character_set)s"
@@ -1376,7 +1375,7 @@ def db_remove(name, **connection_args):
     cur = dbc.cursor()
     s_name = quote_identifier(name)
     # identifiers cannot be used as values
-    qry = "DROP DATABASE {};".format(s_name)
+    qry = f"DROP DATABASE {s_name};"
     try:
         _execute(cur, qry)
     except MySQLdb.OperationalError as exc:
@@ -1430,7 +1429,7 @@ def _mysql_user_exists(
     unix_socket=False,
     password_column=None,
     auth_plugin="mysql_native_password",
-    **connection_args
+    **connection_args,
 ):
 
     server_version = salt.utils.data.decode(version(**connection_args))
@@ -1475,7 +1474,7 @@ def _mariadb_user_exists(
     unix_socket=False,
     password_column=None,
     auth_plugin="mysql_native_password",
-    **connection_args
+    **connection_args,
 ):
 
     qry = "SELECT User,Host FROM mysql.user WHERE User = %(user)s AND Host = %(host)s"
@@ -1507,7 +1506,7 @@ def user_exists(
     passwordless=False,
     unix_socket=False,
     password_column=None,
-    **connection_args
+    **connection_args,
 ):
     """
     Checks if a user exists on the MySQL server. A login can be checked to see
@@ -1552,7 +1551,7 @@ def user_exists(
     if (
         dbc is None
         and __context__["mysql.error"].startswith(
-            "MySQL Error 1045: Access denied for user '{}'@".format(user)
+            f"MySQL Error 1045: Access denied for user '{user}'@"
         )
         and password
     ):
@@ -1579,7 +1578,7 @@ def user_exists(
             unix_socket,
             password_column=password_column,
             auth_plugin=auth_plugin,
-            **connection_args
+            **connection_args,
         )
     else:
         qry, args = _mysql_user_exists(
@@ -1591,7 +1590,7 @@ def user_exists(
             unix_socket,
             password_column=password_column,
             auth_plugin=auth_plugin,
-            **connection_args
+            **connection_args,
         )
 
     try:
@@ -1646,7 +1645,7 @@ def _mysql_user_create(
     unix_socket=False,
     password_column=None,
     auth_plugin="mysql_native_password",
-    **connection_args
+    **connection_args,
 ):
 
     server_version = salt.utils.data.decode(version(**connection_args))
@@ -1709,7 +1708,7 @@ def _mariadb_user_create(
     unix_socket=False,
     password_column=None,
     auth_plugin="mysql_native_password",
-    **connection_args
+    **connection_args,
 ):
 
     qry = "CREATE USER %(user)s@%(host)s"
@@ -1755,7 +1754,7 @@ def user_create(
     unix_socket=False,
     password_column=None,
     auth_plugin="mysql_native_password",
-    **connection_args
+    **connection_args,
 ):
     """
     Creates a MySQL user
@@ -1845,7 +1844,7 @@ def user_create(
             unix_socket,
             password_column=password_column,
             auth_plugin=auth_plugin,
-            **connection_args
+            **connection_args,
         )
     else:
         qry, args = _mysql_user_create(
@@ -1857,7 +1856,7 @@ def user_create(
             unix_socket,
             password_column=password_column,
             auth_plugin=auth_plugin,
-            **connection_args
+            **connection_args,
         )
 
     if isinstance(qry, bool):
@@ -1877,9 +1876,9 @@ def user_create(
         password,
         password_hash,
         password_column=password_column,
-        **connection_args
+        **connection_args,
     ):
-        msg = "User '{}'@'{}' has been created".format(user, host)
+        msg = f"User '{user}'@'{host}' has been created"
         if not any((password, password_hash)):
             msg += " with passwordless login"
         log.info(msg)
@@ -1898,7 +1897,7 @@ def _mysql_user_chpass(
     unix_socket=None,
     password_column=None,
     auth_plugin="mysql_native_password",
-    **connection_args
+    **connection_args,
 ):
     server_version = salt.utils.data.decode(version(**connection_args))
     compare_version = "8.0.11"
@@ -1984,7 +1983,7 @@ def _mariadb_user_chpass(
     unix_socket=None,
     password_column=None,
     auth_plugin="mysql_native_password",
-    **connection_args
+    **connection_args,
 ):
 
     server_version = salt.utils.data.decode(version(**connection_args))
@@ -2055,7 +2054,7 @@ def user_chpass(
     allow_passwordless=False,
     unix_socket=None,
     password_column=None,
-    **connection_args
+    **connection_args,
 ):
     """
     Change password for a MySQL user
@@ -2140,7 +2139,7 @@ def user_chpass(
             unix_socket,
             password_column=password_column,
             auth_plugin=auth_plugin,
-            **connection_args
+            **connection_args,
         )
     else:
         qry, args = _mysql_user_chpass(
@@ -2152,7 +2151,7 @@ def user_chpass(
             unix_socket,
             password_column=password_column,
             auth_plugin=auth_plugin,
-            **connection_args
+            **connection_args,
         )
 
     try:
@@ -2330,7 +2329,7 @@ def __grant_normalize(grant):
     exploded_grants = __grant_split(grant)
     for chkgrant, _ in exploded_grants:
         if chkgrant.strip().upper() not in __grants__:
-            raise Exception("Invalid grant : '{}'".format(chkgrant))
+            raise Exception(f"Invalid grant : '{chkgrant}'")
 
     return grant
 
@@ -2350,7 +2349,7 @@ def __ssl_option_sanitize(ssl_option):
         normal_key = key.strip().upper()
 
         if normal_key not in __ssl_options__:
-            raise Exception("Invalid SSL option : '{}'".format(key))
+            raise Exception(f"Invalid SSL option : '{key}'")
 
         if normal_key in __ssl_options_parameterized__:
             # SSL option parameters (cipher, issuer, subject) are pasted directly to SQL so
@@ -2394,11 +2393,11 @@ def __grant_generate(
         if dbc != "*":
             # _ and % are authorized on GRANT queries and should get escaped
             # on the db name, but only if not requesting a table level grant
-            dbc = quote_identifier(dbc, for_grants=(table == "*"))
+            dbc = quote_identifier(dbc, for_grants=table == "*")
         if table != "*":
             table = quote_identifier(table)
     # identifiers cannot be used as values, and same thing for grants
-    qry = "GRANT {} ON {}.{} TO %(user)s@%(host)s".format(grant, dbc, table)
+    qry = f"GRANT {grant} ON {dbc}.{table} TO %(user)s@%(host)s"
     args = {}
     args["user"] = user
     args["host"] = host
@@ -2445,10 +2444,46 @@ def user_grants(user, host="localhost", **connection_args):
     for grant in results:
         tmp = grant[0].split(" IDENTIFIED BY")[0]
         if "WITH GRANT OPTION" in grant[0] and "WITH GRANT OPTION" not in tmp:
-            tmp = "{} WITH GRANT OPTION".format(tmp)
+            tmp = f"{tmp} WITH GRANT OPTION"
         ret.append(tmp)
     log.debug(ret)
     return ret
+
+
+def _server_all_privileges(**connection_args):
+    """
+    Return the list of privileges the connected MySQL server reports via
+    ``SHOW PRIVILEGES`` (excluding ``USAGE``, ``GRANT OPTION``, and ``PROXY``,
+    which are not granted by ``GRANT ALL PRIVILEGES``).
+
+    Returns ``None`` if the query fails (no connection, no permission, etc.)
+    so callers can fall back to the hard-coded ``__all_privileges__`` list.
+    """
+    try:
+        dbc = _connect(**connection_args)
+    except Exception:  # pylint: disable=broad-except
+        return None
+    if dbc is None:
+        return None
+    cur = dbc.cursor()
+    try:
+        _execute(cur, "SHOW PRIVILEGES")
+    except Exception as exc:  # pylint: disable=broad-except
+        err = f"MySQL Error: {exc}"
+        __context__["mysql.error"] = err
+        log.error(err)
+        return None
+
+    excluded = {"USAGE", "GRANT OPTION", "PROXY"}
+    privileges = []
+    for row in salt.utils.data.decode(cur.fetchall()):
+        if not row:
+            continue
+        name = row[0].strip().upper()
+        if name in excluded:
+            continue
+        privileges.append(name)
+    return privileges or None
 
 
 def grant_exists(
@@ -2458,7 +2493,7 @@ def grant_exists(
     host="localhost",
     grant_option=False,
     escape=True,
-    **connection_args
+    **connection_args,
 ):
     """
     Checks to see if a grant exists in the database
@@ -2479,22 +2514,43 @@ def grant_exists(
         )
         log.error(err)
         return False
-    if "ALL" in grant.upper():
-        if (
-            salt.utils.versions.version_cmp(server_version, "8.0") >= 0
-            and "MariaDB" not in server_version
-            and database == "*.*"
-        ):
-            grant = ",".join([i for i in __all_privileges__])
-        else:
-            grant = "ALL PRIVILEGES"
+    # On MySQL 8.x the set of privileges granted by ``GRANT ALL PRIVILEGES``
+    # drifts between point releases (e.g. 8.4 removed ``SET_USER_ID`` and
+    # added many dynamic privileges such as ``ALLOW_NONEXISTENT_DEFINER``).
+    # Build the expected privilege set from the connected server's own
+    # ``SHOW PRIVILEGES`` output so the comparison stays correct across
+    # versions. Fall back to the static list if the query fails.
+    target_privs = None
+    if (
+        "ALL" in grant.upper()
+        and salt.utils.versions.version_cmp(server_version, "8.0") >= 0
+        and "MariaDB" not in server_version
+        and database == "*.*"
+    ):
+        server_privs = _server_all_privileges(**connection_args)
+        # Bypass ``__grant_generate`` (whose normalize step would reject any
+        # privilege not in the hard-coded ``__grants__`` list) by building
+        # the target token set directly from the server's privilege list.
+        target_privs = list(server_privs or __all_privileges__)
+    elif "ALL" in grant.upper():
+        grant = "ALL PRIVILEGES"
 
-    try:
-        target = __grant_generate(grant, database, user, host, grant_option, escape)
-    except Exception as exc:  # pylint: disable=broad-except
-        log.error("Error during grant generation.")
-        log.error(exc)
-        return False
+    if target_privs is None:
+        try:
+            target = __grant_generate(grant, database, user, host, grant_option, escape)
+        except Exception as exc:  # pylint: disable=broad-except
+            log.error("Error during grant generation.")
+            log.error(exc)
+            return False
+        target_tokens = _grant_to_tokens(target)
+    else:
+        target = None
+        target_tokens = {
+            "user": user,
+            "host": host,
+            "grant": target_privs,
+            "database": database,
+        }
 
     grants = user_grants(user, host, **connection_args)
 
@@ -2522,7 +2578,6 @@ def grant_exists(
         else:
             _grants[grant_token["database"]]["grant"].extend(grant_token["grant"])
 
-    target_tokens = _grant_to_tokens(target)
     target_tokens["grant"] = _resolve_grant_aliases(
         target_tokens["grant"], server_version
     )
@@ -2563,7 +2618,7 @@ def grant_exists(
         except Exception as exc:  # pylint: disable=broad-except
             # Fallback to strict parsing
             log.exception(exc)
-            if grants is not False and target in grants:
+            if target is not None and grants is not False and target in grants:
                 log.debug("Grant exists.")
                 return True
 
@@ -2579,7 +2634,7 @@ def grant_add(
     grant_option=False,
     escape=True,
     ssl_option=False,
-    **connection_args
+    **connection_args,
 ):
     """
     Adds a grant to the MySQL server.
@@ -2635,7 +2690,7 @@ def grant_revoke(
     host="localhost",
     grant_option=False,
     escape=True,
-    **connection_args
+    **connection_args,
 ):
     """
     Removes a grant from the MySQL server.
@@ -2663,7 +2718,7 @@ def grant_revoke(
     if dbc != "*":
         # _ and % are authorized on GRANT queries and should get escaped
         # on the db name, but only if not requesting a table level grant
-        s_database = quote_identifier(dbc, for_grants=(table == "*"))
+        s_database = quote_identifier(dbc, for_grants=table == "*")
     if dbc == "*":
         # add revoke for *.*
         # before the modification query send to mysql will looks like
@@ -2672,7 +2727,7 @@ def grant_revoke(
     if table != "*":
         table = quote_identifier(table)
     # identifiers cannot be used as values, same thing for grants
-    qry = "REVOKE {} ON {}.{} FROM %(user)s@%(host)s;".format(grant, s_database, table)
+    qry = f"REVOKE {grant} ON {s_database}.{table} FROM %(user)s@%(host)s;"
     args = {}
     args["user"] = user
     args["host"] = host
@@ -2764,11 +2819,13 @@ def __do_query_into_hash(conn, sql_str):
 
     rtn_results = []
 
+    cursor = None
     try:
         cursor = conn.cursor()
     except MySQLdb.MySQLError:
         log.error("%s: Can't get cursor for SQL->%s", mod, sql_str)
-        cursor.close()
+        if cursor:
+            cursor.close()
         log.debug("%s-->", mod)
         return rtn_results
 
@@ -3037,12 +3094,12 @@ def plugin_add(name, soname=None, **connection_args):
     if dbc is None:
         return False
     cur = dbc.cursor()
-    qry = "INSTALL PLUGIN {}".format(name)
+    qry = f"INSTALL PLUGIN {name}"
 
     if soname:
-        qry += ' SONAME "{}"'.format(soname)
+        qry += f' SONAME "{soname}"'
     else:
-        qry += ' SONAME "{}.so"'.format(name)
+        qry += f' SONAME "{name}.so"'
 
     try:
         _execute(cur, qry)
@@ -3077,7 +3134,7 @@ def plugin_remove(name, **connection_args):
     if dbc is None:
         return False
     cur = dbc.cursor()
-    qry = "UNINSTALL PLUGIN {}".format(name)
+    qry = f"UNINSTALL PLUGIN {name}"
     args = {}
     args["name"] = name
 

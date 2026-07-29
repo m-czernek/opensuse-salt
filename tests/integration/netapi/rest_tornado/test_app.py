@@ -5,11 +5,11 @@ import time
 import pytest
 
 import salt.auth
-import tornado.escape
-import tornado.web
+import salt.ext.tornado.escape
+import salt.ext.tornado.web
 import salt.utils.json
 import salt.utils.stringutils
-from tornado.testing import AsyncHTTPTestCase
+from salt.ext.tornado.testing import AsyncHTTPTestCase
 from salt.netapi.rest_tornado import saltnado
 from tests.support.helpers import TstSuiteLoggingHandler, patched_environ
 from tests.support.mixins import AdaptedConfigurationTestCaseMixin
@@ -67,7 +67,7 @@ class SaltnadoIntegrationTestsBase(
     def setUp(self):
         super().setUp()
         self.patched_environ = patched_environ(ASYNC_TEST_TIMEOUT="30")
-        self.patched_environ.__enter__()
+        self.patched_environ.__enter__()  # pylint: disable=unnecessary-dunder-call
         self.addCleanup(self.patched_environ.__exit__)
 
     def tearDown(self):
@@ -96,7 +96,7 @@ class SaltnadoIntegrationTestsBase(
             del self.patched_environ
 
     def build_tornado_app(self, urls):
-        application = tornado.web.Application(urls, debug=True)
+        application = salt.ext.tornado.web.Application(urls, debug=True)
 
         application.auth = self.auth
         application.opts = self.opts
@@ -112,7 +112,7 @@ class SaltnadoIntegrationTestsBase(
             if response.headers.get("Content-Type") == "application/json":
                 response._body = response.body.decode("utf-8")
             else:
-                response._body = tornado.escape.native_str(response.body)
+                response._body = salt.ext.tornado.escape.native_str(response.body)
         return response
 
     def fetch(self, path, **kwargs):

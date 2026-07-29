@@ -8,19 +8,14 @@ import functools
 import logging
 import re
 
-import salt.loader
-
 # Try to import range from https://github.com/ytoolshed/range
 HAS_RANGE = False
 try:
-    salt.loader.LOAD_LOCK.acquire()
     import seco.range
 
     HAS_RANGE = True
 except ImportError:
     pass
-finally:
-    salt.loader.LOAD_LOCK.release()
 # pylint: enable=import-error
 
 
@@ -60,7 +55,7 @@ class RosterMatcher:
         Execute the correct tgt_type routine and return
         """
         try:
-            return getattr(self, "ret_{}_minions".format(self.tgt_type))()
+            return getattr(self, f"ret_{self.tgt_type}_minions")()
         except AttributeError:
             return {}
 

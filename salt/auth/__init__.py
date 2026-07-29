@@ -12,7 +12,6 @@ so that any external authentication system can be used inside of Salt
 # 5. Cache auth token with relative data opts['token_dir']
 # 6. Interface to verify tokens
 
-
 import getpass
 import logging
 import random
@@ -43,14 +42,10 @@ AUTH_INTERNAL_KEYWORDS = frozenset(
         "gather_job_timeout",
         "kwarg",
         "match",
-        "id_",
-        "force",
         "metadata",
         "print_event",
         "raw",
         "yield_pub_data",
-        "batch",
-        "batch_delay",
     ]
 )
 
@@ -66,6 +61,31 @@ class LoadAuth:
         self.auth = salt.loader.auth(opts)
         self.tokens = salt.loader.eauth_tokens(opts)
         self.ckminions = ckminions or salt.utils.minions.CkMinions(opts)
+
+    def destroy(self):
+        """
+        Clean up resources
+        """
+        if hasattr(self, "auth") and self.auth is not None:
+            if hasattr(self.auth, "destroy"):
+                self.auth.destroy()
+            self.auth = {}
+        if hasattr(self, "tokens") and self.tokens is not None:
+            if hasattr(self.tokens, "destroy"):
+                self.tokens.destroy()
+            self.tokens = {}
+        if hasattr(self, "ckminions") and self.ckminions is not None:
+            if hasattr(self.ckminions, "cache") and self.ckminions.cache is not None:
+                if hasattr(self.ckminions.cache, "destroy"):
+                    self.ckminions.cache.destroy()
+                self.ckminions.cache = None
+            self.ckminions = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.destroy()
 
     def load_name(self, load):
         """
@@ -142,7 +162,7 @@ class LoadAuth:
         mod = self.opts["eauth_acl_module"]
         if not mod:
             mod = load["eauth"]
-        fstr = "{}.acl".format(mod)
+        fstr = f"{mod}.acl"
         if fstr not in self.auth:
             return None
         fcall = salt.utils.args.format_call(
@@ -244,30 +264,57 @@ class LoadAuth:
         Return the name associated with the token, or False if the token is
         not valid
         """
-        tdata = {}
         try:
             tdata = self.tokens["{}.get_token".format(self.opts["eauth_tokens"])](
                 self.opts, tok
             )
-        except salt.exceptions.SaltDeserializationError:
-            log.warning("Failed to load token %r - removing broken/empty file.", tok)
-            rm_tok = True
-        else:
-            if not tdata:
-                return {}
-            rm_tok = False
-
-        if tdata.get("expire", 0) < time.time():
-            # If expire isn't present in the token it's invalid and needs
-            # to be removed. Also, if it's present and has expired - in
-            # other words, the expiration is before right now, it should
-            # be removed.
-            rm_tok = True
-
-        if rm_tok:
+        except salt.exceptions.SaltDeserializationError as exc:
+            # The on-disk / in-store token blob is corrupt and cannot
+            # be parsed. Removing it is the right call -- a corrupt
+            # token can never authenticate anyway, and leaving it
+            # around makes every subsequent ``get_tok`` for the same
+            # id keep failing. ``%r`` on the exception gives the
+            # operator the class and message inline (e.g. msgpack
+            # format error, truncated file) without spamming a full
+            # traceback into a hot-path WARNING; the full traceback is
+            # available via the companion ``log.debug`` for deeper
+            # investigation.
+            log.warning(
+                "Token %r could not be deserialized (%r); removing it from the store.",
+                tok,
+                exc,
+            )
+            log.debug("Token deserialization traceback:", exc_info=True)
             self.rm_token(tok)
             return {}
+        except OSError as exc:
+            # Transient backend error (Redis connection blip, NFS hang,
+            # hung disk). The token itself is fine; do NOT delete it --
+            # that would log every authenticated user out on every
+            # backend hiccup. Return an empty dict so the caller treats
+            # this request as not-authenticated; the next request will
+            # retry against the backend and succeed once it recovers.
+            # Same logging pattern as above -- exception class + message
+            # at WARNING, full traceback at DEBUG so a flapping deploy
+            # stays diagnoseable without GB/hour of stack frames.
+            log.warning(
+                "Token store transient error reading %r (%r); treating as "
+                "not-authenticated for this request without removing the "
+                "token from the store.",
+                tok,
+                exc,
+            )
+            log.debug("Token store transient-error traceback:", exc_info=True)
+            return {}
 
+        if not tdata:
+            return {}
+        if tdata.get("expire", 0) < time.time():
+            # Expired token: drop it from the store. ``expire`` defaults
+            # to 0 if missing, so a malformed-but-deserializable token
+            # without an ``expire`` key falls into this branch too.
+            self.rm_token(tok)
+            return {}
         return tdata
 
     def list_tokens(self):
@@ -328,6 +375,7 @@ class LoadAuth:
         failure.
         """
         error_msg = 'Authentication failure of type "user" occurred.'
+
         auth_key = load.pop("key", None)
         if auth_key is None:
             log.warning(error_msg)
@@ -336,27 +384,32 @@ class LoadAuth:
         if "user" in load:
             auth_user = AuthUser(load["user"])
             if auth_user.is_sudo():
-                # If someone sudos check to make sure there is no ACL's around their username
-                if auth_key != key[self.opts.get("user", "root")]:
-                    log.warning(error_msg)
-                    return False
-                return auth_user.sudo_name()
+                for check_key in key:
+                    if auth_key == key[check_key]:
+                        return auth_user.sudo_name()
+                return False
             elif (
                 load["user"] == self.opts.get("user", "root") or load["user"] == "root"
             ):
-                if auth_key != key[self.opts.get("user", "root")]:
-                    log.warning(
-                        "Master runs as %r, but user in payload is %r",
-                        self.opts.get("user", "root"),
-                        load["user"],
-                    )
-                    log.warning(error_msg)
-                    return False
+                for check_key in key:
+                    if auth_key == key[check_key]:
+                        return True
+                log.warning(
+                    "Master runs as %r, but user in payload is %r",
+                    self.opts.get("user", "root"),
+                    load["user"],
+                )
+                log.warning(error_msg)
+                return False
+
             elif auth_user.is_running_user():
                 if auth_key != key.get(load["user"]):
                     log.warning(error_msg)
                     return False
             elif auth_key == key.get("root"):
+                pass
+            elif auth_key == key.get("salt"):
+                # there is nologin for salt
                 pass
             else:
                 if load["user"] in key:
@@ -369,9 +422,13 @@ class LoadAuth:
                     log.warning(error_msg)
                     return False
         else:
-            if auth_key != key[salt.utils.user.get_user()]:
-                log.warning(error_msg)
-                return False
+            for check_key in key:
+                if auth_key == key[check_key]:
+                    return True
+
+            log.warning(error_msg)
+            return False
+
         return True
 
     def get_auth_list(self, load, token=None):
@@ -469,7 +526,7 @@ class LoadAuth:
             msg = 'Authentication failure of type "user" occurred'
             if not auth_ret:  # auth_ret can be a boolean or the effective user id
                 if show_username:
-                    msg = "{} for user {}.".format(msg, username)
+                    msg = f"{msg} for user {username}."
                 ret["error"] = {"name": "UserAuthenticationError", "message": msg}
                 return ret
 
@@ -530,7 +587,7 @@ class Resolver:
         if not eauth:
             print("External authentication system has not been specified")
             return ret
-        fstr = "{}.auth".format(eauth)
+        fstr = f"{eauth}.auth"
         if fstr not in self.auth:
             print(
                 'The specified external authentication system "{}" is not available'.format(
@@ -549,14 +606,14 @@ class Resolver:
             if arg in self.opts:
                 ret[arg] = self.opts[arg]
             elif arg.startswith("pass"):
-                ret[arg] = getpass.getpass("{}: ".format(arg))
+                ret[arg] = getpass.getpass(f"{arg}: ")
             else:
-                ret[arg] = input("{}: ".format(arg))
+                ret[arg] = input(f"{arg}: ")
         for kwarg, default in list(args["kwargs"].items()):
             if kwarg in self.opts:
                 ret["kwarg"] = self.opts[kwarg]
             else:
-                ret[kwarg] = input("{} [{}]: ".format(kwarg, default))
+                ret[kwarg] = input(f"{kwarg} [{default}]: ")
 
         # Use current user if empty
         if "username" in ret and not ret["username"]:

@@ -9,6 +9,12 @@ installer for testing
 .EXAMPLE
 setup.ps1
 #>
+param(
+    [Parameter(Mandatory=$false)]
+    [Alias("c")]
+# Don't prettify the output of the Write-Result
+    [Switch] $CICD
+)
 
 #-------------------------------------------------------------------------------
 # Script Preferences
@@ -22,8 +28,12 @@ $ErrorActionPreference = "Stop"
 #-------------------------------------------------------------------------------
 
 function Write-Result($result, $ForegroundColor="Green") {
-    $position = 80 - $result.Length - [System.Console]::CursorLeft
-    Write-Host -ForegroundColor $ForegroundColor ("{0,$position}$result" -f "")
+    if ( $CICD ) {
+        Write-Host $result -ForegroundColor $ForegroundColor
+    } else {
+        $position = 80 - $result.Length - [System.Console]::CursorLeft
+        Write-Host -ForegroundColor $ForegroundColor ("{0,$position}$result" -f "")
+    }
 }
 
 #-------------------------------------------------------------------------------
@@ -37,6 +47,8 @@ $NSIS_DIR      = "$WINDOWS_DIR\nsis"
 $BUILDENV_DIR  = "$WINDOWS_DIR\buildenv"
 $PREREQS_DIR   = "$WINDOWS_DIR\prereqs"
 $NSIS_BIN      = "$( ${env:ProgramFiles(x86)} )\NSIS\makensis.exe"
+$SALT_DEP_URL  = "https://github.com/saltstack/salt-windows-deps/raw/refs/heads/main/ssm/64/"
+$GO_DEPS_URL   = "https://github.com/saltstack/salt-windows-deps/raw/refs/heads/main/go"
 
 #-------------------------------------------------------------------------------
 # Script Start
@@ -67,16 +79,94 @@ $directories | ForEach-Object {
 }
 
 #-------------------------------------------------------------------------------
+# Go (required to build test stubs)
+#-------------------------------------------------------------------------------
+
+Write-Host "Looking for Go 1.20+: " -NoNewline
+$go_ok = $false
+$go_exe = (Get-Command go -ErrorAction SilentlyContinue)
+if ( -not $go_exe ) {
+    # Go may be installed but not yet in the current session PATH.
+    # Check both common install locations (1.21+ default, then pre-1.21).
+    $known_paths = @("C:\Program Files\Go\bin\go.exe", "C:\Go\bin\go.exe")
+    foreach ( $p in $known_paths ) {
+        if ( Test-Path $p ) {
+            $env:PATH = "$(Split-Path $p);$env:PATH"
+            $go_exe = Get-Command go -ErrorAction SilentlyContinue
+            break
+        }
+    }
+}
+if ( $go_exe ) {
+    $ver_out = & go version 2>$null
+    if ( $ver_out -match 'go(\d+)\.(\d+)' ) {
+        $maj = [int]$Matches[1]; $min = [int]$Matches[2]
+        if ( $maj -gt 1 -or ($maj -eq 1 -and $min -ge 20) ) {
+            $go_ok = $true
+        }
+    }
+}
+if ( $go_ok ) {
+    Write-Result "Success" -ForegroundColor Green
+} else {
+    Write-Result "Missing" -ForegroundColor Yellow
+
+    Write-Host "Downloading Go: " -NoNewline
+    $url  = "$GO_DEPS_URL/go1.26.1.windows-amd64.msi"
+    $file = "$env:TEMP\go-install.msi"
+    Invoke-WebRequest -Uri $url -OutFile "$file"
+    if ( Test-Path -Path "$file" ) {
+        Write-Result "Success" -ForegroundColor Green
+    } else {
+        Write-Result "Failed" -ForegroundColor Red
+        exit 1
+    }
+
+    Write-Host "Installing Go: " -NoNewline
+    Start-Process "msiexec.exe" -ArgumentList "/i `"$file`" /quiet /norestart" -Wait -NoNewWindow
+    if ( Test-Path -Path "C:\Program Files\Go\bin\go.exe" ) {
+        Write-Result "Success" -ForegroundColor Green
+    } else {
+        Write-Result "Failed" -ForegroundColor Red
+        exit 1
+    }
+
+    # Refresh session PATH so go build works immediately without reopening the shell
+    $env:PATH = "C:\Program Files\Go\bin;$env:PATH"
+
+    Write-Host "Cleaning up: " -NoNewline
+    Remove-Item -Path $file -Force
+    if ( ! (Test-Path -Path "$file") ) {
+        Write-Result "Success" -ForegroundColor Green
+    } else {
+        Write-Result "Failed" -ForegroundColor Yellow
+    }
+}
+
+#-------------------------------------------------------------------------------
 # Create binaries
 #-------------------------------------------------------------------------------
 
-$prereq_files = "vcredist_x86_2013.exe",
-                "vcredist_x64_2013.exe",
-                "ucrt_x86.zip",
-                "ucrt_x64.zip"
+# Build the daemon stub (salt-minion.exe): a real PE that stays alive and
+# exits cleanly on CTRL_C so NSSM can manage it as a proper service.
+# -C changes the working directory to the module root before building so
+# that Go modules can locate go.mod (requires Go 1.20+).
+Write-Host "Building salt-minion.exe stub: " -NoNewline
+& go build -C "$SCRIPT_DIR\stubs\daemon" -o "$BUILDENV_DIR\salt-minion.exe" .
+if ( Test-Path -Path "$BUILDENV_DIR\salt-minion.exe" ) {
+    Write-Result "Success"
+} else {
+    Write-Result "Failed" -ForegroundColor Red
+    exit 1
+}
+
+# Build the exit stub (vcredist): a real PE that exits immediately with code 0
+# so ExecWait succeeds and the installer does not abort during VCRedist install.
+$prereq_files = "vcredist_x86_2022.exe",
+                "vcredist_x64_2022.exe"
 $prereq_files | ForEach-Object {
-    Write-Host "Creating $_`: " -NoNewline
-    Set-Content -Path "$PREREQS_DIR\$_" -Value "binary"
+    Write-Host "Building $_`: " -NoNewline
+    & go build -C "$SCRIPT_DIR\stubs\exit" -o "$PREREQS_DIR\$_" .
     if ( Test-Path -Path "$PREREQS_DIR\$_" ) {
         Write-Result "Success"
     } else {
@@ -85,8 +175,8 @@ $prereq_files | ForEach-Object {
     }
 }
 
-$binary_files = "ssm.exe",
-                "python.exe"
+# python.exe only needs to exist on disk (checked by test assertions, not executed)
+$binary_files = @("python.exe")
 $binary_files | ForEach-Object {
     Write-Host "Creating $_`: " -NoNewline
     Set-Content -Path "$BUILDENV_DIR\$_" -Value "binary"
@@ -98,11 +188,23 @@ $binary_files | ForEach-Object {
     }
 }
 
+# Make sure ssm.exe is present. This is needed for VMtools
+if ( ! (Test-Path -Path "$BUILDENV_DIR\ssm.exe") ) {
+    Write-Host "Copying SSM to Build Env: " -NoNewline
+    Invoke-WebRequest -Uri "$SALT_DEP_URL/ssm-2.24-103-gdee49fc.exe" -OutFile "$BUILDENV_DIR\ssm.exe"
+    if ( Test-Path -Path "$BUILDENV_DIR\ssm.exe" ) {
+        Write-Result "Success" -ForegroundColor Green
+    } else {
+        Write-Result "Failed" -ForegroundColor Red
+        exit 1
+    }
+}
+
 #-------------------------------------------------------------------------------
 # Copy Configs
 #-------------------------------------------------------------------------------
 
-Write-Host "Copy minion config: " -NoNewline
+Write-Host "Copy testing minion config: " -NoNewline
 Copy-Item -Path "$NSIS_DIR\tests\_files\minion" `
           -Destination "$BUILDENV_DIR\configs\"
 if ( Test-Path -Path "$BUILDENV_DIR\configs\minion" ) {
@@ -126,6 +228,7 @@ if ( Test-Path -Path "$installer" ) {
     Write-Result "Success"
 } else {
     Write-Result "Failed" -ForegroundColor Red
+    Write-Host "$NSIS_BIN /DSaltVersion=test /DPythonArchitecture=AMD64 $NSIS_DIR\installer\Salt-Minion-Setup.nsi"
     exit 1
 }
 
@@ -144,7 +247,7 @@ if ( Test-Path -Path "$test_installer" ) {
 #-------------------------------------------------------------------------------
 
 Write-Host "Setting up venv: " -NoNewline
-python.exe -m venv venv
+python.exe -m venv "$SCRIPT_DIR\venv"
 if ( Test-Path -Path "$SCRIPT_DIR\venv" ) {
     Write-Result "Success"
 } else {
@@ -153,7 +256,7 @@ if ( Test-Path -Path "$SCRIPT_DIR\venv" ) {
 }
 
 Write-Host "Activating venv: " -NoNewline
-.\venv\Scripts\activate
+& $SCRIPT_DIR\venv\Scripts\activate.ps1
 if ( "$env:VIRTUAL_ENV" ) {
     Write-Result "Success"
 } else {

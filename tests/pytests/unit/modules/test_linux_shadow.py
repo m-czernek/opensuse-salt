@@ -1,5 +1,5 @@
 """
-:codeauthor: Erik Johnson <erik@saltstack.com>
+    :codeauthor: Erik Johnson <erik@saltstack.com>
 """
 
 import types
@@ -175,11 +175,6 @@ def test_info(password):
     Test if info shows the correct user information
     """
 
-    data = {
-        "/etc/shadow": f"foo:{password.pw_hash}:31337:0:99999:7:::",
-        "*": Exception("Attempted to open something other than /etc/shadow"),
-    }
-
     # First test is with a succesful call
     expected_result = [
         ("expire", -1),
@@ -191,7 +186,10 @@ def test_info(password):
         ("passwd", password.pw_hash),
         ("warn", 7),
     ]
-    with patch("salt.utils.files.fopen", mock_open(read_data=data)):
+    getspnam_return = spwd.struct_spwd(
+        ["foo", password.pw_hash, 31337, 0, 99999, 7, -1, -1, -1]
+    )
+    with patch("spwd.getspnam", return_value=getspnam_return):
         result = shadow.info("foo")
         assert expected_result == sorted(result.items(), key=lambda x: x[0])
 
@@ -206,8 +204,15 @@ def test_info(password):
         ("passwd", ""),
         ("warn", ""),
     ]
-    with patch("salt.utils.files.fopen", mock_open(read_data=data)):
-        result = shadow.info("bar")
+    # We get KeyError exception for non-existent users in glibc based systems
+    getspnam_return = KeyError
+    with patch("spwd.getspnam", side_effect=getspnam_return):
+        result = shadow.info("foo")
+        assert expected_result == sorted(result.items(), key=lambda x: x[0])
+    # And FileNotFoundError in musl based systems
+    getspnam_return = FileNotFoundError
+    with patch("spwd.getspnam", side_effect=getspnam_return):
+        result = shadow.info("foo")
         assert expected_result == sorted(result.items(), key=lambda x: x[0])
 
 

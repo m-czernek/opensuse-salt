@@ -1,103 +1,27 @@
-"""
-tests.pytests.unit.test_crypt
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-
-Unit tests for salt's crypt module
-"""
-
-import uuid
+import logging
+import os
 
 import pytest
 
-import salt.crypt
-import salt.master
-import salt.utils.files
-
-PRIV_KEY = """
------BEGIN RSA PRIVATE KEY-----
-MIIEogIBAAKCAQEAoAsMPt+4kuIG6vKyw9r3+OuZrVBee/2vDdVetW+Js5dTlgrJ
-aghWWn3doGmKlEjqh7E4UTa+t2Jd6w8RSLnyHNJ/HpVhMG0M07MF6FMfILtDrrt8
-ZX7eDVt8sx5gCEpYI+XG8Y07Ga9i3Hiczt+fu6HYwu96HggmG2pqkOrn3iGfqBvV
-YVFJzSZYe7e4c1PeEs0xYcrA4k+apyGsMtpef8vRUrNicRLc7dAcvfhtgt2DXEZ2
-d72t/CR4ygtUvPXzisaTPW0G7OWAheCloqvTIIPQIjR8htFxGTz02STVXfnhnJ0Z
-k8KhqKF2v1SQvIYxsZU7jaDgl5i3zpeh58cYOwIDAQABAoIBABZUJEO7Y91+UnfC
-H6XKrZEZkcnH7j6/UIaOD9YhdyVKxhsnax1zh1S9vceNIgv5NltzIsfV6vrb6v2K
-Dx/F7Z0O0zR5o+MlO8ZncjoNKskex10gBEWG00Uqz/WPlddiQ/TSMJTv3uCBAzp+
-S2Zjdb4wYPUlgzSgb2ygxrhsRahMcSMG9PoX6klxMXFKMD1JxiY8QfAHahPzQXy9
-F7COZ0fCVo6BE+MqNuQ8tZeIxu8mOULQCCkLFwXmkz1FpfK/kNRmhIyhxwvCS+z4
-JuErW3uXfE64RLERiLp1bSxlDdpvRO2R41HAoNELTsKXJOEt4JANRHm/CeyA5wsh
-NpscufUCgYEAxhgPfcMDy2v3nL6KtkgYjdcOyRvsAF50QRbEa8ldO+87IoMDD/Oe
-osFERJ5hhyyEO78QnaLVegnykiw5DWEF02RKMhD/4XU+1UYVhY0wJjKQIBadsufB
-2dnaKjvwzUhPh5BrBqNHl/FXwNCRDiYqXa79eWCPC9OFbZcUWWq70s8CgYEAztOI
-61zRfmXJ7f70GgYbHg+GA7IrsAcsGRITsFR82Ho0lqdFFCxz7oK8QfL6bwMCGKyk
-nzk+twh6hhj5UNp18KN8wktlo02zTgzgemHwaLa2cd6xKgmAyuPiTgcgnzt5LVNG
-FOjIWkLwSlpkDTl7ZzY2QSy7t+mq5d750fpIrtUCgYBWXZUbcpPL88WgDB7z/Bjg
-dlvW6JqLSqMK4b8/cyp4AARbNp12LfQC55o5BIhm48y/M70tzRmfvIiKnEc/gwaE
-NJx4mZrGFFURrR2i/Xx5mt/lbZbRsmN89JM+iKWjCpzJ8PgIi9Wh9DIbOZOUhKVB
-9RJEAgo70LvCnPTdS0CaVwKBgDJW3BllAvw/rBFIH4OB/vGnF5gosmdqp3oGo1Ik
-jipmPAx6895AH4tquIVYrUl9svHsezjhxvjnkGK5C115foEuWXw0u60uiTiy+6Pt
-2IS0C93VNMulenpnUrppE7CN2iWFAiaura0CY9fE/lsVpYpucHAWgi32Kok+ZxGL
-WEttAoGAN9Ehsz4LeQxEj3x8wVeEMHF6OsznpwYsI2oVh6VxpS4AjgKYqeLVcnNi
-TlZFsuQcqgod8OgzA91tdB+Rp86NygmWD5WzeKXpCOg9uA+y/YL+0sgZZHsuvbK6
-PllUgXdYxqClk/hdBFB7v9AQoaj7K9Ga22v32msftYDQRJ94xOI=
------END RSA PRIVATE KEY-----
-"""
+import salt.crypt as crypt
+import salt.exceptions
+import salt.ext.tornado.gen
+from tests.support.mock import mock_open, patch
 
 
-PUB_KEY = """
------BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoAsMPt+4kuIG6vKyw9r3
-+OuZrVBee/2vDdVetW+Js5dTlgrJaghWWn3doGmKlEjqh7E4UTa+t2Jd6w8RSLny
-HNJ/HpVhMG0M07MF6FMfILtDrrt8ZX7eDVt8sx5gCEpYI+XG8Y07Ga9i3Hiczt+f
-u6HYwu96HggmG2pqkOrn3iGfqBvVYVFJzSZYe7e4c1PeEs0xYcrA4k+apyGsMtpe
-f8vRUrNicRLc7dAcvfhtgt2DXEZ2d72t/CR4ygtUvPXzisaTPW0G7OWAheCloqvT
-IIPQIjR8htFxGTz02STVXfnhnJ0Zk8KhqKF2v1SQvIYxsZU7jaDgl5i3zpeh58cY
-OwIDAQAB
------END PUBLIC KEY-----
-"""
-
-PRIV_KEY2 = """
------BEGIN RSA PRIVATE KEY-----
-MIIEogIBAAKCAQEAp+8cTxguO6Vg+YO92VfHgNld3Zy8aM3JbZvpJcjTnis+YFJ7
-Zlkcc647yPRRwY9nYBNywahnt5kIeuT1rTvTsMBZWvmUoEVUj1Xg8XXQkBvb9Ozy
-Gqy/G/p8KDDpzMP/U+XCnUeHiXTZrgnqgBIc2cKeCVvWFqDi0GRFGzyaXLaX3PPm
-M7DJ0MIPL1qgmcDq6+7Ze0gJ9SrDYFAeLmbuT1OqDfufXWQl/82JXeiwU2cOpqWq
-7n5fvPOWim7l1tzQ+dSiMRRm0xa6uNexCJww3oJSwvMbAmgzvOhqqhlqv+K7u0u7
-FrFFojESsL36Gq4GBrISnvu2tk7u4GGNTYYQbQIDAQABAoIBAADrqWDQnd5DVZEA
-lR+WINiWuHJAy/KaIC7K4kAMBgbxrz2ZbiY9Ok/zBk5fcnxIZDVtXd1sZicmPlro
-GuWodIxdPZAnWpZ3UtOXUayZK/vCP1YsH1agmEqXuKsCu6Fc+K8VzReOHxLUkmXn
-FYM+tixGahXcjEOi/aNNTWitEB6OemRM1UeLJFzRcfyXiqzHpHCIZwBpTUAsmzcG
-QiVDkMTKubwo/m+PVXburX2CGibUydctgbrYIc7EJvyx/cpRiPZXo1PhHQWdu4Y1
-SOaC66WLsP/wqvtHo58JQ6EN/gjSsbAgGGVkZ1xMo66nR+pLpR27coS7o03xCks6
-DY/0mukCgYEAuLIGgBnqoh7YsOBLd/Bc1UTfDMxJhNseo+hZemtkSXz2Jn51322F
-Zw/FVN4ArXgluH+XsOhvG/MFFpojwZSrb0Qq5b1MRdo9qycq8lGqNtlN1WHqosDQ
-zW29kpL0tlRrSDpww3wRESsN9rH5XIrJ1b3ZXuO7asR+KBVQMy/+NcUCgYEA6MSC
-c+fywltKPgmPl5j0DPoDe5SXE/6JQy7w/vVGrGfWGf/zEJmhzS2R+CcfTTEqaT0T
-Yw8+XbFgKAqsxwtE9MUXLTVLI3sSUyE4g7blCYscOqhZ8ItCUKDXWkSpt++rG0Um
-1+cEJP/0oCazG6MWqvBC4NpQ1nzh46QpjWqMwokCgYAKDLXJ1p8rvx3vUeUJW6zR
-dfPlEGCXuAyMwqHLxXgpf4EtSwhC5gSyPOtx2LqUtcrnpRmt6JfTH4ARYMW9TMef
-QEhNQ+WYj213mKP/l235mg1gJPnNbUxvQR9lkFV8bk+AGJ32JRQQqRUTbU+yN2MQ
-HEptnVqfTp3GtJIultfwOQKBgG+RyYmu8wBP650izg33BXu21raEeYne5oIqXN+I
-R5DZ0JjzwtkBGroTDrVoYyuH1nFNEh7YLqeQHqvyufBKKYo9cid8NQDTu+vWr5UK
-tGvHnwdKrJmM1oN5JOAiq0r7+QMAOWchVy449VNSWWV03aeftB685iR5BXkstbIQ
-EVopAoGAfcGBTAhmceK/4Q83H/FXBWy0PAa1kZGg/q8+Z0KY76AqyxOVl0/CU/rB
-3tO3sKhaMTHPME/MiQjQQGoaK1JgPY6JHYvly2KomrJ8QTugqNGyMzdVJkXAK2AM
-GAwC8ivAkHf8CHrHa1W7l8t2IqBjW1aRt7mOW92nfG88Hck0Mbo=
------END RSA PRIVATE KEY-----
-"""
-
-
-PUB_KEY2 = """
------BEGIN PUBLIC KEY-----
-MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAp+8cTxguO6Vg+YO92VfH
-gNld3Zy8aM3JbZvpJcjTnis+YFJ7Zlkcc647yPRRwY9nYBNywahnt5kIeuT1rTvT
-sMBZWvmUoEVUj1Xg8XXQkBvb9OzyGqy/G/p8KDDpzMP/U+XCnUeHiXTZrgnqgBIc
-2cKeCVvWFqDi0GRFGzyaXLaX3PPmM7DJ0MIPL1qgmcDq6+7Ze0gJ9SrDYFAeLmbu
-T1OqDfufXWQl/82JXeiwU2cOpqWq7n5fvPOWim7l1tzQ+dSiMRRm0xa6uNexCJww
-3oJSwvMbAmgzvOhqqhlqv+K7u0u7FrFFojESsL36Gq4GBrISnvu2tk7u4GGNTYYQ
-bQIDAQAB
------END PUBLIC KEY-----
-"""
+@pytest.fixture
+def key_data():
+    return [
+        "-----BEGIN PUBLIC KEY-----",
+        "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAoe5QSDYRWKyknbVyRrIj",
+        "rm1ht5HgKzAVUber0x54+b/UgxTd1cqI6I+eDlx53LqZSH3G8Rd5cUh8LHoGedSa",
+        "E62vEiLAjgXa+RdgcGiQpYS8+Z2RvQJ8oIcZgO+2AzgBRHboNWHTYRRmJXCd3dKs",
+        "9tcwK6wxChR06HzGqaOTixAuQlegWbOTU+X4dXIbW7AnuQBt9MCib7SxHlscrqcS",
+        "cBrRvq51YP6cxPm/rZJdBqZhVrlghBvIpa45NApP5PherGi4AbEGYte4l+gC+fOA",
+        "osEBis1V27djPpIyQS4qk3XAPQg6CYQMDltHqA4Fdo0Nt7SMScxJhfH0r6zmBFAe",
+        "BQIDAQAB",
+        "-----END PUBLIC KEY-----",
+    ]
 
 
 @pytest.fixture
@@ -110,79 +34,22 @@ def minion_root(tmp_path):
     yield root
 
 
-def test_get_rsa_pub_key_bad_key(tmp_path):
-    """
-    get_rsa_pub_key raises InvalidKeyError when encoutering a bad key
-    """
-    key_path = str(tmp_path / "key")
-    with salt.utils.files.fopen(key_path, "w") as fp:
-        fp.write("")
-    with pytest.raises(salt.crypt.InvalidKeyError):
-        salt.crypt.get_rsa_pub_key(key_path)
+@pytest.mark.parametrize("linesep", ["\r\n", "\r", "\n"])
+def test__clean_key(key_data, linesep):
+    tst_key = linesep.join(key_data)
+    chk_key = "\n".join(key_data)
+    assert crypt.clean_key(tst_key) == crypt.clean_key(chk_key)
 
 
-def test_cryptical_dumps_no_nonce():
-    master_crypt = salt.crypt.Crypticle({}, salt.crypt.Crypticle.generate_key_string())
-    data = {"foo": "bar"}
-    ret = master_crypt.dumps(data)
-
-    # Validate message structure
-    assert isinstance(ret, bytes)
-    une = master_crypt.decrypt(ret)
-    une.startswith(master_crypt.PICKLE_PAD)
-    assert salt.payload.loads(une[len(master_crypt.PICKLE_PAD) :]) == data
-
-    # Validate load back to orig data
-    assert master_crypt.loads(ret) == data
+@pytest.mark.parametrize("linesep", ["\r\n", "\r", "\n"])
+def test__clean_key_mismatch(key_data, linesep):
+    tst_key = linesep.join(key_data)
+    tst_key = tst_key.replace("5", "4")
+    chk_key = "\n".join(key_data)
+    assert crypt.clean_key(tst_key) != crypt.clean_key(chk_key)
 
 
-def test_cryptical_dumps_valid_nonce():
-    nonce = uuid.uuid4().hex
-    master_crypt = salt.crypt.Crypticle({}, salt.crypt.Crypticle.generate_key_string())
-    data = {"foo": "bar"}
-    ret = master_crypt.dumps(data, nonce=nonce)
-
-    assert isinstance(ret, bytes)
-    une = master_crypt.decrypt(ret)
-    une.startswith(master_crypt.PICKLE_PAD)
-    nonce_and_data = une[len(master_crypt.PICKLE_PAD) :]
-    assert nonce_and_data.startswith(nonce.encode())
-    assert salt.payload.loads(nonce_and_data[len(nonce) :]) == data
-
-    assert master_crypt.loads(ret, nonce=nonce) == data
-
-
-def test_cryptical_dumps_invalid_nonce():
-    nonce = uuid.uuid4().hex
-    master_crypt = salt.crypt.Crypticle({}, salt.crypt.Crypticle.generate_key_string())
-    data = {"foo": "bar"}
-    ret = master_crypt.dumps(data, nonce=nonce)
-    assert isinstance(ret, bytes)
-    with pytest.raises(salt.crypt.SaltClientError, match="Nonce verification error"):
-        assert master_crypt.loads(ret, nonce="abcde")
-
-
-def test_verify_signature(tmp_path):
-    tmp_path.joinpath("foo.pem").write_text(PRIV_KEY.strip())
-    tmp_path.joinpath("foo.pub").write_text(PUB_KEY.strip())
-    tmp_path.joinpath("bar.pem").write_text(PRIV_KEY2.strip())
-    tmp_path.joinpath("bar.pub").write_text(PUB_KEY2.strip())
-    msg = b"foo bar"
-    sig = salt.crypt.sign_message(str(tmp_path.joinpath("foo.pem")), msg)
-    assert salt.crypt.verify_signature(str(tmp_path.joinpath("foo.pub")), msg, sig)
-
-
-def test_verify_signature_bad_sig(tmp_path):
-    tmp_path.joinpath("foo.pem").write_text(PRIV_KEY.strip())
-    tmp_path.joinpath("foo.pub").write_text(PUB_KEY.strip())
-    tmp_path.joinpath("bar.pem").write_text(PRIV_KEY2.strip())
-    tmp_path.joinpath("bar.pub").write_text(PUB_KEY2.strip())
-    msg = b"foo bar"
-    sig = salt.crypt.sign_message(str(tmp_path.joinpath("foo.pem")), msg)
-    assert not salt.crypt.verify_signature(str(tmp_path.joinpath("bar.pub")), msg, sig)
-
-
-async def test_auth_aes_key_rotation(minion_root, io_loop):
+async def test_auth_aes_key_rotation(minion_root, io_loop, caplog):
     pki_dir = minion_root / "etc" / "salt" / "pki"
     opts = {
         "id": "minion",
@@ -193,17 +60,18 @@ async def test_auth_aes_key_rotation(minion_root, io_loop):
         "acceptance_wait_time": 60,
         "acceptance_wait_time_max": 60,
     }
+    crypt.gen_keys(pki_dir, "minion", opts["keysize"])
     credskey = (
         opts["pki_dir"],  # where the keys are stored
         opts["id"],  # minion ID
         opts["master_uri"],  # master ID
+        str(os.path.getmtime(os.path.join(opts["pki_dir"], "minion.pem"))),
     )
-    salt.crypt.gen_keys(pki_dir, "minion", opts["keysize"])
 
-    aes = salt.crypt.Crypticle.generate_key_string()
-    session = salt.crypt.Crypticle.generate_key_string()
+    aes = crypt.Crypticle.generate_key_string()
+    session = crypt.Crypticle.generate_key_string()
 
-    auth = salt.crypt.AsyncAuth(opts, io_loop)
+    auth = crypt.AsyncAuth(opts, io_loop)
 
     async def mock_sign_in(*args, **kwargs):
         return mock_sign_in.response
@@ -217,13 +85,15 @@ async def test_auth_aes_key_rotation(minion_root, io_loop):
 
     assert credskey not in auth.creds_map
 
-    await auth.authenticate()
+    with caplog.at_level(logging.DEBUG):
+        await auth.authenticate()
 
+    assert "Got new master aes key" in caplog.text
     assert credskey in auth.creds_map
     assert auth.creds_map[credskey]["aes"] == aes
     assert auth.creds_map[credskey]["session"] == session
 
-    aes1 = salt.crypt.Crypticle.generate_key_string()
+    aes1 = crypt.Crypticle.generate_key_string()
 
     mock_sign_in.response = {
         "enc": "pub",
@@ -231,27 +101,31 @@ async def test_auth_aes_key_rotation(minion_root, io_loop):
         "session": session,
     }
 
-    await auth.authenticate()
+    with caplog.at_level(logging.DEBUG):
+        await auth.authenticate()
 
+    assert "The master's aes key has changed" in caplog.text
     assert credskey in auth.creds_map
     assert auth.creds_map[credskey]["aes"] == aes1
     assert auth.creds_map[credskey]["session"] == session
 
-    session1 = salt.crypt.Crypticle.generate_key_string()
+    session1 = crypt.Crypticle.generate_key_string()
     mock_sign_in.response = {
         "enc": "pub",
         "aes": aes1,
         "session": session1,
     }
 
-    await auth.authenticate()
+    with caplog.at_level(logging.DEBUG):
+        await auth.authenticate()
 
+    assert "The master's session key has changed" in caplog.text
     assert credskey in auth.creds_map
     assert auth.creds_map[credskey]["aes"] == aes1
     assert auth.creds_map[credskey]["session"] == session1
 
 
-def test_sauth_aes_key_rotation(minion_root, io_loop):
+def test_sauth_aes_key_rotation(minion_root, io_loop, caplog):
 
     pki_dir = minion_root / "etc" / "salt" / "pki"
     opts = {
@@ -263,17 +137,12 @@ def test_sauth_aes_key_rotation(minion_root, io_loop):
         "acceptance_wait_time": 60,
         "acceptance_wait_time_max": 60,
     }
-    credskey = (
-        opts["pki_dir"],  # where the keys are stored
-        opts["id"],  # minion ID
-        opts["master_uri"],  # master ID
-    )
-    salt.crypt.gen_keys(pki_dir, "minion", opts["keysize"])
+    crypt.gen_keys(pki_dir, "minion", opts["keysize"])
 
-    aes = salt.crypt.Crypticle.generate_key_string()
-    session = salt.crypt.Crypticle.generate_key_string()
+    aes = crypt.Crypticle.generate_key_string()
+    session = crypt.Crypticle.generate_key_string()
 
-    auth = salt.crypt.SAuth(opts, io_loop)
+    auth = crypt.SAuth(opts, io_loop)
 
     def mock_sign_in(*args, **kwargs):
         return mock_sign_in.response
@@ -287,13 +156,15 @@ def test_sauth_aes_key_rotation(minion_root, io_loop):
 
     assert auth._creds is None
 
-    auth.authenticate()
+    with caplog.at_level(logging.DEBUG):
+        auth.authenticate()
 
+    assert "Got new master aes key" in caplog.text
     assert isinstance(auth._creds, dict)
     assert auth._creds["aes"] == aes
     assert auth._creds["session"] == session
 
-    aes1 = salt.crypt.Crypticle.generate_key_string()
+    aes1 = crypt.Crypticle.generate_key_string()
 
     mock_sign_in.response = {
         "enc": "pub",
@@ -301,21 +172,354 @@ def test_sauth_aes_key_rotation(minion_root, io_loop):
         "session": session,
     }
 
-    auth.authenticate()
+    with caplog.at_level(logging.DEBUG):
+        auth.authenticate()
 
+    assert "The master's aes key has changed" in caplog.text
     assert isinstance(auth._creds, dict)
     assert auth._creds["aes"] == aes1
     assert auth._creds["session"] == session
 
-    session1 = salt.crypt.Crypticle.generate_key_string()
+    session1 = crypt.Crypticle.generate_key_string()
     mock_sign_in.response = {
         "enc": "pub",
         "aes": aes1,
         "session": session1,
     }
 
-    auth.authenticate()
+    with caplog.at_level(logging.DEBUG):
+        auth.authenticate()
 
+    assert "The master's session key has changed" in caplog.text
     assert isinstance(auth._creds, dict)
     assert auth._creds["aes"] == aes1
     assert auth._creds["session"] == session1
+
+
+def test_get_key_with_evict_bad_key(tmp_path):
+    key_path = tmp_path / "key"
+    key_path.write_text("asdfasoiasdofaoiu0923jnoiausbd98sb9")
+    with pytest.raises(salt.exceptions.InvalidKeyError):
+        crypt._get_key_with_evict(str(key_path), 1, None)
+
+
+def test_async_auth_cache_private_key(minion_root, io_loop):
+
+    pki_dir = minion_root / "etc" / "salt" / "pki"
+    opts = {
+        "id": "minion",
+        "__role": "minion",
+        "pki_dir": str(pki_dir),
+        "master_uri": "tcp://127.0.0.1:4505",
+        "keysize": 4096,
+        "acceptance_wait_time": 60,
+        "acceptance_wait_time_max": 60,
+    }
+
+    auth = crypt.AsyncAuth(opts, io_loop)
+
+    # The private key is cached.
+    assert isinstance(auth._private_key, crypt.PrivateKey)
+
+    # get_keys returns the cached instance
+    _id = id(auth._private_key)
+    assert _id == id(auth.get_keys())
+
+
+def test_async_auth_cache_token(minion_root, io_loop):
+    pki_dir = minion_root / "etc" / "salt" / "pki"
+    opts = {
+        "id": "minion",
+        "__role": "minion",
+        "pki_dir": str(pki_dir),
+        "master_uri": "tcp://127.0.0.1:4505",
+        "keysize": 4096,
+        "acceptance_wait_time": 60,
+        "acceptance_wait_time_max": 60,
+    }
+
+    auth = crypt.AsyncAuth(opts, io_loop)
+
+    with patch("salt.crypt.private_encrypt") as moc:
+        auth.gen_token("salt")
+        auth.gen_token("salt")
+        moc.assert_called_once()
+
+
+def test_verify_master_accepts_cached_key_with_whitespace_drift(
+    minion_root, io_loop, key_data
+):
+    """
+    Regression test for https://github.com/saltstack/salt/issues/68493
+
+    A master that does not ``clean_key()`` its outgoing ``pub_key`` (e.g. an
+    older 3006.0 master) sends a payload whose ``pub_key`` carries a trailing
+    newline. ``verify_master`` writes that raw payload to ``minion_master.pub``
+    on first contact, but on every subsequent restart it reads the cached file
+    through ``clean_key()`` (which strips trailing whitespace) and then
+    compares the normalized cache against the raw payload. The two strings
+    only differ in trailing whitespace, but the comparison fails and the
+    minion rejects the master with "Invalid master key" forever (until the
+    cache file is deleted).
+
+    The fix normalizes both sides of the comparison through ``clean_key()``.
+    """
+    pki_dir = minion_root / "etc" / "salt" / "pki"
+    opts = {
+        "id": "minion",
+        "__role": "minion",
+        "pki_dir": str(pki_dir),
+        "master_uri": "tcp://127.0.0.1:4505",
+        "keysize": 4096,
+        "acceptance_wait_time": 60,
+        "acceptance_wait_time_max": 60,
+        "open_mode": False,
+        "verify_master_pubkey_sign": False,
+        "always_verify_signature": False,
+    }
+    crypt.gen_keys(pki_dir, "minion", opts["keysize"])
+
+    auth = crypt.AsyncAuth(opts, io_loop)
+
+    raw_pub_key = "\n".join(key_data) + "\n"
+    cached_pub_key = crypt.clean_key(raw_pub_key)
+    assert raw_pub_key != cached_pub_key, "fixture must exercise the drift"
+
+    # Simulate the on-disk cache that the minion would build up after talking
+    # to a master whose outgoing pub_key has been normalized by clean_key().
+    m_pub_fn = pki_dir / auth.mpub
+    m_pub_fn.write_text(cached_pub_key)
+
+    payload = {
+        "enc": "pub",
+        "pub_key": raw_pub_key,
+        "aes": "ignored-by-extract-aes-mock",
+    }
+
+    with patch.object(auth, "extract_aes", return_value="aes-key") as extract:
+        result = auth.verify_master(payload)
+
+    assert result == "aes-key"
+    extract.assert_called_once()
+
+
+def test_verify_master_caches_clean_key_on_first_contact(
+    minion_root, io_loop, key_data
+):
+    """
+    Regression test for https://github.com/saltstack/salt/issues/68493
+
+    When ``verify_master`` accepts a master's pub_key for the first time it
+    must cache the ``clean_key()``-normalized form to ``minion_master.pub``.
+    Caching the raw payload causes the next call (which reads through
+    ``clean_key()``) to compare a normalized cache against a raw payload and
+    spuriously reject the master.
+    """
+    pki_dir = minion_root / "etc" / "salt" / "pki"
+    opts = {
+        "id": "minion",
+        "__role": "minion",
+        "pki_dir": str(pki_dir),
+        "master_uri": "tcp://127.0.0.1:4505",
+        "keysize": 4096,
+        "acceptance_wait_time": 60,
+        "acceptance_wait_time_max": 60,
+        "open_mode": False,
+        "verify_master_pubkey_sign": False,
+        "always_verify_signature": False,
+    }
+    crypt.gen_keys(pki_dir, "minion", opts["keysize"])
+
+    auth = crypt.AsyncAuth(opts, io_loop)
+
+    raw_pub_key = "\n".join(key_data) + "\n"
+    cached_pub_key = crypt.clean_key(raw_pub_key)
+
+    m_pub_fn = pki_dir / auth.mpub
+    assert not m_pub_fn.exists()
+
+    payload = {
+        "enc": "pub",
+        "pub_key": raw_pub_key,
+        "aes": "ignored-by-extract-aes-mock",
+    }
+
+    with patch.object(auth, "extract_aes", return_value="aes-key"):
+        # First contact: master_pub=False because the minion hadn't seen a
+        # pubkey yet when it sent the auth request.
+        result = auth.verify_master(payload, master_pub=False)
+
+    assert result == "aes-key"
+    assert m_pub_fn.read_text() == cached_pub_key
+
+
+@pytest.mark.parametrize("linesep", ["\r\n", "\r", "\n"])
+def test_gen_signature_signs_clean_key(key_data, linesep):
+    """
+    Regression test for https://github.com/saltstack/salt/issues/68930
+
+    gen_signature() must apply clean_key() before signing so the signed
+    content matches what get_pub_str() sends to minions.
+    """
+    raw_pub_on_disk = linesep.join(key_data)
+    expected = crypt.clean_key(raw_pub_on_disk)
+
+    with (
+        patch("salt.utils.files.fopen", mock_open(read_data=raw_pub_on_disk)),
+        patch("os.path.isfile", return_value=False),
+        patch("salt.crypt.sign_message", return_value=b"fakesig") as mock_sign,
+    ):
+        crypt.gen_signature("priv_path", "pub_path", "sig_path")
+
+    _, signed_content, _ = mock_sign.call_args[0]
+    assert signed_content == expected
+
+
+@pytest.mark.parametrize("linesep", ["\r\n", "\r", "\n"])
+def test_gen_signature_signs_clean_key_trailing_newline(key_data, linesep):
+    """
+    Same as above but with a trailing newline, which is the common case
+    because the cryptography library writes PEM files with one.
+    """
+    raw_pub_on_disk = linesep.join(key_data) + linesep
+    expected = crypt.clean_key(raw_pub_on_disk)
+
+    assert raw_pub_on_disk != expected
+
+    with (
+        patch("salt.utils.files.fopen", mock_open(read_data=raw_pub_on_disk)),
+        patch("os.path.isfile", return_value=False),
+        patch("salt.crypt.sign_message", return_value=b"fakesig") as mock_sign,
+    ):
+        crypt.gen_signature("priv_path", "pub_path", "sig_path")
+
+    _, signed_content, _ = mock_sign.call_args[0]
+    assert signed_content == expected
+
+
+async def test_authenticate_caps_retry_loop_with_auth_retries_69442(
+    minion_root, io_loop
+):
+    """
+    Regression test for https://github.com/saltstack/salt/issues/69442
+
+    When ``sign_in()`` keeps returning ``"retry"`` (for example because the
+    master has not yet accepted the minion key, the master AES key is in
+    flux, or the master is reachable but rejecting auth), the outer
+    ``AsyncAuth._authenticate()`` loop must bail out after ``auth_retries``
+    attempts with a ``SaltClientError`` whose message names the attempt
+    count.
+
+    On 3006.x/3007.x the loop had no outer-attempts cap and the minion
+    spun forever with exponential backoff up to ``acceptance_wait_time_max``
+    with no operator-visible error log. This test asserts the
+    backported cap: with ``auth_retries=3`` and ``sign_in`` returning
+    ``"retry"`` on every call, the loop runs exactly 3 attempts and the
+    future resolves to a ``SaltClientError`` carrying the
+    ``"Failed to authenticate with the master after 3 attempts"`` message.
+    """
+    pki_dir = minion_root / "etc" / "salt" / "pki"
+    opts = {
+        "id": "minion",
+        "__role": "minion",
+        "pki_dir": str(pki_dir),
+        "master_uri": "tcp://127.0.0.1:4505",
+        "keysize": 4096,
+        # Zero out the inter-attempt sleep so the test doesn't actually
+        # wait ``acceptance_wait_time * attempts`` seconds before
+        # observing the cap.
+        "acceptance_wait_time": 0,
+        "acceptance_wait_time_max": 0,
+        "auth_retries": 3,
+    }
+    crypt.gen_keys(pki_dir, "minion", opts["keysize"])
+
+    auth = crypt.AsyncAuth(opts, io_loop)
+
+    call_count = 0
+
+    @salt.ext.tornado.gen.coroutine
+    def mock_sign_in(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        return "retry"
+
+    auth.sign_in = mock_sign_in
+
+    with pytest.raises(salt.exceptions.SaltClientError) as exc_info:
+        await auth.authenticate()
+
+    assert call_count == 3
+    assert "Failed to authenticate with the master after 3 attempts" in str(
+        exc_info.value
+    )
+
+
+async def test_authenticate_default_does_not_cap_retry_loop_69442(minion_root, io_loop):
+    """
+    Regression test for https://github.com/saltstack/salt/issues/69442
+
+    The outer ``AsyncAuth._authenticate()`` retry cap is opt-in on the
+    3006.x LTS branch: the default ``auth_retries=0`` must preserve the
+    pre-3006.26 behavior of retrying ``sign_in()`` forever when it keeps
+    returning ``"retry"``.  Operators who upgrade without setting the
+    new option should see no behavior change.
+
+    This test drives the loop without ``auth_retries`` set (so the
+    default applies) and asserts that the loop keeps calling ``sign_in``
+    well past any small finite cap (the historical ``auth_tries``
+    default of 7, the canonical ``master_tries`` default of 1, etc.).
+    After ``call_limit`` ``"retry"`` returns the mock returns the
+    distinct ``"bad enc algo"`` sentinel to break the otherwise-infinite
+    loop cleanly via the existing ``elif`` branch.  The test passes if
+    and only if the loop reached ``call_limit`` and the resulting error
+    is the generic "Attempt to authenticate ... failed" message rather
+    than the cap-specific "...after N attempts" message.
+    """
+    pki_dir = minion_root / "etc" / "salt" / "pki"
+    opts = {
+        "id": "minion",
+        "__role": "minion",
+        "pki_dir": str(pki_dir),
+        "master_uri": "tcp://127.0.0.1:4505",
+        "keysize": 4096,
+        "acceptance_wait_time": 0,
+        "acceptance_wait_time_max": 0,
+        # Intentionally do not set ``auth_retries`` -- the default
+        # (0 == unlimited) is what we're asserting here.
+    }
+    crypt.gen_keys(pki_dir, "minion", opts["keysize"])
+
+    auth = crypt.AsyncAuth(opts, io_loop)
+
+    # Sanity-check the default before driving the loop.
+    assert auth.opts.get("auth_retries", 0) == 0
+
+    call_count = 0
+    # Comfortably past the historical ``auth_tries`` default of 7 and
+    # any other plausible small cap a regression might introduce.
+    call_limit = 25
+
+    @salt.ext.tornado.gen.coroutine
+    def mock_sign_in(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count >= call_limit:
+            # Break the otherwise-infinite loop via the existing
+            # ``"bad enc algo"`` sentinel branch in ``_authenticate``.
+            return "bad enc algo"
+        return "retry"
+
+    auth.sign_in = mock_sign_in
+
+    with pytest.raises(salt.exceptions.SaltClientError) as exc_info:
+        await auth.authenticate()
+
+    # The loop ran every plausible small finite cap's worth of attempts
+    # without bailing out with the cap error, proving the default is
+    # uncapped.
+    assert call_count == call_limit
+    assert "after" not in str(exc_info.value).lower() or "attempts" not in str(
+        exc_info.value
+    )
+    assert "Attempt to authenticate with the salt master failed" in str(exc_info.value)

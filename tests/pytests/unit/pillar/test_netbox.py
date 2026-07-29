@@ -1240,6 +1240,141 @@ def site_prefixes():
 
 
 @pytest.fixture
+def site_prefixes_results_nb_420():
+    return {
+        "dict": {
+            "count": 2,
+            "next": None,
+            "previous": None,
+            "results": [
+                {
+                    "id": 50,
+                    "url": "https://netbox.example.com/api/ipam/prefixes/50/",
+                    "display_url": "https://netbox.example.com/ipam/prefixes/50/",
+                    "display": "198.51.100.0/24",
+                    "family": {"value": 4, "label": "IPv4"},
+                    "prefix": "198.51.100.0/24",
+                    "vrf": None,
+                    "scope_type": "dcim.site",
+                    "scope_id": 1,
+                    "scope": {
+                        "id": 1,
+                        "url": "https://netbox.example.com/api/dcim/sites/1/",
+                        "display": "Site 1",
+                        "name": "Site 1",
+                        "slug": "site1",
+                        "description": "",
+                    },
+                    "tenant": None,
+                    "vlan": None,
+                    "status": {"value": "active", "label": "Active"},
+                    "role": None,
+                    "is_pool": False,
+                    "mark_utilized": False,
+                    "description": "",
+                    "comments": "",
+                    "tags": [],
+                    "custom_fields": {},
+                    "created": "2025-12-13T15:01:28.282368Z",
+                    "last_updated": "2025-12-22T21:44:22.907412Z",
+                    "children": 0,
+                    "_depth": 1,
+                },
+                {
+                    "id": 43,
+                    "url": "https://netbox.example.com/api/ipam/prefixes/43/",
+                    "display_url": "https://netbox.example.com/ipam/prefixes/43/",
+                    "display": "2001:db8::/48",
+                    "family": {"value": 6, "label": "IPv6"},
+                    "prefix": "2001:db8::/48",
+                    "vrf": None,
+                    "scope_type": "dcim.site",
+                    "scope_id": 1,
+                    "scope": {
+                        "id": 1,
+                        "url": "https://netbox.example.com/api/dcim/sites/1/",
+                        "display": "Site 1",
+                        "name": "Site 1",
+                        "slug": "site1",
+                        "description": "",
+                    },
+                    "tenant": None,
+                    "vlan": None,
+                    "status": {"value": "active", "label": "Active"},
+                    "role": None,
+                    "is_pool": False,
+                    "mark_utilized": False,
+                    "description": "IPv6 addresses for Site 1",
+                    "comments": "",
+                    "tags": [],
+                    "custom_fields": {},
+                    "created": "2025-12-12T20:42:27.011531Z",
+                    "last_updated": "2025-12-12T20:42:27.011555Z",
+                    "children": 3,
+                    "_depth": 1,
+                },
+            ],
+        }
+    }
+
+
+@pytest.fixture
+def site_prefixes_nb_420():
+    return [
+        {
+            "_depth": 1,
+            "children": 0,
+            "comments": "",
+            "created": "2025-12-13T15:01:28.282368Z",
+            "custom_fields": {},
+            "description": "",
+            "display": "198.51.100.0/24",
+            "display_url": "https://netbox.example.com/ipam/prefixes/50/",
+            "family": {"label": "IPv4", "value": 4},
+            "id": 50,
+            "is_pool": False,
+            "last_updated": "2025-12-22T21:44:22.907412Z",
+            "mark_utilized": False,
+            "prefix": "198.51.100.0/24",
+            "role": None,
+            "scope_id": 1,
+            "scope_type": "dcim.site",
+            "status": {"label": "Active", "value": "active"},
+            "tags": [],
+            "tenant": None,
+            "url": "https://netbox.example.com/api/ipam/prefixes/50/",
+            "vlan": None,
+            "vrf": None,
+        },
+        {
+            "_depth": 1,
+            "children": 3,
+            "comments": "",
+            "created": "2025-12-12T20:42:27.011531Z",
+            "custom_fields": {},
+            "description": "IPv6 addresses for Site 1",
+            "display": "2001:db8::/48",
+            "display_url": "https://netbox.example.com/ipam/prefixes/43/",
+            "family": {"label": "IPv6", "value": 6},
+            "id": 43,
+            "is_pool": False,
+            "last_updated": "2025-12-12T20:42:27.011555Z",
+            "mark_utilized": False,
+            "prefix": "2001:db8::/48",
+            "role": None,
+            "scope_id": 1,
+            "scope_type": "dcim.site",
+            "status": {"label": "Active", "value": "active"},
+            "tags": [],
+            "tenant": None,
+            "url": "https://netbox.example.com/api/ipam/prefixes/43/",
+            "vlan": None,
+            "vrf": None,
+        },
+    ]
+
+
+@pytest.fixture
 def proxy_details_results():
     return {
         "dict": {
@@ -2099,6 +2234,26 @@ def test_when_we_retrieve_site_prefixes_then_return_list(
         assert actual_result == expected_result
 
 
+def test_when_we_retrieve_site_prefixes_nb_420_then_return_list(
+    default_kwargs, headers, site_prefixes_results_nb_420, site_prefixes_nb_420
+):
+
+    expected_result = site_prefixes_nb_420
+
+    with patch("salt.utils.http.query", autospec=True) as query:
+        query.return_value = site_prefixes_results_nb_420
+
+        actual_result = netbox._get_site_prefixes(
+            default_kwargs["api_url"],
+            default_kwargs["minion_id"],
+            "Site 1",
+            1,
+            headers,
+            default_kwargs["api_query_result_limit"],
+        )
+        assert actual_result == expected_result
+
+
 def test_when_we_retrieve_site_prefixes_and_get_http_error_then_return_empty_list(
     default_kwargs, headers, http_error
 ):
@@ -2316,6 +2471,44 @@ def test_when_we_retrieve_everything_successfully_then_return_dict(
         actual_result = netbox.ext_pillar(**default_kwargs)
 
         assert actual_result == expected_result
+
+
+@pytest.mark.parametrize(
+    "destination_pillar_key,expected_keys",
+    [
+        ("netbox", ["netbox"]),
+        ("netbox:minion", ["netbox", "minion"]),
+        ("custom:nested:key", ["custom", "nested", "key"]),
+    ],
+)
+def test_destination_pillar_key_routes_data_to_correct_location(
+    default_kwargs,
+    device_results,
+    no_results,
+    destination_pillar_key,
+    expected_keys,
+):
+    """Test that destination_pillar_key correctly nests the netbox data."""
+    default_kwargs["virtual_machines"] = False
+    default_kwargs["proxy_return"] = False
+    default_kwargs["site_details"] = False
+    default_kwargs["site_prefixes"] = False
+    default_kwargs["destination_pillar_key"] = destination_pillar_key
+
+    with patch("salt.pillar.netbox._get_devices", autospec=True) as get_devices, patch(
+        "salt.pillar.netbox._get_virtual_machines", autospec=True
+    ) as get_virtual_machines:
+        get_devices.return_value = device_results["dict"]["results"]
+        get_virtual_machines.return_value = no_results["dict"]["results"]
+
+        actual_result = netbox.ext_pillar(**default_kwargs)
+
+        # Walk the expected nesting path and verify data is present
+        node = actual_result
+        for key in expected_keys:
+            assert key in node, f"Key '{key}' not found in {list(node.keys())}"
+            node = node[key]
+        assert node["id"] == 511
 
 
 def test_when_we_set_proxy_return_but_get_no_value_for_platform_then_error_message_should_be_logged(

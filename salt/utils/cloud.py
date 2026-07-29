@@ -2,7 +2,6 @@
 Utility functions for salt.cloud
 """
 
-
 import codecs
 import copy
 import errno
@@ -63,7 +62,7 @@ try:
     from pypsexec.client import Client as PsExecClient
     from pypsexec.exceptions import SCMRException
     from pypsexec.scmr import Service as ScmrService
-    from smbprotocol.exceptions import SMBResponseException
+    from smbprotocol.exceptions import CannotDelete, SMBResponseException
     from smbprotocol.tree import TreeConnect
 
     logging.getLogger("smbprotocol").setLevel(logging.WARNING)
@@ -78,16 +77,19 @@ WINRM_MIN_VER = "0.3.0"
 
 
 try:
-    # Verify WinRM 0.3.0 or greater
-    import pkg_resources  # pylint: disable=3rd-party-module-not-gated
-    import winrm
-    from winrm.exceptions import WinRMTransportError
+    import importlib
+    import importlib.metadata
 
-    winrm_pkg = pkg_resources.get_distribution("pywinrm")
-    if not salt.utils.versions.compare(winrm_pkg.version, ">=", WINRM_MIN_VER):
+    # Verify WinRM 0.3.0 or greater
+
+    version = importlib.metadata.version("winrm")
+    if not salt.utils.versions.compare(version, ">=", WINRM_MIN_VER):
         HAS_WINRM = False
     else:
         HAS_WINRM = True
+
+    import winrm
+    from winrm.exceptions import WinRMTransportError
 
 except ImportError:
     HAS_WINRM = False
@@ -205,6 +207,8 @@ def __ssh_gateway_arguments(kwargs):
                 str(ssh_gateway_command),
             )
         )
+
+        extended_arguments = f'-oProxyCommand="{extended_arguments}"'
 
         log.info(
             "Using SSH gateway %s@%s:%s %s",
@@ -565,9 +569,9 @@ def bootstrap(vm_, opts=None):
     )
 
     if saltify_driver:
-        deploy_kwargs[
-            "wait_for_passwd_maxtries"
-        ] = 0  # No need to wait/retry with Saltify
+        deploy_kwargs["wait_for_passwd_maxtries"] = (
+            0  # No need to wait/retry with Saltify
+        )
 
     win_installer = salt.config.get_cloud_config_value("win_installer", vm_, opts)
     if win_installer:
@@ -910,7 +914,12 @@ class Client:
         return self._client.connect()
 
     def disconnect(self):
-        self._client.cleanup()  # This removes the lingering PAExec binary
+        try:
+            # This removes any lingering PAExec binaries
+            self._client.cleanup()
+        except CannotDelete as exc:
+            # We shouldn't hard crash here, so just log the error
+            log.debug("Exception cleaning up PAexec: %r", exc)
         return self._client.disconnect()
 
     def create_service(self):
@@ -2115,9 +2124,7 @@ def _exec_ssh_cmd(cmd, error_msg=None, allow_failure=False, **kwargs):
         return proc.exitstatus
     except salt.utils.vt.TerminalException as err:
         trace = traceback.format_exc()
-        log.error(
-            error_msg.format(cmd, err, trace)
-        )  # pylint: disable=str-format-in-logging
+        log.error(error_msg.format(cmd, err, trace))
     finally:
         proc.close(terminate=True, kill=True)
     # Signal an error
@@ -2948,7 +2955,10 @@ def update_bootstrap(config, url=None):
         - The absolute path to the bootstrap
         - The content of the bootstrap script
     """
-    default_url = config.get("bootstrap_script_url", "https://bootstrap.saltstack.com")
+    default_url = config.get(
+        "bootstrap_script_url",
+        "https://github.com/saltstack/salt-bootstrap/releases/latest/download/bootstrap-salt.sh",
+    )
     if not url:
         url = default_url
     if not url:
@@ -2964,7 +2974,7 @@ def update_bootstrap(config, url=None):
                     "Python requests library to be installed"
                 )
             }
-        req = requests.get(url)
+        req = requests.get(url, timeout=120)
         if req.status_code != 200:
             return {
                 "error": (

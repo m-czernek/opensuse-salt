@@ -1,3 +1,4 @@
+import importlib
 import os
 import time
 
@@ -24,6 +25,14 @@ except AttributeError:
 
 if HAS_PYGIT2:
     import pygit2
+
+    try:
+        from pygit2.enums import ObjectType
+
+        HAS_PYGIT2_ENUMS = True
+
+    except ModuleNotFoundError:
+        HAS_PYGIT2_ENUMS = False
 
 
 @pytest.fixture
@@ -56,7 +65,7 @@ def test_provider_case_insensitive_gitfs_provider(minion_opts, role_name, role_c
     Ensure that both lowercase and non-lowercase values are supported
     """
     provider = "GitPython"
-    key = "{}_provider".format(role_name)
+    key = f"{role_name}_provider"
     with patch.object(role_class, "verify_gitpython", MagicMock(return_value=True)):
         with patch.object(role_class, "verify_pygit2", MagicMock(return_value=False)):
             args = [minion_opts, {}]
@@ -94,7 +103,7 @@ def test_valid_provider_gitfs_provider(minion_opts, role_name, role_class):
         """
         return MagicMock(return_value=verify.endswith(provider))
 
-    key = "{}_provider".format(role_name)
+    key = f"{role_name}_provider"
     for provider in salt.utils.gitfs.GIT_PROVIDERS:
         verify = "verify_gitpython"
         mock1 = _get_mock(verify, provider)
@@ -149,9 +158,14 @@ def _prepare_remote_repository_pygit2(tmp_path):
         tree,
         [repository.head.target],
     )
-    repository.create_tag(
-        "annotated_tag", commit, pygit2.GIT_OBJ_COMMIT, signature, "some message"
-    )
+    if HAS_PYGIT2_ENUMS:
+        repository.create_tag(
+            "annotated_tag", commit, ObjectType.COMMIT, signature, "some message"
+        )
+    else:
+        repository.create_tag(
+            "annotated_tag", commit, pygit2.GIT_OBJ_COMMIT, signature, "some message"
+        )
     return remote
 
 
@@ -251,12 +265,14 @@ def test_checkout_pygit2_with_home_env_unset(_prepare_provider):
     provider.credentials = None
     with patched_environ(__cleanup__=["HOME"]):
         assert "HOME" not in os.environ
-        import importlib
-
         importlib.reload(salt.utils.gitfs)
         assert "HOME" in os.environ
 
 
+@pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
+@pytest.mark.skip_on_windows(
+    reason="Skip Pygit2 on windows, due to pygit2 access error on windows"
+)
 @pytest.mark.skipif(not HAS_PYGIT2, reason="This host lacks proper pygit2 support")
 @pytest.mark.skip_on_windows(
     reason="Skip Pygit2 on windows, due to pygit2 access error on windows"

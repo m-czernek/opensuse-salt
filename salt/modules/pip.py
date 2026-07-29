@@ -84,8 +84,6 @@ import shutil
 import sys
 import tempfile
 
-import pkg_resources  # pylint: disable=3rd-party-module-not-gated
-
 import salt.utils.data
 import salt.utils.files
 import salt.utils.json
@@ -95,12 +93,6 @@ import salt.utils.stringutils
 import salt.utils.url
 import salt.utils.versions
 from salt.exceptions import CommandExecutionError, CommandNotFoundError
-
-try:
-    import pkg_resources
-except ImportError:
-    pkg_resources = None
-
 
 # This needs to be named logger so we don't shadow it in pip.install
 logger = logging.getLogger(__name__)  # pylint: disable=invalid-name
@@ -120,12 +112,7 @@ def __virtual__():
     entire filesystem.  If it's not installed in a conventional location, the
     user is required to provide the location of pip each time it is used.
     """
-    if pkg_resources is None:
-        ret = False, 'Package dependency "pkg_resource" is missing'
-    else:
-        ret = "pip"
-
-    return ret
+    return "pip"
 
 
 def _pip_bin_env(cwd, bin_env):
@@ -147,7 +134,7 @@ def _clear_context(bin_env=None):
     """
     contextkey = "pip.version"
     if bin_env is not None:
-        contextkey = "{}.{}".format(contextkey, bin_env)
+        contextkey = f"{contextkey}.{bin_env}"
     __context__.pop(contextkey, None)
 
 
@@ -200,7 +187,7 @@ def _get_pip_bin(bin_env):
                         bin_path,
                     )
         raise CommandNotFoundError(
-            "Could not find a pip binary in virtualenv {}".format(bin_env)
+            f"Could not find a pip binary in virtualenv {bin_env}"
         )
 
     # bin_env is the python or pip binary
@@ -212,12 +199,10 @@ def _get_pip_bin(bin_env):
             # We have been passed a pip binary, use the pip binary.
             return [os.path.normpath(bin_env)]
 
-        raise CommandExecutionError(
-            "Could not find a pip binary within {}".format(bin_env)
-        )
+        raise CommandExecutionError(f"Could not find a pip binary within {bin_env}")
     else:
         raise CommandNotFoundError(
-            "Access denied to {}, could not find a pip binary".format(bin_env)
+            f"Access denied to {bin_env}, could not find a pip binary"
         )
 
 
@@ -423,9 +408,7 @@ def _format_env_vars(env_vars):
                     val = str(val)
                 ret[key] = val
         else:
-            raise CommandExecutionError(
-                "env_vars {} is not a dictionary".format(env_vars)
-            )
+            raise CommandExecutionError(f"env_vars {env_vars} is not a dictionary")
     return ret
 
 
@@ -475,7 +458,7 @@ def install(
     cache_dir=None,
     no_binary=None,
     disable_version_check=False,
-    **kwargs
+    **kwargs,
 ):
     """
     Install packages with pip
@@ -514,7 +497,9 @@ def install(
         or one or more package names with commas between them
 
     log
-        Log file where a complete (maximum verbosity) record will be kept
+        Log file where a complete (maximum verbosity) record will be kept.
+        If this file doesn't exist and the parent directory is writeable,
+        it will be created.
 
     proxy
         Specify a proxy in the form ``user:passwd@proxy.server:port``. Note
@@ -768,9 +753,19 @@ def install(
 
     if log:
         if os.path.isdir(log):
-            raise OSError("'{}' is a directory. Use --log path_to_file".format(log))
+            raise OSError(f"'{log}' is a directory. Use --log path_to_file")
+        if not os.path.exists(log):
+            parent = os.path.dirname(log)
+            if not os.path.exists(parent):
+                raise OSError(
+                    f"Trying to create '{log}' but parent directory '{parent}' does not exist."
+                )
+            elif not os.access(parent, os.W_OK):
+                raise OSError(
+                    f"Trying to create '{log}' but parent directory '{parent}' is not writeable."
+                )
         elif not os.access(log, os.W_OK):
-            raise OSError("'{}' is not writeable".format(log))
+            raise OSError(f"'{log}' is not writeable")
 
         cmd.extend(["--log", log])
 
@@ -795,9 +790,7 @@ def install(
                 raise ValueError("Timeout cannot be a float")
             int(timeout)
         except ValueError:
-            raise ValueError(
-                "'{}' is not a valid timeout, must be an integer".format(timeout)
-            )
+            raise ValueError(f"'{timeout}' is not a valid timeout, must be an integer")
         cmd.extend(["--timeout", timeout])
 
     if find_links:
@@ -808,9 +801,7 @@ def install(
             if not (
                 salt.utils.url.validate(link, VALID_PROTOS) or os.path.exists(link)
             ):
-                raise CommandExecutionError(
-                    "'{}' is not a valid URL or path".format(link)
-                )
+                raise CommandExecutionError(f"'{link}' is not a valid URL or path")
             cmd.extend(["--find-links", link])
 
     if no_index and (index_url or extra_index_url):
@@ -820,14 +811,12 @@ def install(
 
     if index_url:
         if not salt.utils.url.validate(index_url, VALID_PROTOS):
-            raise CommandExecutionError("'{}' is not a valid URL".format(index_url))
+            raise CommandExecutionError(f"'{index_url}' is not a valid URL")
         cmd.extend(["--index-url", index_url])
 
     if extra_index_url:
         if not salt.utils.url.validate(extra_index_url, VALID_PROTOS):
-            raise CommandExecutionError(
-                "'{}' is not a valid URL".format(extra_index_url)
-            )
+            raise CommandExecutionError(f"'{extra_index_url}' is not a valid URL")
         cmd.extend(["--extra-index-url", extra_index_url])
 
     if no_index:
@@ -847,7 +836,7 @@ def install(
         cmd.append("--use-mirrors")
         for mirror in mirrors:
             if not mirror.startswith("http://"):
-                raise CommandExecutionError("'{}' is not a valid URL".format(mirror))
+                raise CommandExecutionError(f"'{mirror}' is not a valid URL")
             cmd.extend(["--mirrors", mirror])
 
     if disable_version_check:
@@ -857,11 +846,9 @@ def install(
         cmd.extend(["--build", build])
 
     # Use VENV_PIP_TARGET environment variable value as target
-    # if set and no target specified on the function call.
-    # Do not set target if bin_env specified, use default
-    # for specified binary environment or expect explicit target specification.
+    # if set and no target specified on the function call
     target_env = os.environ.get("VENV_PIP_TARGET", None)
-    if target is None and target_env is not None and bin_env is None:
+    if target is None and target_env is not None:
         target = target_env
 
     if target:
@@ -873,9 +860,13 @@ def install(
     if download_cache or cache_dir:
         cmd.extend(
             [
-                "--cache-dir"
-                if salt.utils.versions.compare(ver1=cur_version, oper=">=", ver2="6.0")
-                else "--download-cache",
+                (
+                    "--cache-dir"
+                    if salt.utils.versions.compare(
+                        ver1=cur_version, oper=">=", ver2="6.0"
+                    )
+                    else "--download-cache"
+                ),
                 download_cache or cache_dir,
             ]
         )
@@ -1007,7 +998,7 @@ def install(
                 # Don't allow any recursion into keyword arg definitions
                 # Don't allow multiple definitions of a keyword
                 if isinstance(val, (dict, list)):
-                    raise TypeError("Too many levels in: {}".format(key))
+                    raise TypeError(f"Too many levels in: {key}")
                 # This is a a normal one-to-one keyword argument
                 cmd.extend([key, val])
             # It is a positional argument, append it to the list
@@ -1052,6 +1043,7 @@ def uninstall(
     cwd=None,
     saltenv="base",
     use_vt=False,
+    extra_args=None,
 ):
     """
     Uninstall packages individually or from a pip requirements file
@@ -1094,6 +1086,24 @@ def uninstall(
     use_vt
         Use VT terminal emulation (see output while installing)
 
+    extra_args
+        pip keyword and positional arguments not yet implemented in salt
+
+        .. code-block:: yaml
+
+            salt '*' pip.install pandas extra_args="[{'--latest-pip-kwarg':'param'}, '--latest-pip-arg']"
+
+        Will be translated into the following pip command:
+
+        .. code-block:: bash
+
+            pip install pandas --latest-pip-kwarg param --latest-pip-arg
+
+        .. warning::
+
+            If unsupported options are passed here that are not supported in a
+            minion's version of pip, a `No such option error` will be thrown.
+
     CLI Example:
 
     .. code-block:: bash
@@ -1120,7 +1130,7 @@ def uninstall(
             # TODO make this check if writeable
             os.path.exists(log)
         except OSError:
-            raise OSError("'{}' is not writeable".format(log))
+            raise OSError(f"'{log}' is not writeable")
 
         cmd.extend(["--log", log])
 
@@ -1145,9 +1155,7 @@ def uninstall(
                 raise ValueError("Timeout cannot be a float")
             int(timeout)
         except ValueError:
-            raise ValueError(
-                "'{}' is not a valid timeout, must be an integer".format(timeout)
-            )
+            raise ValueError(f"'{timeout}' is not a valid timeout, must be an integer")
         cmd.extend(["--timeout", timeout])
 
     if pkgs:
@@ -1165,6 +1173,24 @@ def uninstall(
                         except ValueError:
                             pass
         cmd.extend(pkgs)
+
+    if extra_args:
+        # These are arguments from the latest version of pip that
+        # have not yet been implemented in salt
+        for arg in extra_args:
+            # It is a keyword argument
+            if isinstance(arg, dict):
+                # There will only ever be one item in this dictionary
+                key, val = arg.popitem()
+                # Don't allow any recursion into keyword arg definitions
+                # Don't allow multiple definitions of a keyword
+                if isinstance(val, (dict, list)):
+                    raise TypeError(f"Too many levels in: {key}")
+                # This is a a normal one-to-one keyword argument
+                cmd.extend([key, val])
+            # It is a positional argument, append it to the list
+            else:
+                cmd.append(arg)
 
     cmd_kwargs = dict(
         python_shell=False, runas=user, cwd=cwd, saltenv=saltenv, use_vt=use_vt
@@ -1230,6 +1256,12 @@ def freeze(bin_env=None, user=None, cwd=None, use_vt=False, env_vars=None, **kwa
         )
     else:
         cmd.append("--all")
+
+    # Suppress pip's outbound version-check; otherwise airgapped minions block
+    # on the PyPI round-trip for every ``pip freeze`` (issue #68214). The flag
+    # was added in pip 6.0, predating the 8.0.3 floor above, so it is always
+    # safe to append here.
+    cmd.append("--disable-pip-version-check")
 
     cmd_kwargs = dict(runas=user, cwd=cwd, use_vt=use_vt, python_shell=False)
     if kwargs:
@@ -1349,11 +1381,15 @@ def list_(prefix=None, bin_env=None, user=None, cwd=None, env_vars=None, **kwarg
             user=user,
             cwd=cwd,
             env_vars=env_vars,
-            **kwargs
+            **kwargs,
         )
 
     cmd = _get_pip_bin(bin_env)
-    cmd.extend(["list", "--format=json"])
+    # ``--disable-pip-version-check`` keeps ``pip list`` from making an
+    # outbound HTTPS call to PyPI to check for a newer pip release. On
+    # airgapped minions that check times out (~20s per call), which makes
+    # every ``pip.installed`` state re-run unacceptably slow (issue #68214).
+    cmd.extend(["list", "--format=json", "--disable-pip-version-check"])
 
     cmd_kwargs = dict(cwd=cwd, runas=user, python_shell=False)
     if kwargs:
@@ -1407,7 +1443,7 @@ def version(bin_env=None, cwd=None, user=None):
     cwd = _pip_bin_env(cwd, bin_env)
     contextkey = "pip.version"
     if bin_env is not None:
-        contextkey = "{}.{}".format(contextkey, bin_env)
+        contextkey = f"{contextkey}.{bin_env}"
 
     if contextkey in __context__:
         return __context__[contextkey]
@@ -1441,7 +1477,10 @@ def list_upgrades(bin_env=None, user=None, cwd=None):
 
     cwd = _pip_bin_env(cwd, bin_env)
     cmd = _get_pip_bin(bin_env)
-    cmd.extend(["list", "--outdated"])
+    # ``pip list --outdated`` already contacts PyPI by design; skip pip's
+    # separate self-version check so the command does not pay for a second,
+    # independent PyPI round-trip (issue #68214).
+    cmd.extend(["list", "--outdated", "--disable-pip-version-check"])
 
     pip_version = version(bin_env, cwd, user=user)
     # Pip started supporting the ability to output json starting with 9.0.0
@@ -1576,7 +1615,10 @@ def upgrade(bin_env=None, user=None, cwd=None, use_vt=False):
         "comment": "",
     }
     cmd = _get_pip_bin(bin_env)
-    cmd.extend(["install", "-U"])
+    # Suppress pip's outbound self-version check; ``pip install -U`` already
+    # talks to PyPI for each package, so the extra round-trip is wasted
+    # work (issue #68214).
+    cmd.extend(["install", "-U", "--disable-pip-version-check"])
 
     old = list_(bin_env=bin_env, user=user, cwd=cwd)
 
@@ -1660,18 +1702,10 @@ def list_all_versions(
     """
     cwd = _pip_bin_env(cwd, bin_env)
     cmd = _get_pip_bin(bin_env)
-
-    if index_url:
-        if not salt.utils.url.validate(index_url, VALID_PROTOS):
-            raise CommandExecutionError("'{}' is not a valid URL".format(index_url))
-        cmd.extend(["--index-url", index_url])
-
-    if extra_index_url:
-        if not salt.utils.url.validate(extra_index_url, VALID_PROTOS):
-            raise CommandExecutionError(
-                "'{}' is not a valid URL".format(extra_index_url)
-            )
-        cmd.extend(["--extra-index-url", extra_index_url])
+    # ``pip index versions`` (and the legacy ``pip install ==versions`` probe)
+    # queries PyPI for the package; skip pip's separate self-version check so
+    # the call doesn't pay for an extra outbound round-trip (issue #68214).
+    cmd.append("--disable-pip-version-check")
 
     # Is the `pip index` command available
     pip_version = version(bin_env=bin_env, cwd=cwd, user=user)
@@ -1682,8 +1716,17 @@ def list_all_versions(
         if salt.utils.versions.compare(ver1=pip_version, oper=">=", ver2="20.3"):
             cmd.append("--use-deprecated=legacy-resolver")
         regex = re.compile(r"\s*Could not find a version.* \(from versions: (.*)\)")
-        cmd.extend(["install", "{}==versions".format(pkg)])
+        cmd.extend(["install", f"{pkg}==versions"])
 
+    if index_url:
+        if not salt.utils.url.validate(index_url, VALID_PROTOS):
+            raise CommandExecutionError(f"'{index_url}' is not a valid URL")
+        cmd.extend(["--index-url", index_url])
+
+    if extra_index_url:
+        if not salt.utils.url.validate(extra_index_url, VALID_PROTOS):
+            raise CommandExecutionError(f"'{extra_index_url}' is not a valid URL")
+        cmd.extend(["--extra-index-url", extra_index_url])
     cmd_kwargs = dict(
         cwd=cwd, runas=user, output_loglevel="quiet", redirect_stderr=True
     )
@@ -1711,7 +1754,7 @@ def list_all_versions(
             versions = [
                 v for v in match.group(1).split(", ") if v and excludes.match(v)
             ]
-            versions.sort(key=pkg_resources.parse_version)
+            versions.sort(key=salt.utils.versions.parse)
             break
     if not versions:
         return None

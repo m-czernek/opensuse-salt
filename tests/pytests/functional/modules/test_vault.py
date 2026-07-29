@@ -3,6 +3,7 @@ import logging
 import time
 
 import pytest
+from saltfactories.daemons.container import Container
 
 import salt.utils.path
 from tests.support.runtests import RUNTIME_VARS
@@ -16,12 +17,41 @@ VAULT_BINARY = salt.utils.path.which("vault")
 
 log = logging.getLogger(__name__)
 
+# Workaround for https://github.com/saltstack/pytest-salt-factories/issues/198
+# Container.terminate() does not wait for Docker to fully release the container
+# name, causing 409 "name already in use" errors when parameterized fixtures
+# recreate a container immediately after termination.
+_original_terminate = Container.terminate
+
+
+def _terminate_and_wait(self):
+    """
+    Call the original terminate and then poll Docker until the container
+    name is fully released.  This prevents 409 "name already in use"
+    errors when a new container is created immediately after termination.
+    """
+    if self._terminate_result is not None:
+        return self._terminate_result
+    name = self.name
+    client = self.docker_client
+    result = _original_terminate(self)
+    for _ in range(30):
+        try:
+            client.containers.get(name)
+            time.sleep(1)
+        except Exception:  # pylint: disable=broad-except
+            break
+    return result
+
+
+Container.terminate = _terminate_and_wait  # pylint: disable=E9502
+
 
 @pytest.fixture(scope="module")
 def minion_config_overrides(vault_port):
     return {
         "vault": {
-            "url": "http://127.0.0.1:{}".format(vault_port),
+            "url": f"http://127.0.0.1:{vault_port}",
             "auth": {
                 "method": "token",
                 "token": "testsecret",
@@ -35,7 +65,7 @@ def minion_config_overrides(vault_port):
 
 
 def vault_container_version_id(value):
-    return "vault=={}".format(value)
+    return f"vault=={value}"
 
 
 @pytest.fixture(
@@ -54,15 +84,16 @@ def vault_container_version(request, salt_factories, vault_port, shell):
 
     factory = salt_factories.get_container(
         "vault",
-        "ghcr.io/saltstack/salt-ci-containers/vault:{}".format(vault_version),
+        f"ghcr.io/saltstack/salt-ci-containers/vault:{vault_version}",
         check_ports=[vault_port],
         container_run_kwargs={
             "ports": {"8200/tcp": vault_port},
             "environment": {
                 "VAULT_DEV_ROOT_TOKEN_ID": "testsecret",
                 "VAULT_LOCAL_CONFIG": json.dumps(config),
+                "SKIP_SETCAP": "1",
             },
-            "cap_add": "IPC_LOCK",
+            "cap_add": ["IPC_LOCK"],
         },
         pull_before_start=True,
         skip_on_pull_failure=True,
@@ -77,7 +108,7 @@ def vault_container_version(request, salt_factories, vault_port, shell):
                 VAULT_BINARY,
                 "login",
                 "token=testsecret",
-                env={"VAULT_ADDR": "http://127.0.0.1:{}".format(vault_port)},
+                env={"VAULT_ADDR": f"http://127.0.0.1:{vault_port}"},
             )
             if ret.returncode == 0:
                 break
@@ -91,8 +122,8 @@ def vault_container_version(request, salt_factories, vault_port, shell):
             "policy",
             "write",
             "testpolicy",
-            "{}/vault.hcl".format(RUNTIME_VARS.FILES),
-            env={"VAULT_ADDR": "http://127.0.0.1:{}".format(vault_port)},
+            f"{RUNTIME_VARS.FILES}/vault.hcl",
+            env={"VAULT_ADDR": f"http://127.0.0.1:{vault_port}"},
         )
         if ret.returncode != 0:
             log.debug("Failed to assign policy to vault:\n%s", ret)
@@ -118,17 +149,17 @@ def vault(loaders, modules, vault_container_version, shell, vault_port):
             "list",
             "--format=json",
             secret_path,
-            env={"VAULT_ADDR": "http://127.0.0.1:{}".format(vault_port)},
+            env={"VAULT_ADDR": f"http://127.0.0.1:{vault_port}"},
         )
         if ret.returncode == 0:
             for secret in ret.data:
-                secret_path = "secret/my/{}".format(secret)
+                secret_path = f"secret/my/{secret}"
                 ret = shell.run(
                     VAULT_BINARY,
                     "kv",
                     "delete",
                     secret_path,
-                    env={"VAULT_ADDR": "http://127.0.0.1:{}".format(vault_port)},
+                    env={"VAULT_ADDR": f"http://127.0.0.1:{vault_port}"},
                 )
                 ret = shell.run(
                     VAULT_BINARY,
@@ -136,7 +167,7 @@ def vault(loaders, modules, vault_container_version, shell, vault_port):
                     "metadata",
                     "delete",
                     secret_path,
-                    env={"VAULT_ADDR": "http://127.0.0.1:{}".format(vault_port)},
+                    env={"VAULT_ADDR": f"http://127.0.0.1:{vault_port}"},
                 )
 
 
@@ -270,6 +301,6 @@ def test_list_secrets(vault):
 @pytest.mark.usefixtures("existing_secret")
 def test_destroy_secret_kv2(vault, vault_container_version):
     if vault_container_version == "0.9.6":
-        pytest.skip("Test not applicable to vault=={}".format(vault_container_version))
+        pytest.skip(f"Test not applicable to vault=={vault_container_version}")
     ret = vault.destroy_secret("secret/my/secret", "1")
     assert ret is True

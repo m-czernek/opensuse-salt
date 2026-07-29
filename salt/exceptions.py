@@ -94,9 +94,13 @@ class AuthenticationError(SaltException):
     """
 
 
-class InvalidKeyError(SaltException):
+class InvalidKeyError(SaltException, ValueError):
     """
     Raised when we encounter an invalid RSA key.
+
+    Also subclasses ``ValueError`` because an invalid key IS a value error;
+    callers that catch ``ValueError`` (such as the FIPS-mode key-loading
+    paths in :mod:`salt.crypt`) will see this exception too.
     """
 
 
@@ -284,7 +288,7 @@ class SaltRenderError(SaltException):
         self.buffer = buf
         self.context = ""
         if trace:
-            exc_str += "\n{}\n".format(trace)
+            exc_str += f"\n{trace}\n"
         if self.line_num and self.buffer:
             # Avoid circular import
             import salt.utils.templates
@@ -366,6 +370,13 @@ class SaltValidationError(SaltException):
     """
     Thrown when a value fails validation
     """
+
+
+class UnsupportedAlgorithm(SaltException):
+    """
+    Thrown when a requested encryption or signing algorithm is un-supported.
+    """
+
 
 class SaltDaemonNotRunning(SaltException):
     """

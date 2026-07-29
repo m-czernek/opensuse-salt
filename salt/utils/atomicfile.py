@@ -2,6 +2,7 @@
 A module written originally by Armin Ronacher to manage file transfers in an
 atomic way
 """
+
 import errno
 import os
 import random
@@ -10,12 +11,17 @@ import sys
 import tempfile
 import time
 
+import salt.utils.files
 import salt.utils.win_dacl
 
 CAN_RENAME_OPEN_FILE = False
 if os.name == "nt":  # pragma: no cover
-    _rename = lambda src, dst: False  # pylint: disable=C0103
-    _rename_atomic = lambda src, dst: False  # pylint: disable=C0103
+
+    def _rename(src, dst):
+        return False
+
+    def _rename_atomic(src, dst):
+        return False
 
     try:
         import ctypes
@@ -90,7 +96,7 @@ if os.name == "nt":  # pragma: no cover
         except OSError as err:
             if err.errno != errno.EEXIST:
                 raise
-            old = "{}-{:08x}".format(dst, random.randint(0, sys.maxint))
+            old = f"{dst}-{random.randint(0, sys.maxint):08x}"
             os.rename(dst, old)
             os.rename(src, dst)
             try:
@@ -122,16 +128,33 @@ class _AtomicWFile:
     def close(self):
         if self._fh.closed:
             return
+        # Flush user-space buffers and fsync the file's data + metadata
+        # before the atomic rename. Without this, a crash after the rename
+        # can expose a written-but-unsynced (truncated/partial) file:
+        # POSIX does not require an implicit fsync on rename, and the
+        # fsync-on-rename heuristic of ext4 et al. is not universal. The
+        # fileno() / fsync() pair is guarded because some file-like objects
+        # do not expose a real fd (e.g. an in-memory wrapper); in that case
+        # there is nothing useful to sync at the fd level.
+        try:
+            self._fh.flush()
+            os.fsync(self._fh.fileno())
+        except (AttributeError, OSError, ValueError):
+            pass
         self._fh.close()
-        if os.path.isfile(self._filename):
-            if salt.utils.win_dacl.HAS_WIN32:
+        if salt.utils.win_dacl.HAS_WIN32:
+            if os.path.isfile(self._filename):
                 salt.utils.win_dacl.copy_security(
                     source=self._filename, target=self._tmp_filename
                 )
-            else:
+        else:
+            if os.path.isfile(self._filename):
                 shutil.copymode(self._filename, self._tmp_filename)
                 st = os.stat(self._filename)
                 os.chown(self._tmp_filename, st.st_uid, st.st_gid)
+            else:
+                # chmod file to default mode based on umask
+                os.chmod(self._tmp_filename, 0o666 & ~salt.utils.files.get_umask())
         atomic_rename(self._tmp_filename, self._filename)
 
     def __exit__(self, exc_type, exc_value, traceback):

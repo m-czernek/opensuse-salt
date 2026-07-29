@@ -36,7 +36,7 @@ the above word between angle brackets (<>).
                   - FollowSymlinks
                 AllowOverride: All
 
-.. versionchanged:: 2018.3
+.. versionchanged:: 2018.3.0
 
 Allows having the same section container multiple times (e.g. <Directory /path/to/dir>).
 
@@ -83,7 +83,6 @@ it still needs keyword ``this`` with empty string (or "\b" if nicer output is re
                     this: "\b"
                     do: another thing
 """
-
 
 import os
 

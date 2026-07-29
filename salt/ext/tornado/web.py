@@ -80,8 +80,6 @@ import types
 from inspect import isclass
 from io import BytesIO
 
-import salt.utils.timeutil
-
 import salt.ext.tornado
 from salt.ext.tornado.concurrent import Future
 from salt.ext.tornado import escape
@@ -541,7 +539,7 @@ class RequestHandler(object):
         return default
 
     def set_cookie(self, name, value, domain=None, expires=None, path="/",
-                   expires_days=None, samesite=None, **kwargs):
+                   expires_days=None, **kwargs):
         """Sets the given cookie name/value with the given options.
 
         Additional keyword arguments are set on the Cookie.Morsel
@@ -553,28 +551,25 @@ class RequestHandler(object):
         name = escape.native_str(name)
         value = escape.native_str(value)
         if re.search(r"[\x00-\x20]", value):
-            # Legacy check for control characters in cookie values. This check is no longer needed
-            # since the cookie library escapes these characters correctly now. It will be removed
-            # in the next feature release.
+            # Legacy check for control characters in cookie values. The cookie
+            # library escapes these correctly now; this may be removed later.
             raise ValueError("Invalid cookie %r: %r" % (name, value))
+        samesite = kwargs.get("samesite")
         for attr_name, attr_value in [
             ("name", name),
             ("domain", domain),
             ("path", path),
             ("samesite", samesite),
         ]:
-            # Cookie attributes may not contain control characters or semicolons (except when
-            # escaped in the value). A check for control characters was added to the http.cookies
-            # library in a Feb 2026 security release; as of March it still does not check for
-            # semicolons.
-            #
-            # When a semicolon check is added to the standard library (and the release has had time
-            # for adoption), this check may be removed, but be mindful of the fact that this may
-            # change the timing of the exception (to the generation of the Set-Cookie header in
-            # flush()). We m
-            if attr_value is not None and re.search(r"[\x00-\x20\x3b\x7f]", attr_value):
-                raise http.cookies.CookieError(
-                    f"Invalid cookie attribute {attr_name}={attr_value!r} for cookie {name!r}"
+            # Cookie attributes may not contain control characters, semicolons,
+            # or U+007F (DEL). The stdlib gained control-char checks in a 2026
+            # security release but did not yet cover semicolons or DEL here.
+            if attr_value is not None and re.search(
+                r"[\x00-\x20\x3b\x7f]", attr_value
+            ):
+                raise Cookie.CookieError(
+                    "Invalid cookie attribute %s=%r for cookie %r"
+                    % (attr_name, attr_value, name)
                 )
         if not hasattr(self, "_new_cookie"):
             self._new_cookie = Cookie.SimpleCookie()
@@ -585,14 +580,12 @@ class RequestHandler(object):
         if domain:
             morsel["domain"] = domain
         if expires_days is not None and not expires:
-            expires = salt.utils.timeutil.utcnow() + datetime.timedelta(
+            expires = datetime.datetime.utcnow() + datetime.timedelta(
                 days=expires_days)
         if expires:
             morsel["expires"] = httputil.format_timestamp(expires)
         if path:
             morsel["path"] = path
-        if samesite:
-            morsel["samesite"] = samesite
         for k, v in kwargs.items():
             if k == 'max_age':
                 k = 'max-age'
@@ -612,7 +605,7 @@ class RequestHandler(object):
         was set (but there is no way to find out on the server side
         which values were used for a given cookie).
         """
-        expires = salt.utils.timeutil.utcnow() - datetime.timedelta(days=365)
+        expires = datetime.datetime.utcnow() - datetime.timedelta(days=365)
         self.set_cookie(name, value="", path=path, expires=expires,
                         domain=domain)
 
@@ -1515,14 +1508,6 @@ class RequestHandler(object):
         try:
             if self.request.method not in self.SUPPORTED_METHODS:
                 raise HTTPError(405)
-
-            # If we're not in stream_request_body mode, this is the place where we parse the body.
-            if not _has_stream_request_body(self.__class__):
-                try:
-                    self.request._parse_body()
-                except httputil.HTTPInputError as e:
-                    raise HTTPError(400, "Invalid body: %s" % e)
-
             self.path_args = [self.decode_argument(arg) for arg in args]
             self.path_kwargs = dict((k, self.decode_argument(v, name=k))
                                     for (k, v) in kwargs.items())
@@ -2138,9 +2123,8 @@ class _HandlerDelegate(httputil.HTTPMessageDelegate):
         if self.stream_request_body:
             self.request.body.set_result(None)
         else:
-            # Note that the body gets parsed in RequestHandler._execute so it can be in
-            # the right exception handler scope.
             self.request.body = b''.join(self.chunks)
+            self.request._parse_body()
             self.execute()
 
     def on_connection_close(self):
@@ -2506,7 +2490,7 @@ class StaticFileHandler(RequestHandler):
         cache_time = self.get_cache_time(self.path, self.modified,
                                          content_type)
         if cache_time > 0:
-            self.set_header("Expires", salt.utils.timeutil.utcnow() +
+            self.set_header("Expires", datetime.datetime.utcnow() +
                             datetime.timedelta(seconds=cache_time))
             self.set_header("Cache-Control", "max-age=" + str(cache_time))
 

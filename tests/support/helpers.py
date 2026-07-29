@@ -8,6 +8,7 @@
 
     Test support helpers
 """
+
 import base64
 import builtins
 import errno
@@ -33,12 +34,13 @@ import types
 
 import attr
 import pytest
+import pytestskipmarkers.utils.platform
 from pytestshellutils.exceptions import ProcessFailed
 from pytestshellutils.utils import ports
 from pytestshellutils.utils.processes import ProcessResult
 
-import tornado.ioloop
-import tornado.web
+import salt.ext.tornado.ioloop
+import salt.ext.tornado.web
 import salt.utils.files
 import salt.utils.platform
 import salt.utils.pycrypto
@@ -73,7 +75,7 @@ def no_symlinks():
         ret = subprocess.run(
             ["git", "config", "--get", "core.symlinks"],
             shell=False,
-            universal_newlines=True,
+            text=True,
             cwd=RUNTIME_VARS.CODE_DIR,
             stdout=subprocess.PIPE,
             check=False,
@@ -508,7 +510,7 @@ class ForceImportErrorOn:
         if name in self.__module_names:
             importerror_fromlist = self.__module_names.get(name)
             if importerror_fromlist is None:
-                raise ImportError("Forced ImportError raised for {!r}".format(name))
+                raise ImportError(f"Forced ImportError raised for {name!r}")
 
             if importerror_fromlist.intersection(set(fromlist)):
                 raise ImportError(
@@ -698,7 +700,7 @@ def with_system_user(
                 log.debug("Failed to create system user")
                 # The user was not created
                 if on_existing == "skip":
-                    cls.skipTest("Failed to create system user {!r}".format(username))
+                    cls.skipTest(f"Failed to create system user {username!r}")
 
                 if on_existing == "delete":
                     log.debug("Deleting the system user %r", username)
@@ -726,7 +728,7 @@ def with_system_user(
                     hashed_password = password
                 else:
                     hashed_password = salt.utils.pycrypto.gen_hash(password=password)
-                hashed_password = "'{}'".format(hashed_password)
+                hashed_password = f"'{hashed_password}'"
                 add_pwd = cls.run_function(
                     "shadow.set_password", [username, hashed_password]
                 )
@@ -805,7 +807,7 @@ def with_system_group(group, on_existing="delete", delete=True):
                 log.debug("Failed to create system group")
                 # The group was not created
                 if on_existing == "skip":
-                    cls.skipTest("Failed to create system group {!r}".format(group))
+                    cls.skipTest(f"Failed to create system group {group!r}")
 
                 if on_existing == "delete":
                     log.debug("Deleting the system group %r", group)
@@ -902,7 +904,7 @@ def with_system_user_and_group(username, group, on_existing="delete", delete=Tru
                 log.debug("Failed to create system user")
                 # The user was not created
                 if on_existing == "skip":
-                    cls.skipTest("Failed to create system user {!r}".format(username))
+                    cls.skipTest(f"Failed to create system user {username!r}")
 
                 if on_existing == "delete":
                     log.debug("Deleting the system user %r", username)
@@ -929,7 +931,7 @@ def with_system_user_and_group(username, group, on_existing="delete", delete=Tru
                 log.debug("Failed to create system group")
                 # The group was not created
                 if on_existing == "skip":
-                    cls.skipTest("Failed to create system group {!r}".format(group))
+                    cls.skipTest(f"Failed to create system group {group!r}")
 
                 if on_existing == "delete":
                     log.debug("Deleting the system group %r", group)
@@ -1098,7 +1100,7 @@ def _check_required_sminion_attributes(sminion_attr, *required_items):
     available_items = list(getattr(sminion, sminion_attr))
     not_available_items = set()
 
-    name = "__not_available_{items}s__".format(items=sminion_attr)
+    name = f"__not_available_{sminion_attr}s__"
     if not hasattr(sminion, name):
         setattr(sminion, name, set())
 
@@ -1180,13 +1182,13 @@ def skip_if_binaries_missing(*binaries, **kwargs):
             if salt.utils.path.which(binary) is None:
                 return skip(
                     "{}The {!r} binary was not found".format(
-                        message and "{}. ".format(message) or "", binary
+                        message and f"{message}. " or "", binary
                     )
                 )
     elif salt.utils.path.which_bin(binaries) is None:
         return skip(
             "{}None of the following binaries was found: {}".format(
-                message and "{}. ".format(message) or "", ", ".join(binaries)
+                message and f"{message}. " or "", ", ".join(binaries)
             )
         )
     return _id
@@ -1277,7 +1279,7 @@ def http_basic_auth(login_cb=lambda username, password: False):
     .. code-block:: python
 
         @http_basic_auth(lambda u, p: u == 'foo' and p == 'bar')
-        class AuthenticatedHandler(tornado.web.RequestHandler):
+        class AuthenticatedHandler(salt.ext.tornado.web.RequestHandler):
             pass
     """
 
@@ -1422,7 +1424,7 @@ class Webserver:
         self.port = port
         self.wait = wait
         self.handler = (
-            handler if handler is not None else tornado.web.StaticFileHandler
+            handler if handler is not None else salt.ext.tornado.web.StaticFileHandler
         )
         self.web_root = None
         self.ssl_opts = ssl_opts
@@ -1431,14 +1433,14 @@ class Webserver:
         """
         Threading target which stands up the tornado application
         """
-        self.ioloop = tornado.ioloop.IOLoop()
+        self.ioloop = salt.ext.tornado.ioloop.IOLoop()
         self.ioloop.make_current()
-        if self.handler == tornado.web.StaticFileHandler:
-            self.application = tornado.web.Application(
+        if self.handler == salt.ext.tornado.web.StaticFileHandler:
+            self.application = salt.ext.tornado.web.Application(
                 [(r"/(.*)", self.handler, {"path": self.root})]
             )
         else:
-            self.application = tornado.web.Application(
+            self.application = salt.ext.tornado.web.Application(
                 [(r"/(.*)", self.handler)]
             )
         self.application.listen(self.port, ssl_options=self.ssl_opts)
@@ -1515,7 +1517,7 @@ class Webserver:
         self.stop()
 
 
-class SaveRequestsPostHandler(tornado.web.RequestHandler):
+class SaveRequestsPostHandler(salt.ext.tornado.web.RequestHandler):
     """
     Save all requests sent to the server.
     """
@@ -1535,7 +1537,7 @@ class SaveRequestsPostHandler(tornado.web.RequestHandler):
         raise NotImplementedError()
 
 
-class MirrorPostHandler(tornado.web.RequestHandler):
+class MirrorPostHandler(salt.ext.tornado.web.RequestHandler):
     """
     Mirror a POST body back to the client
     """
@@ -1609,7 +1611,7 @@ class VirtualEnv:
     venv_bin_dir = attr.ib(init=False, repr=False)
 
     @pip_requirement.default
-    def _default_pip_requiremnt(self):
+    def _default_pip_requirement(self):
         if os.environ.get("ONEDIR_TESTRUN", "0") == "1":
             return "pip>=22.3.1,<23.0"
         return "pip>=20.2.4,<21.2"
@@ -1630,6 +1632,15 @@ class VirtualEnv:
         environ = os.environ.copy()
         if self.env:
             environ.update(self.env)
+        # Onedir interpreters embed relenv toolchain paths under $HOME; CI may lack that
+        # tree when building sdists (e.g. timelib). Prefer host compilers when available.
+        if os.environ.get("ONEDIR_TESTRUN") == "1" and sys.platform != "win32":
+            cc = shutil.which("gcc")
+            cxx = shutil.which("g++")
+            if cc and "CC" not in environ:
+                environ["CC"] = cc
+            if cxx and "CXX" not in environ:
+                environ["CXX"] = cxx
         return environ
 
     @venv_python.default
@@ -1644,6 +1655,10 @@ class VirtualEnv:
         return pathlib.Path(self.venv_python).parent
 
     def __enter__(self):
+        if pytestskipmarkers.utils.platform.is_fips_enabled():
+            pytest.skip(
+                "Test cannot currently create virtual environments on a FIPS enabled platform"
+            )
         try:
             self._create_virtualenv()
         except subprocess.CalledProcessError:
@@ -1668,11 +1683,10 @@ class VirtualEnv:
         kwargs.setdefault("stderr", subprocess.PIPE)
         kwargs.setdefault("universal_newlines", True)
         env = kwargs.pop("env", None)
+        merged = dict(self.environ)
         if env:
-            env = self.environ.copy().update(env)
-        else:
-            env = self.environ
-        proc = subprocess.run(args, check=False, env=env, **kwargs)
+            merged.update(env)
+        proc = subprocess.run(args, check=False, env=merged, **kwargs)
         ret = ProcessResult(
             returncode=proc.returncode,
             stdout=proc.stdout,
@@ -1742,14 +1756,11 @@ class VirtualEnv:
         return data
 
     def _create_virtualenv(self):
-        pyexec = self.get_real_python()
-        if not pyexec:
-            pytest.fail("'python' binary not found for virtualenv")
         cmd = [
-            pyexec,
+            sys.executable,
             "-m",
             "virtualenv",
-            f"--python={pyexec}",
+            f"--python={self.get_real_python()}",
         ]
         if self.system_site_packages:
             cmd.append("--system-site-packages")
@@ -1882,7 +1893,7 @@ class Keys:
 
     @property
     def pub_path(self):
-        return self.priv_path.with_name("{}.pub".format(self.priv_path.name))
+        return self.priv_path.with_name(f"{self.priv_path.name}.pub")
 
     @property
     def pub(self):

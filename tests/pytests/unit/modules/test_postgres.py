@@ -2,6 +2,7 @@ import datetime
 import re
 
 import pytest
+from pytestskipmarkers.utils import platform
 
 import salt.modules.config as configmod
 import salt.modules.postgres as postgres
@@ -117,6 +118,8 @@ def idfn(val):
     ids=idfn,
 )
 def test_verify_password(role, password, verifier, method, result):
+    if platform.is_fips_enabled() and (method == "md5" or verifier == md5_pw):
+        pytest.skip("Test cannot run on a FIPS enabled platform")
     assert postgres._verify_password(role, password, verifier, method) == result
 
 
@@ -971,6 +974,7 @@ def test_user_update3():
         )
 
 
+@pytest.mark.skip_on_fips_enabled_platform
 def test_user_update_encrypted_passwd():
     with patch(
         "salt.modules.postgres._run_psql", Mock(return_value={"retcode": 0})
@@ -1226,6 +1230,7 @@ def test_create_extension_newerthan():
                 assert not postgres.create_extension("foo", ext_version="a", schema="b")
 
 
+@pytest.mark.skip_on_fips_enabled_platform
 def test_encrypt_passwords():
     assert postgres._maybe_encrypt_password("foo", "bar", False) == "bar"
     assert (
@@ -2527,6 +2532,92 @@ def test_tablespace_alter_new_name():
             port="testport",
             user="testuser",
         )
+
+
+def test_find_pg_binary_bins_dir_preferred_over_path():
+    """
+    When postgres.bins_dir is configured, _find_pg_binary should return the
+    binary from bins_dir even when a psql binary is also present on the system
+    PATH (GitHub issue #53190).
+    """
+
+    def which_side_effect(path):
+        if path == "/usr/pgsql-15/bin/psql":
+            return "/usr/pgsql-15/bin/psql"
+        if path == "psql":
+            return "/usr/bin/psql"
+        return None
+
+    with patch.dict(
+        postgres.__salt__,
+        {"config.option": MagicMock(return_value="/usr/pgsql-15/bin")},
+    ), patch("salt.utils.path.which", side_effect=which_side_effect):
+        result = postgres._find_pg_binary("psql")
+    assert result == "/usr/pgsql-15/bin/psql"
+
+
+def test_find_pg_binary_bins_dir_used_when_not_on_path():
+    """
+    When postgres.bins_dir is configured and psql is not on the system PATH,
+    _find_pg_binary should still find the binary via bins_dir.
+    """
+
+    def which_side_effect(path):
+        if path == "/usr/pgsql-15/bin/psql":
+            return "/usr/pgsql-15/bin/psql"
+        return None
+
+    with patch.dict(
+        postgres.__salt__,
+        {"config.option": MagicMock(return_value="/usr/pgsql-15/bin")},
+    ), patch("salt.utils.path.which", side_effect=which_side_effect):
+        result = postgres._find_pg_binary("psql")
+    assert result == "/usr/pgsql-15/bin/psql"
+
+
+def test_find_pg_binary_falls_back_to_path_when_bins_dir_not_set():
+    """
+    When postgres.bins_dir is not configured, _find_pg_binary should fall
+    back to the system PATH (regression guard).
+    """
+    with patch.dict(
+        postgres.__salt__,
+        {"config.option": MagicMock(return_value=None)},
+    ), patch("salt.utils.path.which", MagicMock(return_value="/usr/bin/psql")):
+        result = postgres._find_pg_binary("psql")
+    assert result == "/usr/bin/psql"
+
+
+def test_find_pg_binary_falls_back_to_path_when_not_in_bins_dir():
+    """
+    When postgres.bins_dir is configured but the binary is not found there,
+    _find_pg_binary should fall back to the system PATH.
+    """
+
+    def which_side_effect(path):
+        if path == "psql":
+            return "/usr/bin/psql"
+        return None
+
+    with patch.dict(
+        postgres.__salt__,
+        {"config.option": MagicMock(return_value="/usr/pgsql-15/bin")},
+    ), patch("salt.utils.path.which", side_effect=which_side_effect):
+        result = postgres._find_pg_binary("psql")
+    assert result == "/usr/bin/psql"
+
+
+def test_find_pg_binary_returns_none_when_not_found_anywhere():
+    """
+    When psql cannot be found in bins_dir or on the system PATH,
+    _find_pg_binary should return None so the caller can handle the error.
+    """
+    with patch.dict(
+        postgres.__salt__,
+        {"config.option": MagicMock(return_value="/usr/pgsql-15/bin")},
+    ), patch("salt.utils.path.which", MagicMock(return_value=None)):
+        result = postgres._find_pg_binary("psql")
+    assert result is None
 
 
 def test_tablespace_remove():

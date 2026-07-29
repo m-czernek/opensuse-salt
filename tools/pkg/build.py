@@ -1,23 +1,205 @@
 """
 These commands are used to build the salt onedir and system packages.
 """
+
 # pylint: disable=resource-leakage,broad-except
 from __future__ import annotations
 
+import base64
+import csv
+import hashlib
+import io
+import json
 import logging
 import os
 import pathlib
+import re
 import shutil
+import sys
 import tarfile
+import tempfile
 import zipfile
 from typing import TYPE_CHECKING
 
-import yaml
 from ptscripts import Context, command_group
 
 import tools.utils
 
 log = logging.getLogger(__name__)
+
+# Cached path to the patched pip wheel built by _build_patched_pip_wheel.
+# None until first call; reused across all build steps in the same process.
+_PATCHED_PIP_WHEEL: pathlib.Path | None = None
+
+
+def _apply_unified_diff(original_text: str, patch_text: str) -> str:
+    """
+    Apply a unified diff patch to *original_text* and return the result.
+
+    This is a minimal pure-Python applier sufficient for the well-formed,
+    non-fuzzy patches stored in pkg/patches/pip-urllib3/.  It handles the
+    standard unified diff hunk format produced by difflib.unified_diff and
+    GNU diff, including the '\\' (no newline at end of file) marker.
+    """
+    orig_lines = original_text.splitlines(True)
+    result: list[str] = []
+    orig_idx = 0
+
+    patch_lines = patch_text.splitlines(True)
+    i = 0
+
+    # Skip the file-header lines (--- / +++) before the first hunk.
+    while i < len(patch_lines) and not patch_lines[i].startswith("@@"):
+        i += 1
+
+    while i < len(patch_lines):
+        line = patch_lines[i]
+        if line.startswith("@@"):
+            m = re.match(r"^@@ -(\d+)(?:,\d+)? \+\d+(?:,\d+)? @@", line)
+            if not m:
+                i += 1
+                continue
+            orig_start = int(m.group(1)) - 1  # convert 1-based → 0-based
+
+            # Copy unchanged original lines that precede this hunk.
+            result.extend(orig_lines[orig_idx:orig_start])
+            orig_idx = orig_start
+            i += 1
+
+            # Process hunk body lines.
+            while i < len(patch_lines):
+                hunk_line = patch_lines[i]
+                if hunk_line.startswith("@@"):
+                    break  # next hunk starts
+                if hunk_line.startswith("+"):
+                    result.append(hunk_line[1:])
+                elif hunk_line.startswith("-"):
+                    orig_idx += 1
+                elif hunk_line.startswith(" "):
+                    result.append(orig_lines[orig_idx])
+                    orig_idx += 1
+                # "\\" → "No newline at end of file" marker; skip.
+                i += 1
+        else:
+            i += 1
+
+    # Copy any original lines that follow the last hunk.
+    result.extend(orig_lines[orig_idx:])
+    return "".join(result)
+
+
+def _patch_pip_wheel_urllib3(wheel_path: pathlib.Path) -> None:
+    """
+    Rewrite *wheel_path* in-place so that the urllib3 vendored inside pip
+    contains the Salt security backports defined in pkg/patches/pip-urllib3/.
+
+    Patches applied (unified diff format):
+      response.py.patch  — CVE-2025-66418, CVE-2026-21441
+      _version.py.patch  — version bumped to "2.6.3"
+
+    Each patch is applied to the file as extracted from the wheel, so the
+    original sources do not need to be stored in the repository.  The wheel's
+    RECORD file is updated with correct sha256 hashes and sizes for the two
+    patched files so that the installed dist-info stays valid.
+    """
+    patches_dir = tools.utils.REPO_ROOT / "pkg" / "patches" / "pip-urllib3"
+    patch_map = {
+        "pip/_vendor/urllib3/response.py": (
+            patches_dir / "response.py.patch"
+        ).read_text(encoding="utf-8"),
+        "pip/_vendor/urllib3/_version.py": (
+            patches_dir / "_version.py.patch"
+        ).read_text(encoding="utf-8"),
+    }
+
+    def _record_hash(content: bytes) -> str:
+        digest = hashlib.sha256(content).digest()
+        return "sha256=" + base64.urlsafe_b64encode(digest).decode().rstrip("=")
+
+    tmp_path = wheel_path.with_suffix(".tmp.whl")
+    try:
+        with zipfile.ZipFile(wheel_path, "r") as zin:
+            with zipfile.ZipFile(
+                tmp_path, "w", compression=zipfile.ZIP_DEFLATED
+            ) as zout:
+                record_name: str | None = None
+                record_rows: list[list[str]] = []
+                patched: dict[str, bytes] = {}
+
+                for item in zin.infolist():
+                    if item.filename.endswith(".dist-info/RECORD"):
+                        record_name = item.filename
+                        raw = zin.read(item.filename).decode("utf-8")
+                        record_rows = list(csv.reader(raw.splitlines()))
+                        continue  # written last after we know the new hashes
+                    if item.filename in patch_map:
+                        original = zin.read(item.filename).decode("utf-8")
+                        patched_text = _apply_unified_diff(
+                            original, patch_map[item.filename]
+                        )
+                        patched_bytes = patched_text.encode("utf-8")
+                        patched[item.filename] = patched_bytes
+                        zout.writestr(item, patched_bytes)
+                    else:
+                        zout.writestr(item, zin.read(item.filename))
+
+                # Update RECORD rows for patched files and write it back.
+                if record_name:
+                    new_rows = []
+                    for row in record_rows:
+                        if len(row) >= 1 and row[0] in patched:
+                            content = patched[row[0]]
+                            new_rows.append(
+                                [row[0], _record_hash(content), str(len(content))]
+                            )
+                        else:
+                            new_rows.append(row)
+                    buf = io.StringIO()
+                    csv.writer(buf).writerows(new_rows)
+                    zout.writestr(record_name, buf.getvalue())
+
+        tmp_path.replace(wheel_path)
+    except Exception:
+        tmp_path.unlink(missing_ok=True)
+        raise
+
+
+def _build_patched_pip_wheel(ctx: Context) -> pathlib.Path:
+    """
+    Download pip==25.2 into a temporary directory, patch its vendored urllib3,
+    and return the path to the patched wheel.  The result is cached for the
+    lifetime of the current process so subsequent calls are free.
+    """
+    global _PATCHED_PIP_WHEEL
+    if _PATCHED_PIP_WHEEL is not None:
+        return _PATCHED_PIP_WHEEL
+
+    tmpdir = pathlib.Path(tempfile.mkdtemp(prefix="salt-pip-patch-"))
+    ctx.info("Downloading pip==25.2 for urllib3 security patching ...")
+    # Drop PIP_CONSTRAINT for this single call: the constraints file
+    # pins pip to a newer version (e.g. 26.0.1) but the urllib3 patches
+    # in pkg/patches/pip-urllib3/ are written against pip 25.2's
+    # vendored urllib3 1.26.20 and would not apply to whatever urllib3
+    # the newer pip vendors. Leaving PIP_CONSTRAINT set causes
+    # ResolutionImpossible.
+    download_env = {k: v for k, v in os.environ.items() if k != "PIP_CONSTRAINT"}
+    ctx.run(
+        sys.executable,
+        "-m",
+        "pip",
+        "download",
+        "pip==25.2",
+        "--no-deps",
+        "--dest",
+        str(tmpdir),
+        env=download_env,
+    )
+    wheel = next(tmpdir.glob("pip-*.whl"))
+    ctx.info(f"Patching urllib3 CVEs inside {wheel.name} ...")
+    _patch_pip_wheel_urllib3(wheel)
+    _PATCHED_PIP_WHEEL = wheel
+    return wheel
+
 
 # Define the command group
 build = command_group(
@@ -26,13 +208,6 @@ build = command_group(
     description=__doc__,
     parent="pkg",
 )
-
-
-def _get_shared_constants():
-    shared_constants = (
-        tools.utils.REPO_ROOT / "cicd" / "shared-gh-workflows-context.yml"
-    )
-    return yaml.safe_load(shared_constants.read_text())
 
 
 @build.command(
@@ -78,19 +253,31 @@ def debian(
             )
             ctx.exit(1)
         ctx.info("Building the package from the source files")
-        shared_constants = _get_shared_constants()
+        shared_constants = tools.utils.get_cicd_shared_context()
+        if not python_version:
+            python_version = shared_constants["python_version"]
+        if not relenv_version:
+            relenv_version = shared_constants["relenv_version"]
+        if TYPE_CHECKING:
+            assert python_version
+            assert relenv_version
         new_env = {
-            "SALT_RELENV_VERSION": relenv_version or shared_constants["relenv_version"],
-            "SALT_PYTHON_VERSION": python_version
-            or shared_constants["python_version_linux"],
+            "SALT_RELENV_VERSION": relenv_version,
+            "SALT_PYTHON_VERSION": python_version,
             "SALT_PACKAGE_ARCH": str(arch),
+            "RELENV_FETCH_VERSION": relenv_version,
         }
         for key, value in new_env.items():
             os.environ[key] = value
             env_args.extend(["-e", key])
 
+    env = os.environ.copy()
+    env["PIP_CONSTRAINT"] = str(
+        tools.utils.REPO_ROOT / "requirements" / "constraints.txt"
+    )
+
     ctx.run("ln", "-sf", "pkg/debian/", ".")
-    ctx.run("debuild", *env_args, "-uc", "-us")
+    ctx.run("debuild", *env_args, "-uc", "-us", env=env)
 
     ctx.info("Done")
 
@@ -110,6 +297,10 @@ def debian(
         "arch": {
             "help": "The arch to build for",
         },
+        "key_id": {
+            "help": "Signing key id",
+            "required": False,
+        },
     },
 )
 def rpm(
@@ -118,10 +309,12 @@ def rpm(
     relenv_version: str = None,
     python_version: str = None,
     arch: str = None,
+    key_id: str = None,
 ):
     """
     Build the RPM package.
     """
+    onci = "GITHUB_WORKFLOW" in os.environ
     checkout = pathlib.Path.cwd()
     if onedir:
         onedir_artifact = checkout / "artifacts" / onedir
@@ -131,26 +324,57 @@ def rpm(
         )
         os.environ["SALT_ONEDIR_ARCHIVE"] = str(onedir_artifact)
     else:
-        ctx.info(f"Building the package from the source files")
+        ctx.info("Building the package from the source files")
         if arch is None:
             ctx.error(
                 "Building the package from the source files but the arch to build for has not been given"
             )
             ctx.exit(1)
-        ctx.info(f"Building the package from the source files")
-        shared_constants = _get_shared_constants()
+        ctx.info("Building the package from the source files")
+        shared_constants = tools.utils.get_cicd_shared_context()
+        if not python_version:
+            python_version = shared_constants["python_version"]
+        if not relenv_version:
+            relenv_version = shared_constants["relenv_version"]
+        if TYPE_CHECKING:
+            assert python_version
+            assert relenv_version
         new_env = {
-            "SALT_RELENV_VERSION": relenv_version or shared_constants["relenv_version"],
-            "SALT_PYTHON_VERSION": python_version
-            or shared_constants["python_version_linux"],
+            "SALT_RELENV_VERSION": relenv_version,
+            "SALT_PYTHON_VERSION": python_version,
             "SALT_PACKAGE_ARCH": str(arch),
+            "RELENV_FETCH_VERSION": relenv_version,
         }
         for key, value in new_env.items():
             os.environ[key] = value
 
+    env = os.environ.copy()
+    env["PIP_CONSTRAINT"] = str(
+        tools.utils.REPO_ROOT / "requirements" / "constraints.txt"
+    )
     spec_file = checkout / "pkg" / "rpm" / "salt.spec"
-    ctx.run("rpmbuild", "-bb", f"--define=_salt_src {checkout}", str(spec_file))
-
+    ctx.run(
+        "rpmbuild", "-bb", f"--define=_salt_src {checkout}", str(spec_file), env=env
+    )
+    if key_id:
+        if onci:
+            path = "/github/home/rpmbuild/RPMS/"
+        else:
+            path = "~/rpmbuild/RPMS/"
+        pkgs = list(pathlib.Path(path).glob("**/*.rpm"))
+        if not pkgs:
+            ctx.error("Signing requested but no packages found.")
+            ctx.exit(1)
+        for pkg in pkgs:
+            ctx.info(f"Running 'rpmsign' on {pkg} ...")
+            ctx.run(
+                "rpmsign",
+                "--key-id",
+                key_id,
+                "--addsign",
+                "--digest-algo=sha256",
+                str(pkg),
+            )
     ctx.info("Done")
 
 
@@ -159,7 +383,6 @@ def rpm(
     arguments={
         "onedir": {
             "help": "The name of the onedir artifact, if given it should be under artifacts/",
-            "required": True,
         },
         "salt_version": {
             "help": (
@@ -171,10 +394,21 @@ def rpm(
         "sign": {
             "help": "Sign and notorize built package",
         },
+        "relenv_version": {
+            "help": "The version of relenv to use",
+        },
+        "python_version": {
+            "help": "The version of python to build with using relenv",
+        },
     },
 )
 def macos(
-    ctx: Context, onedir: str = None, salt_version: str = None, sign: bool = False
+    ctx: Context,
+    onedir: str = None,
+    salt_version: str = None,
+    sign: bool = False,
+    relenv_version: str = None,
+    python_version: str = None,
 ):
     """
     Build the macOS package.
@@ -184,15 +418,57 @@ def macos(
         assert salt_version is not None
 
     checkout = pathlib.Path.cwd()
-    onedir_artifact = checkout / "artifacts" / onedir
-    _check_pkg_build_files_exist(ctx, onedir_artifact=onedir_artifact)
+    if onedir:
+        onedir_artifact = checkout / "artifacts" / onedir
+        ctx.info(f"Building package from existing onedir: {str(onedir_artifact)}")
+        _check_pkg_build_files_exist(ctx, onedir_artifact=onedir_artifact)
 
-    build_root = checkout / "pkg" / "macos" / "build" / "opt"
-    build_root.mkdir(parents=True, exist_ok=True)
-    ctx.info(f"Extracting the onedir artifact to {build_root}")
-    with tarfile.open(str(onedir_artifact)) as tarball:
-        with ctx.chdir(onedir_artifact.parent):
-            tarball.extractall(path=build_root)
+        build_root = checkout / "pkg" / "macos" / "build" / "opt"
+        build_root.mkdir(parents=True, exist_ok=True)
+        ctx.info(f"Extracting the onedir artifact to {build_root}")
+        with tarfile.open(str(onedir_artifact)) as tarball:
+            with ctx.chdir(onedir_artifact.parent):
+                tarball.extractall(path=build_root)  # nosec
+    else:
+        ctx.info("Building package without an existing onedir")
+
+    if not onedir:
+        # Prep the salt onedir if not building from an existing one
+        shared_constants = tools.utils.get_cicd_shared_context()
+        if not python_version:
+            python_version = shared_constants["python_version"]
+        if not relenv_version:
+            relenv_version = shared_constants["relenv_version"]
+        if TYPE_CHECKING:
+            assert python_version
+            assert relenv_version
+        os.environ["RELENV_FETCH_VERSION"] = relenv_version
+        with ctx.chdir(checkout / "pkg" / "macos"):
+            ctx.info("Fetching relenv python")
+            ctx.run(
+                "./build_python.sh",
+                "--version",
+                python_version,
+                "--relenv-version",
+                relenv_version,
+            )
+
+            ctx.info("Installing salt into the relenv python")
+            ctx.run("./install_salt.sh")
+
+        # Patch pip's vendored urllib3 in the standalone macOS build.
+        # install_salt.sh uses the relenv pip but does not upgrade it, so we
+        # install the security-patched pip wheel and replace the copy that
+        # virtualenv embeds so that new environments also get the fixed pip.
+        build_env = checkout / "pkg" / "macos" / "build" / "opt" / "salt"
+        python_bin = build_env / "bin" / "python3"
+        patched_pip = _build_patched_pip_wheel(ctx)
+        ctx.run(str(python_bin), "-m", "pip", "install", str(patched_pip))
+        for old_pip in (build_env / "lib").glob(
+            "python*/site-packages/virtualenv/seed/wheels/embed/pip-*.whl"
+        ):
+            old_pip.unlink()
+            shutil.copy(str(patched_pip), str(old_pip.parent / patched_pip.name))
 
     if sign:
         ctx.info("Signing binaries")
@@ -221,7 +497,6 @@ def macos(
     arguments={
         "onedir": {
             "help": "The name of the onedir artifact, if given it should be under artifacts/",
-            "required": True,
         },
         "salt_version": {
             "help": (
@@ -236,7 +511,13 @@ def macos(
             "required": True,
         },
         "sign": {
-            "help": "Sign and notorize built package",
+            "help": "Sign and notarize built package",
+        },
+        "relenv_version": {
+            "help": "The version of relenv to use",
+        },
+        "python_version": {
+            "help": "The version of python to build with using relenv",
         },
     },
 )
@@ -246,33 +527,27 @@ def windows(
     salt_version: str = None,
     arch: str = None,
     sign: bool = False,
+    relenv_version: str = None,
+    python_version: str = None,
 ):
     """
     Build the Windows package.
     """
     if TYPE_CHECKING:
-        assert onedir is not None
         assert salt_version is not None
         assert arch is not None
 
-    checkout = pathlib.Path.cwd()
-    onedir_artifact = checkout / "artifacts" / onedir
-    _check_pkg_build_files_exist(ctx, onedir_artifact=onedir_artifact)
+    shared_constants = tools.utils.get_cicd_shared_context()
+    if not python_version:
+        python_version = shared_constants["python_version"]
+    if not relenv_version:
+        relenv_version = shared_constants["relenv_version"]
+    if TYPE_CHECKING:
+        assert python_version
+        assert relenv_version
+    os.environ["RELENV_FETCH_VERSION"] = relenv_version
 
-    unzip_dir = checkout / "pkg" / "windows"
-    ctx.info(f"Unzipping the onedir artifact to {unzip_dir}")
-    with zipfile.ZipFile(onedir_artifact, mode="r") as archive:
-        archive.extractall(unzip_dir)
-
-    move_dir = unzip_dir / "salt"
-    build_env = unzip_dir / "buildenv"
-    _check_pkg_build_files_exist(ctx, move_dir=move_dir)
-
-    ctx.info(f"Moving {move_dir} directory to the build environment in {build_env}")
-    shutil.move(move_dir, build_env)
-
-    ctx.info("Building the windows package")
-    ctx.run(
+    build_cmd = [
         "powershell.exe",
         "&",
         "pkg/windows/build.cmd",
@@ -280,9 +555,37 @@ def windows(
         arch,
         "-Version",
         salt_version,
+        "-PythonVersion",
+        python_version,
+        "-RelenvVersion",
+        relenv_version,
         "-CICD",
-        "-SkipInstall",
-    )
+    ]
+
+    checkout = pathlib.Path.cwd()
+    if onedir:
+        build_cmd.append("-SkipInstall")
+        onedir_artifact = checkout / "artifacts" / onedir
+        ctx.info(f"Building package from existing onedir: {str(onedir_artifact)}")
+        _check_pkg_build_files_exist(ctx, onedir_artifact=onedir_artifact)
+
+        unzip_dir = checkout / "pkg" / "windows"
+        ctx.info(f"Unzipping the onedir artifact to {unzip_dir}")
+        with zipfile.ZipFile(onedir_artifact, mode="r") as archive:
+            archive.extractall(unzip_dir)  # nosec
+
+        move_dir = unzip_dir / "salt"
+        build_env = unzip_dir / "buildenv"
+        _check_pkg_build_files_exist(ctx, move_dir=move_dir)
+
+        ctx.info(f"Moving {move_dir} directory to the build environment in {build_env}")
+        shutil.move(move_dir, build_env)
+    else:
+        build_cmd.append("-Build")
+        ctx.info("Building package without an existing onedir")
+
+    ctx.info(f"Running: {' '.join(build_cmd)} ...")
+    ctx.run(*build_cmd)
 
     if sign:
         env = os.environ.copy()
@@ -356,12 +659,15 @@ def windows(
     arguments={
         "arch": {
             "help": "The architecture to build the package for",
-            "choices": ("x86_64", "aarch64", "x86", "amd64"),
+            "choices": ("x86_64", "arm64", "x86", "amd64"),
             "required": True,
         },
         "python_version": {
             "help": "The version of python to create an environment for using relenv",
             "required": True,
+        },
+        "relenv_version": {
+            "help": "The version of relenv to use",
         },
         "package_name": {
             "help": "The name of the relenv environment to be created",
@@ -377,6 +683,7 @@ def onedir_dependencies(
     ctx: Context,
     arch: str = None,
     python_version: str = None,
+    relenv_version: str = None,
     package_name: str = None,
     platform: str = None,
 ):
@@ -391,33 +698,98 @@ def onedir_dependencies(
         assert package_name is not None
         assert platform is not None
 
+    if platform == "darwin":
+        platform = "macos"
+
+    if platform != "macos" and arch == "arm64":
+        arch = "aarch64"
+
+    shared_constants = tools.utils.get_cicd_shared_context()
+    if not python_version:
+        python_version = shared_constants["python_version"]
+    if not relenv_version:
+        relenv_version = shared_constants["relenv_version"]
+    if TYPE_CHECKING:
+        assert python_version
+        assert relenv_version
+    os.environ["RELENV_FETCH_VERSION"] = relenv_version
+
     # We import relenv here because it is not a hard requirement for the rest of the tools commands
     try:
-        from relenv.create import create
+        import relenv.create
     except ImportError:
         ctx.exit(1, "Relenv not installed in the current environment.")
 
     dest = pathlib.Path(package_name).resolve()
-    create(dest, arch=arch, version=python_version)
+    relenv.create.create(dest, arch=arch, version=python_version)
+
+    # Validate that we're using the relenv version we really want to
+    if platform == "windows":
+        env_scripts_dir = dest / "Scripts"
+    else:
+        env_scripts_dir = dest / "bin"
+
+    ret = ctx.run(
+        str(env_scripts_dir / "relenv"), "--version", capture=True, check=False
+    )
+    if ret.returncode:
+        ctx.error(f"Failed to get the relenv version: {ret}")
+        ctx.exit(1)
+
+    env_relenv_version = ret.stdout.strip().decode()
+    if env_relenv_version != relenv_version:
+        ctx.error(
+            f"The onedir installed relenv version({env_relenv_version}) is not "
+            f"the relenv version which should be used({relenv_version})."
+        )
+        ctx.exit(1)
+
+    ctx.info(
+        f"The relenv version installed in the onedir env({env_relenv_version}) "
+        f"matches the version which must be used."
+    )
 
     env = os.environ.copy()
-    install_args = ["-v"]
+    install_args = [
+        "-v",
+        "--use-pep517",
+        "--no-cache-dir",
+        # cmake and ninja are build tools (used to drive other builds); they
+        # are never linked into runtime artifacts. Force wheels for them so
+        # --no-binary :all: below does not trigger a CMake source build,
+        # which fails under the relenv toolchain (missing pid_t/mode_t/etc).
+        "--only-binary=maturin,apache-libcloud,pymssql,hatchling,cmake,ninja,protobuf",
+    ]
     if platform == "windows":
-        python_bin = dest / "Scripts" / "python"
+        python_bin = env_scripts_dir / "python"
     else:
         env["RELENV_BUILDENV"] = "1"
-        python_bin = dest / "bin" / "python3"
-        install_args.extend(
-            [
-                "--use-pep517",
-                "--no-cache-dir",
-                "--no-binary=:all:",
-            ]
+        python_bin = env_scripts_dir / "python3"
+        install_args.append("--no-binary=:all:")
+        install_args.append(
+            "--only-binary=maturin,apache-libcloud,pymssql,cassandra-driver,hatchling,cmake,ninja,protobuf"
         )
+        # CMake 4.x removed support for cmake_minimum_required(VERSION < 3.5).
+        # pyzmq's bundled libzmq still declares an older floor; set the policy
+        # version minimum so nested CMake projects keep configuring. Affects
+        # both macOS (runner CMake) and Linux source-package builds (the
+        # cmake wheel pulled in by --only-binary now ships CMake 4.x).
+        env["CMAKE_POLICY_VERSION_MINIMUM"] = "3.5"
 
     # Cryptography needs openssl dir set to link to the proper openssl libs.
     if platform == "macos":
         env["OPENSSL_DIR"] = f"{dest}"
+
+    if platform == "linux":
+        # This installs the ppbt package. We'll remove it after installing all
+        # of our python packages.
+        ctx.run(
+            str(python_bin),
+            "-m",
+            "pip",
+            "install",
+            "relenv[toolchain]",
+        )
 
     version_info = ctx.run(
         str(python_bin),
@@ -432,33 +804,45 @@ def onedir_dependencies(
         / "static"
         / "pkg"
         / f"py{requirements_version}"
-        / f"{platform}.txt"
+        / f"{platform if platform != 'macos' else 'darwin'}.lock"
     )
     _check_pkg_build_files_exist(ctx, requirements_file=requirements_file)
 
+    env["PIP_CONSTRAINT"] = str(
+        tools.utils.REPO_ROOT / "requirements" / "constraints.txt"
+    )
     ctx.run(
         str(python_bin),
         "-m",
         "pip",
         "install",
         "-U",
+        "setuptools",
         "wheel",
+        env=env,
     )
+    # Install pip from the security-patched wheel instead of pulling from PyPI,
+    # so that pip's vendored urllib3 never contains the vulnerable version.
+    # --force-reinstall is required because relenv ships with pip pre-installed
+    # at the same version (25.2), so without it pip would skip the install as
+    # "already satisfied" and leave the unpatched copy in site-packages.
+    # PIP_CONSTRAINT is dropped for this single call because the constraints
+    # file pins pip to a newer version (e.g. 26.0.1) for the requirements
+    # install below, but here we are intentionally installing the older
+    # patched 25.2 wheel.  Leaving PIP_CONSTRAINT set produces a
+    # ResolutionImpossible between "user requested pip 25.2" and the
+    # constraint.
+    patched_pip = _build_patched_pip_wheel(ctx)
+    patched_env = {k: v for k, v in env.items() if k != "PIP_CONSTRAINT"}
     ctx.run(
         str(python_bin),
         "-m",
         "pip",
         "install",
-        "-U",
-        "pip>=22.3.1,<23.0",
-    )
-    ctx.run(
-        str(python_bin),
-        "-m",
-        "pip",
-        "install",
-        "-U",
-        "setuptools>=65.6.3,<66",
+        "--force-reinstall",
+        "--no-deps",
+        str(patched_pip),
+        env=patched_env,
     )
     ctx.run(
         str(python_bin),
@@ -470,8 +854,6 @@ def onedir_dependencies(
         str(requirements_file),
         env=env,
     )
-    extras_dir = dest / f"extras-{requirements_version}"
-    extras_dir.mkdir()
 
 
 @build.command(
@@ -488,6 +870,9 @@ def onedir_dependencies(
             "help": "The name of the relenv environment to install salt into",
             "required": True,
         },
+        "relenv_version": {
+            "help": "The version of relenv to use",
+        },
     },
 )
 def salt_onedir(
@@ -495,6 +880,7 @@ def salt_onedir(
     salt_name: str,
     platform: str = None,
     package_name: str = None,
+    relenv_version: str = None,
 ):
     """
     Install salt into a relenv onedir environment.
@@ -503,9 +889,45 @@ def salt_onedir(
         assert platform is not None
         assert package_name is not None
 
+    if platform == "darwin":
+        platform = "macos"
+
+    shared_constants = tools.utils.get_cicd_shared_context()
+    if not relenv_version:
+        relenv_version = shared_constants["relenv_version"]
+    if TYPE_CHECKING:
+        assert relenv_version
+    os.environ["RELENV_FETCH_VERSION"] = relenv_version
+
     salt_archive = pathlib.Path(salt_name).resolve()
     onedir_env = pathlib.Path(package_name).resolve()
     _check_pkg_build_files_exist(ctx, onedir_env=onedir_env, salt_archive=salt_archive)
+
+    # Validate that we're using the relenv version we really want to
+    if platform == "windows":
+        env_scripts_dir = onedir_env / "Scripts"
+    else:
+        env_scripts_dir = onedir_env / "bin"
+
+    ret = ctx.run(
+        str(env_scripts_dir / "relenv"), "--version", capture=True, check=False
+    )
+    if ret.returncode:
+        ctx.error(f"Failed to get the relenv version: {ret}")
+        ctx.exit(1)
+
+    env_relenv_version = ret.stdout.strip().decode()
+    if env_relenv_version != relenv_version:
+        ctx.error(
+            f"The onedir installed relenv version({env_relenv_version}) is not "
+            f"the relenv version which should be used({relenv_version})."
+        )
+        ctx.exit(1)
+
+    ctx.info(
+        f"The relenv version installed in the onedir env({env_relenv_version}) "
+        f"matches the version which must be used."
+    )
 
     env = os.environ.copy()
     env["USE_STATIC_REQUIREMENTS"] = "1"
@@ -529,18 +951,232 @@ def salt_onedir(
             "-CICD",
             env=env,
         )
+        python_executable = str(env_scripts_dir / "python.exe")
+        ret = ctx.run(
+            python_executable,
+            "-c",
+            "import json, sys, site, pathlib; sys.stdout.write(json.dumps([pathlib.Path(p).as_posix() for p in site.getsitepackages()]))",
+            capture=True,
+        )
+        if ret.returncode:
+            ctx.error(f"Failed to get the path to `site-packages`: {ret}")
+            ctx.exit(1)
+        site_packages_json = json.loads(ret.stdout.strip().decode())
+        ctx.info(f"Discovered 'site-packages' paths: {site_packages_json}")
     else:
         env["RELENV_PIP_DIR"] = "1"
-        pip_bin = onedir_env / "bin" / "pip3"
-        ctx.run(str(pip_bin), "install", str(salt_archive), env=env)
-        if platform == "darwin":
+        pip_bin = env_scripts_dir / "pip3"
+        if platform == "linux":
+            # This installs the ppbt package. We'll remove it after installing all
+            # of our python packages.
+            ctx.run(
+                str(pip_bin),
+                "install",
+                "relenv[toolchain]",
+            )
+
+        ctx.run(
+            "git",
+            "add",
+            "-f",
+            "salt/_version.txt",
+            check=False,
+            cwd=str(tools.utils.REPO_ROOT),
+        )
+
+        ctx.run(
+            str(pip_bin),
+            "install",
+            "--no-warn-script-location",
+            str(salt_archive),
+            env=env,
+        )
+        if platform == "macos":
 
             def errfn(fn, path, err):
                 ctx.info(f"Removing {path} failed: {err}")
 
-            shutil.rmtree(onedir_env / "opt", onerror=errfn)
-            shutil.rmtree(onedir_env / "etc", onerror=errfn)
-            shutil.rmtree(onedir_env / "Library", onerror=errfn)
+            # shutil.rmtree's onerror= is deprecated in 3.12 in favour
+            # of onexc=. Use whichever is available so newer pylint
+            # stops warning while preserving 3.9-3.11 support. Passing
+            # the keyword through ``**`` keeps pylint from statically
+            # complaining about whichever name isn't in the active
+            # Python's signature.
+            rmtree_kw = (
+                {"onexc": errfn} if sys.version_info >= (3, 12) else {"onerror": errfn}
+            )
+            for subdir in ("opt", "etc", "Library"):
+                path = onedir_env / subdir
+                if path.exists():
+                    shutil.rmtree(path, **rmtree_kw)  # type: ignore[call-overload]
+
+        python_executable = str(env_scripts_dir / "python3")
+        ret = ctx.run(
+            python_executable,
+            "-c",
+            "import json, sys, site, pathlib; sys.stdout.write(json.dumps(site.getsitepackages()))",
+            capture=True,
+        )
+        if ret.returncode:
+            ctx.error(f"Failed to get the path to `site-packages`: {ret}")
+            ctx.exit(1)
+        site_packages_json = json.loads(ret.stdout.strip().decode())
+        ctx.info(f"Discovered 'site-packages' paths: {site_packages_json}")
+
+    site_packages: str
+    for site_packages_path in site_packages_json:
+        if "site-packages" in site_packages_path:
+            site_packages = site_packages_path
+            break
+    else:
+        ctx.error("Cloud not find a site-packages path with 'site-packages' in it?!")
+        ctx.exit(1)
+
+    ret = ctx.run(
+        str(python_executable),
+        "-c",
+        "import sys; print('{}.{}'.format(*sys.version_info))",
+        capture=True,
+    )
+    python_version_info = ret.stdout.strip().decode()
+    extras_dir = onedir_env / f"extras-{python_version_info}"
+    ctx.info(f"Creating Salt's extras path: {extras_dir}")
+    extras_dir.mkdir(exist_ok=True)
+
+    for fname in ("_salt_onedir_extras.py", "_salt_onedir_extras.pth"):
+        src = tools.utils.REPO_ROOT / "pkg" / "common" / "onedir" / fname
+        dst = pathlib.Path(site_packages) / fname
+        ctx.info(f"Copying '{src.relative_to(tools.utils.REPO_ROOT)}' to '{dst}' ...")
+        shutil.copyfile(src, dst)
+
+    if platform == "linux":
+        # The ppbt package is very large. It is only needed when installing
+        # python modules that need to be compiled. Do not ship ppbt by default,
+        # it can be installed later if needed.
+        ctx.run(
+            str(python_executable),
+            "-m",
+            "pip",
+            "uninstall",
+            "-y",
+            "ppbt",
+        )
+
+    # Update virtualenv embedded wheels
+    embed_dir = pathlib.Path(site_packages) / "virtualenv" / "seed" / "wheels" / "embed"
+    # clear existing wheels
+    if embed_dir.exists():
+        for file in embed_dir.glob("*.whl"):
+            try:
+                file.unlink()
+            except Exception as e:
+                log.error("Error deleting %s: %s", file.name, e)
+    else:
+        embed_dir.mkdir(parents=True, exist_ok=True)
+
+    # download new virtualenv embedded wheels
+    env["PIP_CONSTRAINT"] = str(
+        tools.utils.REPO_ROOT / "requirements" / "constraints.txt"
+    )
+    # Download setuptools and wheel normally; pip is handled separately below
+    # so that the security-patched wheel is used instead of the PyPI version.
+    ctx.run(
+        str(python_executable),
+        "-m",
+        "pip",
+        "download",
+        "setuptools",
+        "wheel",
+        "--dest",
+        str(embed_dir),
+    )
+    # Copy the security-patched pip wheel into the embed directory so that
+    # virtualenv seeds new environments with pip that has the urllib3 fixes.
+    patched_pip = _build_patched_pip_wheel(ctx)
+    shutil.copy(str(patched_pip), str(embed_dir / patched_pip.name))
+
+    # Update __init__.py with the new versions
+
+    # 1. Identify the new wheel versions on disk
+    wheels = list(embed_dir.glob("*.whl"))
+
+    def get_latest(name):
+        # Finds the wheel with the highest version number for a given package name
+        matches = [w.name for w in wheels if w.name.startswith(name + "-")]
+        return sorted(matches, reverse=True)[0] if matches else None
+
+    new_pip = get_latest("pip")
+    new_setuptools = get_latest("setuptools")
+    new_wheel = get_latest("wheel")
+
+    if not all([new_pip, new_setuptools]):
+        log.debug("Error: Could not find new wheels to map in __init__.py")
+    else:
+
+        # 2. Read the current __init__.py content
+        init_file = embed_dir / "__init__.py"
+        content = init_file.read_text()
+
+        # 3. Use Regex to replace the specific filenames globally in the BUNDLE_SUPPORT dict
+        # This targets the specific quoted strings for each package type
+        content = re.sub(
+            r'("pip":\s*")([^"]+)"',
+            f'\\1{new_pip}"',
+            content,
+        )
+        content = re.sub(
+            r'("setuptools":\s*")([^"]+)"',
+            f'\\1{new_setuptools}"',
+            content,
+        )
+        content = re.sub(
+            r'("wheel":\s*")([^"]+)"',
+            f'\\1{new_wheel}"',
+            content,
+        )
+
+        # virtualenv >= 21 added a BUNDLE_SHA256 verification step that
+        # rejects any embedded wheel without a recorded hash. The
+        # security-patched pip wheel we just substituted into the embed
+        # directory therefore has to be registered there too. Earlier
+        # virtualenv (<= 20.x) has no BUNDLE_SHA256 dict so the regex
+        # simply does not match and we leave the file unchanged.
+        if "BUNDLE_SHA256" in content:
+            on_disk_wheels = {
+                "pip": new_pip,
+                "setuptools": new_setuptools,
+                "wheel": new_wheel,
+            }
+            new_entries = {}
+            for filename in on_disk_wheels.values():
+                if not filename:
+                    continue
+                digest = hashlib.sha256((embed_dir / filename).read_bytes()).hexdigest()
+                new_entries[filename] = digest
+
+            def _replace_bundle_sha256(match):
+                # Build a fresh BUNDLE_SHA256 dict containing only the
+                # wheels that ship in this embed directory.
+                indent = "    "
+                lines = ["BUNDLE_SHA256 = {"]
+                for filename, digest in sorted(new_entries.items()):
+                    lines.append(f'{indent}"{filename}": "{digest}",')
+                lines.append("}")
+                return "\n".join(lines)
+
+            content = re.sub(
+                r"BUNDLE_SHA256\s*=\s*\{[^}]*\}",
+                _replace_bundle_sha256,
+                content,
+                count=1,
+            )
+
+        # 4. Write the updated file back
+        init_file.write_text(content)
+        log.debug("Updated %s with:", init_file.name)
+        log.debug(
+            "Pip: %s\nSetuptools: %s\nWheel: %s", new_pip, new_setuptools, new_wheel
+        )
 
 
 def _check_pkg_build_files_exist(ctx: Context, **kwargs):

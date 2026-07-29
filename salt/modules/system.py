@@ -12,6 +12,7 @@ Support for reboot, shutdown, etc on POSIX-like systems.
 
 """
 
+import logging
 import os.path
 import re
 from datetime import datetime, timedelta, tzinfo
@@ -19,9 +20,10 @@ from datetime import datetime, timedelta, tzinfo
 import salt.utils.files
 import salt.utils.path
 import salt.utils.platform
-import salt.utils.timeutil
 from salt.exceptions import CommandExecutionError, SaltInvocationError
 from salt.utils.decorators import depends
+
+log = logging.getLogger(__name__)
 
 __virtualname__ = "system"
 
@@ -68,7 +70,7 @@ def init(runlevel):
 
         salt '*' system.init 3
     """
-    cmd = ["init", "{}".format(runlevel)]
+    cmd = ["init", f"{runlevel}"]
     ret = __salt__["cmd.run"](cmd, python_shell=False)
     return ret
 
@@ -101,7 +103,7 @@ def reboot(at_time=None):
 
         salt '*' system.reboot
     """
-    cmd = ["shutdown", "-r", ("{}".format(at_time) if at_time else "now")]
+    cmd = ["shutdown", "-r", (f"{at_time}" if at_time else "now")]
     ret = __salt__["cmd.run"](cmd, python_shell=False)
     return ret
 
@@ -129,7 +131,7 @@ def shutdown(at_time=None):
     else:
         flag = "-h"
 
-    cmd = ["shutdown", flag, ("{}".format(at_time) if at_time else "now")]
+    cmd = ["shutdown", flag, (f"{at_time}" if at_time else "now")]
     ret = __salt__["cmd.run"](cmd, python_shell=False)
     return ret
 
@@ -203,10 +205,10 @@ def _swclock_to_hwclock():
     """
     res = __salt__["cmd.run_all"](["hwclock", "--systohc"], python_shell=False)
     if res["retcode"] != 0:
-        msg = "hwclock failed to set hardware clock from software clock: {}".format(
-            res["stderr"]
+        log.warn(
+            "hwclock failed to set hardware clock from software clock: %s",
+            res["stderr"],
         )
-        raise CommandExecutionError(msg)
     return True
 
 
@@ -256,7 +258,7 @@ def _get_offset_time(utc_offset):
     if utc_offset is not None:
         minutes = _offset_to_min(utc_offset)
         offset = timedelta(minutes=minutes)
-        offset_time = salt.utils.timeutil.utcnow() + offset
+        offset_time = datetime.utcnow() + offset
         offset_time = offset_time.replace(tzinfo=_FixedOffset(minutes))
     else:
         offset_time = datetime.now()
@@ -593,7 +595,7 @@ def set_computer_desc(desc):
             pass
 
     pattern = re.compile(r"^\s*PRETTY_HOSTNAME=(.*)$")
-    new_line = salt.utils.stringutils.to_str('PRETTY_HOSTNAME="{}"'.format(desc))
+    new_line = salt.utils.stringutils.to_str(f'PRETTY_HOSTNAME="{desc}"')
     try:
         with salt.utils.files.fopen("/etc/machine-info", "r+") as mach_info:
             lines = mach_info.readlines()
@@ -634,7 +636,7 @@ def get_computer_name():
 
     .. code-block:: bash
 
-        salt '*' network.get_hostname
+        salt '*' system.get_computer_name
     """
     return __salt__["network.get_hostname"]()
 
@@ -670,10 +672,10 @@ def set_reboot_required_witnessed():
             os.makedirs(dir_path)
         except OSError as ex:
             raise SaltInvocationError(
-                "Error creating {} (-{}): {}".format(dir_path, ex.errno, ex.strerror)
+                f"Error creating {dir_path} (-{ex.errno}): {ex.strerror}"
             )
 
-        rdict = __salt__["cmd.run_all"]("touch {}".format(NILRT_REBOOT_WITNESS_PATH))
+        rdict = __salt__["cmd.run_all"](f"touch {NILRT_REBOOT_WITNESS_PATH}")
         errcode = rdict["retcode"]
 
     return errcode == 0

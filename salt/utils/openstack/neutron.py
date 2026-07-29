@@ -2,7 +2,6 @@
 Neutron class
 """
 
-
 import logging
 
 import salt.utils.versions
@@ -87,9 +86,8 @@ class SaltNeutron(NeutronShell):
         service_type="network",
         os_auth_plugin=None,
         use_keystoneauth=False,
-        **kwargs
+        **kwargs,
     ):
-
         """
         Set up neutron credentials
         """
@@ -117,7 +115,7 @@ class SaltNeutron(NeutronShell):
                 service_type=service_type,
                 os_auth_plugin=os_auth_plugin,
                 password=password,
-                **kwargs
+                **kwargs,
             )
         else:
             self._old_init(
@@ -128,7 +126,7 @@ class SaltNeutron(NeutronShell):
                 service_type=service_type,
                 os_auth_plugin=os_auth_plugin,
                 password=password,
-                **kwargs
+                **kwargs,
             )
 
     def _new_init(
@@ -142,7 +140,7 @@ class SaltNeutron(NeutronShell):
         os_auth_plugin,
         auth=None,
         verify=True,
-        **kwargs
+        **kwargs,
     ):
         if auth is None:
             auth = {}
@@ -181,7 +179,7 @@ class SaltNeutron(NeutronShell):
         os_auth_plugin,
         auth=None,
         verify=True,
-        **kwargs
+        **kwargs,
     ):
         self.kwargs = kwargs.copy()
 
@@ -783,7 +781,7 @@ class SaltNeutron(NeutronShell):
         peer_id,
         psk,
         admin_state_up=True,
-        **kwargs
+        **kwargs,
     ):
         """
         Creates a new IPsecSiteConnection

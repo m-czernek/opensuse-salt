@@ -2,15 +2,29 @@
 A Salt Util for working with the Registry.pol file. The Registry.pol file is the
 source of truth for registry settings that are configured via LGPO.
 """
+
+import ctypes
+import ctypes.wintypes
 import logging
 import os
 import re
 import struct
+import time
+from contextlib import contextmanager
 
 import salt.modules.win_file
 import salt.utils.files
+import salt.utils.platform
 import salt.utils.win_reg
 from salt.exceptions import CommandExecutionError
+
+try:
+    import win32con
+
+    HAS_WINDOWS_MODULES = True
+except ImportError:
+    HAS_WINDOWS_MODULES = False
+
 
 CLASS_INFO = {
     "User": {
@@ -56,6 +70,8 @@ def __virtual__():
     """
     if not salt.utils.platform.is_windows():
         return False, "LGPO_REG Util: Only available on Windows"
+    if not HAS_WINDOWS_MODULES:
+        return False, "LGPO_REG Util: Missing win32 modules"
 
     return __virtualname__
 
@@ -67,13 +83,11 @@ def search_reg_pol(search_string, policy_data):
     gpt.ini
 
     Args:
-
         search_string (str): The string to search for
 
         policy_data (str): The data to be searched
 
     Returns:
-
         bool: ``True`` if the regex search_string is found, otherwise ``False``
     """
     if policy_data:
@@ -86,12 +100,47 @@ def search_reg_pol(search_string, policy_data):
     return False
 
 
+def refresh_policy():
+    """
+    Trigger a native in-process Machine Group Policy refresh via userenv.dll.
+
+    Calls ``RefreshPolicy(bMachine=True)`` exported by ``userenv.dll`` via
+    ``ctypes``. This signals the native OS Group Policy service to process the
+    local ``.pol`` file and commit registry keys without requiring a direct
+    write to the protected policy hive.
+
+    .. note::
+        This call is **asynchronous** — it signals the GP service to begin
+        processing the local ``Registry.pol`` file and returns before that
+        processing is complete. Registry values will reflect the updated
+        policy only after the service finishes its refresh cycle.
+
+        To verify the applied state after the refresh, use
+        :func:`salt.modules.win_lgpo_reg.get_rsop_value`.
+
+    Returns:
+        bool: ``True`` if the refresh signal was accepted successfully
+    """
+    try:
+        userenv = ctypes.WinDLL("userenv.dll")
+        userenv.RefreshPolicy.restype = ctypes.c_bool
+        userenv.RefreshPolicy.argtypes = [ctypes.c_bool]
+        result = userenv.RefreshPolicy(True)
+        if result:
+            log.debug("LGPO_REG Util: Group Policy refresh triggered successfully")
+        else:
+            log.warning("LGPO_REG Util: Group Policy refresh returned False")
+        return bool(result)
+    except Exception as exc:  # pylint: disable=broad-exception-caught
+        log.error("LGPO_REG Util: Failed to trigger Group Policy refresh: %s", exc)
+        return False
+
+
 def read_reg_pol_file(reg_pol_path):
     """
     Helper function to read the content of the Registry.pol file
 
     Args:
-
         reg_pol_path (str): The path to the Registry.pol file
 
     Returns:
@@ -99,10 +148,78 @@ def read_reg_pol_file(reg_pol_path):
     """
     return_data = None
     if os.path.exists(reg_pol_path):
-        log.debug("LGPO_REG Utils: Reading from %s", reg_pol_path)
+        log.debug("LGPO_REG Util: Reading from %s", reg_pol_path)
         with salt.utils.files.fopen(reg_pol_path, "rb") as pol_file:
             return_data = pol_file.read()
     return return_data
+
+
+def _write_with_retry(path, data, mode, retry_count, retry_delay):
+    """
+    Write data to a file, retrying on Windows sharing violations (winerror 32).
+    Fails immediately on any other error (e.g. winerror 5, true access denied).
+    """
+    for attempt in range(1, retry_count + 1):
+        try:
+            with salt.utils.files.fopen(path, mode) as f:
+                f.write(data)
+            return
+        except PermissionError as e:
+            if e.winerror != 32 or attempt == retry_count:
+                raise
+            log.warning(
+                "LGPO_REG Util: %s is locked (attempt %d/%d). "
+                "Retrying in %d seconds...",
+                path,
+                attempt,
+                retry_count,
+                retry_delay,
+            )
+            time.sleep(retry_delay)
+
+
+@contextmanager
+def _policy_lock(machine=True):
+    """
+    Context manager that holds the Windows GP critical section for the duration
+    of a read-modify-write cycle on Registry.pol.
+
+    EnterCriticalPolicySection / LeaveCriticalPolicySection are the same
+    primitives gpsvc uses internally, so holding this lock prevents the GP
+    service from opening the policy file concurrently.
+
+    EnterCriticalPolicySection is a blocking call — it does not return until
+    the critical section is acquired. If gpsvc currently holds it (e.g. during
+    a background GP refresh), this call blocks until gpsvc releases it, at which
+    point gpsvc will also have released any file lock on Registry.pol. No retry
+    loop is needed here; the blocking behavior is the wait mechanism.
+
+    The only residual risk after acquiring the critical section is a non-GP
+    locker (AV scanner, VSS) that does not participate in this handshake; the
+    _write_with_retry layer handles those.
+
+    If the lock cannot be acquired (returns NULL), a CommandExecutionError is
+    raised. NULL from this API always indicates a genuine system error (handle
+    exhaustion, access denied creating the kernel object, etc.) — not a "GP
+    service is busy" condition. The blocking behavior handles the busy case.
+    Proceeding silently without the lock would risk an uncoordinated
+    read-modify-write followed by a confusing downstream write error.
+    """
+    userenv = ctypes.WinDLL("userenv.dll")
+    userenv.EnterCriticalPolicySection.restype = ctypes.wintypes.HANDLE
+    userenv.EnterCriticalPolicySection.argtypes = [ctypes.c_bool]
+    userenv.LeaveCriticalPolicySection.restype = ctypes.c_bool
+    userenv.LeaveCriticalPolicySection.argtypes = [ctypes.wintypes.HANDLE]
+
+    handle = userenv.EnterCriticalPolicySection(machine)
+    if not handle:
+        raise CommandExecutionError(
+            "LGPO_REG Util: Failed to acquire GP critical section"
+        )
+    try:
+        yield
+    finally:
+        userenv.LeaveCriticalPolicySection(handle)
 
 
 def write_reg_pol_data(
@@ -111,6 +228,8 @@ def write_reg_pol_data(
     gpt_extension,
     gpt_extension_guid,
     gpt_ini_path=GPT_INI_PATH,
+    retry_count=10,
+    retry_delay=5,
 ):
     """
     Helper function to actually write the data to a Registry.pol file
@@ -120,7 +239,6 @@ def write_reg_pol_data(
     to be processed
 
     Args:
-
         data_to_write (bytes): Data to write into the user/machine registry.pol
             file
 
@@ -132,6 +250,23 @@ def write_reg_pol_data(
         gpt_extension_guid (str): ADMX registry extension guid for the class
 
         gpt_ini_path (str): The path to the gpt.ini file
+
+        retry_count (int): Number of attempts to make when a write fails due
+            to a sharing violation (``winerror 32``). Sharing violations occur
+            when a process such as an antivirus scanner or VSS holds the file
+            open with an incompatible sharing mode. The GP critical section
+            (see :func:`_policy_lock`) prevents races with ``gpsvc`` itself,
+            so retries are primarily a fallback for those other lockers.
+            Default is ``10``.
+
+        retry_delay (int): Seconds to wait between retry attempts when a
+            sharing violation is encountered. Default is ``5``.
+
+    Returns:
+        bool: True if successful
+
+    Raises:
+        CommandExecutionError: On failure
     """
     # Write Registry.pol file
     if not os.path.exists(policy_file_path):
@@ -140,19 +275,19 @@ def write_reg_pol_data(
     if data_to_write is None:
         data_to_write = b""
     try:
-        with salt.utils.files.fopen(policy_file_path, "wb") as pol_file:
-            reg_pol_header = REG_POL_HEADER.encode("utf-16-le")
-            if not data_to_write.startswith(reg_pol_header):
-                log.debug("LGPO_REG Util: Writing header to %s", policy_file_path)
-                pol_file.write(reg_pol_header)
-            log.debug("LGPO_REG Util: Writing to %s", policy_file_path)
-            pol_file.write(data_to_write)
-    # TODO: This needs to be more specific
+        reg_pol_header = REG_POL_HEADER.encode("utf-16-le")
+        if not data_to_write.startswith(reg_pol_header):
+            log.debug("LGPO_REG Util: Writing header to %s", policy_file_path)
+            data_to_write = reg_pol_header + data_to_write
+        log.debug("LGPO_REG Util: Writing to %s", policy_file_path)
+        _write_with_retry(
+            policy_file_path, data_to_write, "wb", retry_count, retry_delay
+        )
     except Exception as e:  # pylint: disable=broad-except
         msg = (
-            "An error occurred attempting to write to {}, the exception was: {}".format(
-                policy_file_path, e
-            )
+            "An error occurred attempting to write to registry.pol\n"
+            f"PATH: {policy_file_path}\n"
+            f"EXCEPTION: {e}"
         )
         log.exception(msg)
         raise CommandExecutionError(msg)
@@ -171,16 +306,16 @@ def write_reg_pol_data(
     if not search_reg_pol(r"\[General\]\r\n", gpt_ini_data):
         log.debug("LGPO_REG Util: Adding [General] section to gpt.ini")
         gpt_ini_data = "[General]\r\n" + gpt_ini_data
-    if search_reg_pol(r"{}=".format(re.escape(gpt_extension)), gpt_ini_data):
+    if search_reg_pol(rf"{re.escape(gpt_extension)}=", gpt_ini_data):
         # ensure the line contains the ADM guid
         gpt_ext_loc = re.search(
-            r"^{}=.*\r\n".format(re.escape(gpt_extension)),
+            rf"^{re.escape(gpt_extension)}=.*\r\n",
             gpt_ini_data,
             re.IGNORECASE | re.MULTILINE,
         )
         gpt_ext_str = gpt_ini_data[gpt_ext_loc.start() : gpt_ext_loc.end()]
         if not search_reg_pol(
-            search_string=r"{}".format(re.escape(gpt_extension_guid)),
+            search_string=rf"{re.escape(gpt_extension_guid)}",
             policy_data=gpt_ext_str,
         ):
             log.debug("LGPO_REG Util: Inserting gpt extension GUID")
@@ -223,12 +358,15 @@ def write_reg_pol_data(
         )
     else:
         general_location = re.search(
-            r"^\[General\]\r\n", gpt_ini_data, re.IGNORECASE | re.MULTILINE
+            r"^\[General]\r\n", gpt_ini_data, re.IGNORECASE | re.MULTILINE
         )
         if gpt_extension.lower() == "gPCMachineExtensionNames".lower():
             version_nums = (0, 1)
         elif gpt_extension.lower() == "gPCUserExtensionNames".lower():
             version_nums = (1, 0)
+        else:
+            msg = "LGPO_REG Util: Could not determine gpt extension"
+            raise CommandExecutionError(msg)
         gpt_ini_data = "{}{}={}\r\n{}".format(
             gpt_ini_data[general_location.start() : general_location.end()],
             "Version",
@@ -243,17 +381,16 @@ def write_reg_pol_data(
         )
     if gpt_ini_data:
         try:
-            with salt.utils.files.fopen(gpt_ini_path, "w") as gpt_file:
-                gpt_file.write(gpt_ini_data)
-        # TODO: This needs to be more specific
+            _write_with_retry(gpt_ini_path, gpt_ini_data, "w", retry_count, retry_delay)
         except Exception as e:  # pylint: disable=broad-except
             msg = (
-                "An error occurred attempting to write the gpg.ini file.\n"
+                "An error occurred attempting to write the gpt.ini file.\n"
                 "path: {}\n"
                 "exception: {}".format(gpt_ini_path, e)
             )
             log.exception(msg)
             raise CommandExecutionError(msg)
+    return True
 
 
 def reg_pol_to_dict(policy_data):
@@ -273,6 +410,12 @@ def reg_pol_to_dict(policy_data):
     # https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-gpreg/5c092c22-bf6b-4e7f-b180-b20743d368f5
 
     reg_pol_header = REG_POL_HEADER.encode("utf-16-le")
+
+    # If policy_data is None, that means the Registry.pol file is missing,
+    # so we'll create it
+    if policy_data is None:
+        policy_data = reg_pol_header
+
     if not policy_data.startswith(reg_pol_header):
         msg = "LGPO_REG Util: Invalid Header. Registry.pol may be corrupt"
         raise CommandExecutionError(msg)
@@ -296,7 +439,7 @@ def reg_pol_to_dict(policy_data):
     for policy in pol_file_data.split(b"]\x00[\x00"):
         # Now remove the lingering square braces
         policy = policy.replace(b"]\x00", b"").replace(b"[\x00", b"")
-        # Each policy element is delimited by a semi-colon, encoded utf-16-le
+        # Each policy element is delimited by a semicolon, encoded utf-16-le
         # The first 4 are the key, name, type and size
         # all remaining is data
         key, v_name, v_type, v_size, v_data = policy.split(b";\x00", 4)
@@ -306,31 +449,56 @@ def reg_pol_to_dict(policy_data):
         # v_type is one of (0, 1, 2, 3, 4, 5, 7, 11) as 32-bit little-endian
         v_type = struct.unpack("<i", v_type)[0]
         if v_type == 0:
-            # REG_NONE : No Type
+            # REG_NONE: No Type
             # We don't know what this data is, so don't do anything
+            # Sometimes this is treated the same as REG_BINARY. We may need to
+            # consider adding some transformation here
             pass
-        elif v_type in (1, 2):
-            # REG_SZ : String Type
-            # REG_EXPAND_SZ : String with Environment Variables, ie %PATH%
+        elif v_type in (win32con.REG_SZ, win32con.REG_EXPAND_SZ):  # 1, 2
+            # (0x01) REG_SZ: String Type
+            # (0x02) REG_EXPAND_SZ: String with Environment Variables, i.e., %PATH%
             v_data = strip_field_end(v_data).decode("utf-16-le")
-        elif v_type == 4:
-            # REG_DWORD : 32-bit little endian
+        elif v_type == win32con.REG_BINARY:  # 3
+            # (0x03) REG_BINARY: Binary Type
+            v_data = v_data.hex()
+        elif v_type == win32con.REG_DWORD:  # 4
+            # (0x04) REG_DWORD | REG_WORD_LITTLE_ENDIAN: 32-bit little endian
             v_data = struct.unpack("<i", v_data)[0]
-        elif v_type == 5:
-            # REG_DWORD : 32-bit big endian
+        elif v_type == win32con.REG_DWORD_BIG_ENDIAN:  # 5
+            # (0x05) REG_DWORD_BIG_ENDIAN: 32-bit big endian
             v_data = struct.unpack(">i", v_data)[0]
-        elif v_type == 7:
-            # REG_MULTI_SZ : Multiple strings, delimited by \x00
+        elif v_type == win32con.REG_LINK:  # 6
+            # (0x06) REG_LINK:
+            # Not a data type that is supported by standard group policy
+            # templates or the registry.pol file
+            log.warning("LGPO_REG Util: REG_LINK not supported")
+        elif v_type == win32con.REG_MULTI_SZ:  # 7
+            # (0x07) REG_MULTI_SZ: Multiple strings, delimited by \x00
             v_data = strip_field_end(v_data)
             if not v_data:
                 v_data = None
             else:
                 v_data = v_data.decode("utf-16-le").split("\x00")
-        elif v_type == 11:
-            # REG_QWORD : 64-bit little endian
+        elif v_type == win32con.REG_RESOURCE_LIST:  # 8
+            # (0x08) REG_RESOURCE_LIST:
+            # Not a data type that is supported by standard group policy
+            # templates or the registry.pol file
+            log.warning("LGPO_REG Util: REGO_RESOURCE_LIST not supported")
+        elif v_type == win32con.REG_FULL_RESOURCE_DESCRIPTOR:  # 9
+            # (0x09) REG_FULL_RESOURCE_DESCRIPTOR:
+            # Not a data type that is supported by standard group policy
+            # templates or the registry.pol file
+            log.warning("LGPO_REG Util: REG_FULL_RESOURCE_DESCRIPTOR not supported")
+        elif v_type == win32con.REG_RESOURCE_REQUIREMENTS_LIST:  # 10
+            # (0x0A) REG_RESOURCE_REQUIREMENTS_LIST
+            # Not a data type that is supported by standard group policy
+            # templates or the registry.pol file
+            log.warning("LGPO_REG Util: REG_RESOURCE_REQUIREMENTS_LIST not supported")
+        elif v_type == win32con.REG_QWORD:  # 11
+            # (0x0B) REG_QWORD | REG_QWORD_LITTLE_ENDIAN: 64-bit little endian
             v_data = struct.unpack("<q", v_data)[0]
         else:
-            msg = "LGPO_REG Util: Found unknown registry type: {}".format(v_type)
+            msg = f"LGPO_REG Util: Found unknown registry type: {v_type}"
             raise CommandExecutionError(msg)
 
         # Lookup the REG Type from the number
@@ -349,7 +517,7 @@ def reg_pol_to_dict(policy_data):
 
 def dict_to_reg_pol(data):
     """
-    Convert a dictionary to the bytes format expected by the Registry.pol file
+    Convert a dictionary to the byte format expected by the Registry.pol file
 
     Args:
         data (dict): A dictionary containing the contents to be converted
@@ -383,41 +551,50 @@ def dict_to_reg_pol(data):
             # The first three items are pretty straight forward
             policy = [
                 # Key followed by null byte
-                "{}".format(key).encode("utf-16-le") + pol_section_term,
+                f"{key}".encode("utf-16-le") + pol_section_term,
                 # Value name followed by null byte
-                "{}".format(v_name).encode("utf-16-le") + pol_section_term,
+                f"{v_name}".encode("utf-16-le") + pol_section_term,
                 # Type in 32-bit little-endian
                 struct.pack("<i", v_type),
             ]
+            v_data = None
             # The data is encoded depending on the Type
-            if v_type == 0:
-                # REG_NONE : No value
+            if v_type == win32con.REG_NONE:  # 0
+                # (0x00) REG_NONE: No value
                 v_data = b""
-            elif v_type in (1, 2):
-                # REG_SZ : String Type
-                # REG_EXPAND_SZ : String with Environment Variables, ie %PATH%
+            elif v_type in (win32con.REG_SZ, win32con.REG_EXPAND_SZ):  # 1, 2
+                # (0x01) REG_SZ: String Type
+                # (0x02) REG_EXPAND_SZ: String with Environment Variables, ie %PATH%
                 # Value followed by null byte
                 v_data = d["data"].encode("utf-16-le") + pol_section_term
-            elif v_type == 4:
-                # REG_DWORD : Little Endian
+            elif v_type == win32con.REG_BINARY:  # 3
+                # (0x03) REG_BINARY: Binary Type
+                v_data = bytes.fromhex(d["data"])
+            elif v_type == win32con.REG_DWORD:  # 4
+                # (0x04) REG_DWORD: Little Endian
                 # 32-bit little endian
                 v_data = struct.pack("<i", int(d["data"]))
-            elif v_type == 5:
-                # REG_DWORD : Big Endian (not common)
+            elif v_type == win32con.REG_DWORD_BIG_ENDIAN:  # 5
+                # (0x05) REG_DWORD_BIG_ENDIAN: Big Endian (not common)
                 # 32-bit big endian
                 v_data = struct.pack(">i", int(d["data"]))
-            elif v_type == 7:
-                # REG_MULTI_SZ : Multiple strings
+            elif v_type == win32con.REG_LINK:  # 6
+                # (0x06) REG_LINK:
+                # Not a data type that is supported by standard group policy
+                # templates or the registry.pol file
+                log.warning("LGPO_REG Util: REG_LINK not supported")
+            elif v_type == win32con.REG_MULTI_SZ:  # 7
+                # (0x07) REG_MULTI_SZ: Multiple strings
                 # Each element is delimited by \x00, terminated by \x00\x00
                 # Then the entire output is terminated with a null byte
                 if d["data"] is None:
-                    # An None value just gets the section terminator
+                    # A None value just gets the section terminator
                     v_data = pol_section_term
                 elif len(d["data"]) == 0:
                     # An empty list just gets the section terminator
                     v_data = pol_section_term
                 elif len(d["data"]) == 1 and not d["data"][0]:
-                    # An list with an empty value just gets the section terminator
+                    # A list with an empty value just gets the section terminator
                     v_data = pol_section_term
                 else:
                     # All others will be joined with a null byte, the list
@@ -427,8 +604,25 @@ def dict_to_reg_pol(data):
                         + pol_section_term
                         + pol_section_term
                     )
-            elif v_type == 11:
-                # REG_QWORD : Little Endian
+            elif v_type == win32con.REG_RESOURCE_LIST:  # 8
+                # (0x08) REG_RESOURCE_LIST
+                # Not a data type that is supported by standard group policy
+                # templates or the registry.pol file
+                log.warning("LGPO_REG Util: REGO_RESOURCE_LIST not supported")
+            elif v_type == win32con.REG_FULL_RESOURCE_DESCRIPTOR:  # 9
+                # (0x09) REG_FULL_RESOURCE_DESCRIPTOR
+                # Not a data type that is supported by standard group policy
+                # templates or the registry.pol file
+                log.warning("LGPO_REG Util: REG_FULL_RESOURCE_DESCRIPTOR not supported")
+            elif v_type == win32con.REG_RESOURCE_REQUIREMENTS_LIST:  # 10
+                # (0x0A) REG_RESOURCE_REQUIREMENTS_LIST
+                # Not a data type that is supported by standard group policy
+                # templates or the registry.pol file
+                log.warning(
+                    "LGPO_REG Util: REG_RESOURCE_REQUIREMENTS_LIST not supported"
+                )
+            elif v_type == win32con.REG_QWORD:  # 11
+                # (0x0B) REG_QWORD: Little Endian
                 # 64-bit little endian
                 v_data = struct.pack("<q", int(d["data"]))
 
@@ -437,6 +631,11 @@ def dict_to_reg_pol(data):
             if len(v_data) > 65535:
                 msg = "LGPO_REG Util: Size exceeds 65535 bytes"
                 raise CommandExecutionError(msg)
+            if v_data is None:
+                msg = "LGPO_REG Util: Unknown data transformation"
+                raise CommandExecutionError(msg)
+
+            # Calculate the size of the data to be written
             v_size = len(v_data).to_bytes(2, "little") + pol_section_term
 
             policy.append(v_size)

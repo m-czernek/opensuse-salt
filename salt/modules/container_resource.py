@@ -8,6 +8,7 @@ These functions are not designed to be called directly, but instead from the
 :mod:`docker <salt.modules.docker>` execution modules. They provide for
 common logic to be re-used for common actions.
 """
+
 import copy
 import functools
 import logging
@@ -69,15 +70,13 @@ def _nsenter(pid):
     return f"nsenter --target {pid} --mount --uts --ipc --net --pid"
 
 
-def _get_md5(name, path, run_func):
+def _get_sha256(name, path, run_func):
     """
-    Get the MD5 checksum of a file from a container
+    Get the sha256 checksum of a file from a container
     """
-    output = run_func(name, f"md5sum {shlex.quote(path)}", ignore_retcode=True)[
-        "stdout"
-    ]
+    ret = run_func(name, f"sha256sum {shlex.quote(path)}", ignore_retcode=True)
     try:
-        return output.split()[0]
+        return ret["stdout"].split()[0]
     except IndexError:
         # Destination file does not exist or could not be accessed
         return None
@@ -368,8 +367,8 @@ def copy_to(
         )
 
     # Before we try to replace the file, compare checksums.
-    source_md5 = __salt__["file.get_sum"](local_file, "md5")
-    if source_md5 == _get_md5(name, dest, run_all):
+    source_sha256 = __salt__["file.get_sum"](local_file, "sha256")
+    if source_sha256 == _get_sha256(name, dest, run_all):
         log.debug("%s and %s:%s are the same file, skipping copy", source, name, dest)
         return True
 
@@ -399,4 +398,4 @@ def copy_to(
             local_file, name, PATH, dest
         )
     __salt__["cmd.run"](copy_cmd, python_shell=True, output_loglevel="quiet")
-    return source_md5 == _get_md5(name, dest, run_all)
+    return source_sha256 == _get_sha256(name, dest, run_all)

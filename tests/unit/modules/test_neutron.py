@@ -2,7 +2,6 @@
     :codeauthor: Jayesh Kariya <jayeshk@saltstack.com>
 """
 
-
 import salt.modules.neutron as neutron
 from tests.support.mixins import LoaderModuleMockMixin
 from tests.support.mock import MagicMock
@@ -432,7 +431,7 @@ class MockNeutron:
         peer_id,
         psk,
         admin_state_up,
-        **kwargs
+        **kwargs,
     ):
         """
         Mock of create_ipsec_site_connection method

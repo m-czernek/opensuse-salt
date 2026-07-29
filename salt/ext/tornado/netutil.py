@@ -48,29 +48,263 @@ except ImportError:
 if PY3:
     xrange = range
 
-try:
-    from salt.ext.ssl_match_hostname import CertificateError as SSLCertificateError
-    from salt.ext.ssl_match_hostname import match_hostname as ssl_match_hostname
-except ImportError:
-    if hasattr(ssl, 'match_hostname') and hasattr(ssl, 'CertificateError'):  # python 3.2+
-        ssl_match_hostname = ssl.match_hostname
-        SSLCertificateError = ssl.CertificateError
-    elif ssl is None:
-        ssl_match_hostname = SSLCertificateError = None  # type: ignore
-    else:
-        import backports.ssl_match_hostname
-        ssl_match_hostname = backports.ssl_match_hostname.match_hostname
-        SSLCertificateError = backports.ssl_match_hostname.CertificateError  # type: ignore
+if hasattr(ssl, 'match_hostname') and hasattr(ssl, 'CertificateError'):  # python 3.2+
+    ssl_match_hostname = ssl.match_hostname
+    SSLCertificateError = ssl.CertificateError
+elif ssl is None:
+    ssl_match_hostname = SSLCertificateError = None  # type: ignore
+else:
+    #import backports.ssl_match_hostname
+    #ssl_match_hostname = backports.ssl_match_hostname.match_hostname
+    #SSLCertificateError = backports.ssl_match_hostname.CertificateError  # type: ignore
+    #"""The match_hostname() function from Python 3.7.0, essential when using SSL."""
+
+    import sys
+    import socket as _socket
+
+    try:
+        # Divergence: Python-3.7+'s _ssl has this exception type but older Pythons do not
+        from _ssl import SSLCertVerificationError
+        CertificateError = SSLCertVerificationError
+    except:
+        class CertificateError(ValueError):
+            pass
+
+    SSLCertificateError = CertificateError
+
+    #__version__ = '3.7.0.1'
+
+
+    # Divergence: Added to deal with ipaddess as bytes on python2
+    def _to_text(obj):
+        if isinstance(obj, str) and sys.version_info < (3,):
+            obj = unicode(obj, encoding='ascii', errors='strict')
+        elif sys.version_info >= (3,) and isinstance(obj, bytes):
+            obj = str(obj, encoding='ascii', errors='strict')
+        return obj
+
+
+    def _to_bytes(obj):
+        if isinstance(obj, str) and sys.version_info >= (3,):
+            obj = bytes(obj, encoding='ascii', errors='strict')
+        elif sys.version_info < (3,) and isinstance(obj, unicode):
+            obj = obj.encode('ascii', 'strict')
+        return obj
+
+
+    def _dnsname_match(dn, hostname):
+        """Matching according to RFC 6125, section 6.4.3
+
+        - Hostnames are compared lower case.
+        - For IDNA, both dn and hostname must be encoded as IDN A-label (ACE).
+        - Partial wildcards like 'www*.example.org', multiple wildcards, sole
+          wildcard or wildcards in labels other then the left-most label are not
+          supported and a CertificateError is raised.
+        - A wildcard must match at least one character.
+        """
+        if not dn:
+            return False
+
+        wildcards = dn.count('*')
+        # speed up common case w/o wildcards
+        if not wildcards:
+            return dn.lower() == hostname.lower()
+
+        if wildcards > 1:
+            # Divergence .format() to percent formatting for Python < 2.6
+            raise CertificateError(
+                "too many wildcards in certificate DNS name: %s" % repr(dn))
+
+        dn_leftmost, sep, dn_remainder = dn.partition('.')
+
+        if '*' in dn_remainder:
+            # Only match wildcard in leftmost segment.
+            # Divergence .format() to percent formatting for Python < 2.6
+            raise CertificateError(
+                "wildcard can only be present in the leftmost label: "
+                "%s." % repr(dn))
+
+        if not sep:
+            # no right side
+            # Divergence .format() to percent formatting for Python < 2.6
+            raise CertificateError(
+                "sole wildcard without additional labels are not support: "
+                "%s." % repr(dn))
+
+        if dn_leftmost != '*':
+            # no partial wildcard matching
+            # Divergence .format() to percent formatting for Python < 2.6
+            raise CertificateError(
+                "partial wildcards in leftmost label are not supported: "
+                "%s." % repr(dn))
+
+        hostname_leftmost, sep, hostname_remainder = hostname.partition('.')
+        if not hostname_leftmost or not sep:
+            # wildcard must match at least one char
+            return False
+        return dn_remainder.lower() == hostname_remainder.lower()
+
+
+    def _inet_paton(ipname):
+        """Try to convert an IP address to packed binary form
+
+        Supports IPv4 addresses on all platforms and IPv6 on platforms with IPv6
+        support.
+        """
+        # inet_aton() also accepts strings like '1'
+        # Divergence: We make sure we have native string type for all python versions
+        try:
+            b_ipname = _to_bytes(ipname)
+        except UnicodeError:
+            raise ValueError("%s must be an all-ascii string." % repr(ipname))
+
+        # Set ipname in native string format
+        if sys.version_info < (3,):
+            n_ipname = b_ipname
+        else:
+            n_ipname = ipname
+
+        if n_ipname.count('.') == 3:
+            try:
+                return _socket.inet_aton(n_ipname)
+            # Divergence: OSError on late python3.  socket.error earlier.
+            # Null bytes generate ValueError on python3(we want to raise
+            # ValueError anyway), TypeError # earlier
+            except (OSError, _socket.error, TypeError):
+                pass
+
+        try:
+            return _socket.inet_pton(_socket.AF_INET6, n_ipname)
+        # Divergence: OSError on late python3.  socket.error earlier.
+        # Null bytes generate ValueError on python3(we want to raise
+        # ValueError anyway), TypeError # earlier
+        except (OSError, _socket.error, TypeError):
+            # Divergence .format() to percent formatting for Python < 2.6
+            raise ValueError("%s is neither an IPv4 nor an IP6 "
+                             "address." % repr(ipname))
+        except AttributeError:
+            # AF_INET6 not available
+            pass
+
+        # Divergence .format() to percent formatting for Python < 2.6
+        raise ValueError("%s is not an IPv4 address." % repr(ipname))
+
+
+    def _ipaddress_match(ipname, host_ip):
+        """Exact matching of IP addresses.
+
+        RFC 6125 explicitly doesn't define an algorithm for this
+        (section 1.7.2 - "Out of Scope").
+        """
+        # OpenSSL may add a trailing newline to a subjectAltName's IP address
+        ip = _inet_paton(ipname.rstrip())
+        return ip == host_ip
+
+
+    def match_hostname(cert, hostname):
+        """Verify that *cert* (in decoded format as returned by
+        SSLSocket.getpeercert()) matches the *hostname*.  RFC 2818 and RFC 6125
+        rules are followed.
+
+        The function matches IP addresses rather than dNSNames if hostname is a
+        valid ipaddress string. IPv4 addresses are supported on all platforms.
+        IPv6 addresses are supported on platforms with IPv6 support (AF_INET6
+        and inet_pton).
+
+        CertificateError is raised on failure. On success, the function
+        returns nothing.
+        """
+        if not cert:
+            raise ValueError("empty or no certificate, match_hostname needs a "
+                             "SSL socket or SSL context with either "
+                             "CERT_OPTIONAL or CERT_REQUIRED")
+        try:
+            # Divergence: Deal with hostname as bytes
+            host_ip = _inet_paton(_to_text(hostname))
+        except ValueError:
+            # Not an IP address (common case)
+            host_ip = None
+        except UnicodeError:
+            # Divergence: Deal with hostname as byte strings.
+            # IP addresses should be all ascii, so we consider it not
+            # an IP address if this fails
+            host_ip = None
+        dnsnames = []
+        san = cert.get('subjectAltName', ())
+        for key, value in san:
+            if key == 'DNS':
+                if host_ip is None and _dnsname_match(value, hostname):
+                    return
+                dnsnames.append(value)
+            elif key == 'IP Address':
+                if host_ip is not None and _ipaddress_match(value, host_ip):
+                    return
+                dnsnames.append(value)
+        if not dnsnames:
+            # The subject is only checked when there is no dNSName entry
+            # in subjectAltName
+            for sub in cert.get('subject', ()):
+                for key, value in sub:
+                    # XXX according to RFC 2818, the most specific Common Name
+                    # must be used.
+                    if key == 'commonName':
+                        if _dnsname_match(value, hostname):
+                            return
+                        dnsnames.append(value)
+        if len(dnsnames) > 1:
+            raise CertificateError("hostname %r "
+                "doesn't match either of %s"
+                % (hostname, ', '.join(map(repr, dnsnames))))
+        elif len(dnsnames) == 1:
+            raise CertificateError("hostname %r "
+                "doesn't match %r"
+                % (hostname, dnsnames[0]))
+        else:
+            raise CertificateError("no appropriate commonName or "
+                "subjectAltName fields were found")
+
+    ssl_match_hostname = match_hostname
+
 
 if hasattr(ssl, 'SSLContext'):
     if hasattr(ssl, 'create_default_context'):
         # Python 2.7.9+, 3.4+
         # Note that the naming of ssl.Purpose is confusing; the purpose
         # of a context is to authentiate the opposite side of the connection.
-        _client_ssl_defaults = ssl.create_default_context(
-            ssl.Purpose.SERVER_AUTH)
-        _server_ssl_defaults = ssl.create_default_context(
-            ssl.Purpose.CLIENT_AUTH)
+        # On Windows, ssl.create_default_context() calls load_default_certs(),
+        # which reads the OS root store as a single blob; a single malformed
+        # cert there aborts the whole load with ASN1 NOT_ENOUGH_DATA under
+        # OpenSSL 3.5.x (shipped by relenv >= 0.22.13). See cpython#104135.
+        # Point at certifi to bypass the OS store.
+        #
+        # Needed on Python 3.10 and 3.11: cpython merged the iterate-and-skip
+        # variant of _load_windows_store_certs into Lib/ssl.py for the 3.12
+        # branch but never backported it to 3.10 (security-only) or 3.11
+        # (still in bug-fix mode but the backport never landed). 3008.x and
+        # later use Python 3.14 whose stdlib already has the upstream fix
+        # and does not need this branch. DO NOT forward-merge this
+        # special-case to a branch whose onedir Python is >= 3.12 - collapse
+        # it back to the unconditional ssl.create_default_context() form.
+        #
+        # DURABLE CLEANUP: this disappears once relenv carries the
+        # cpython#104135 patch in its cpython build. See salt/__init__.py
+        # for the cleanup pointer.
+        #
+        # Companion work-arounds (delete together with this block):
+        #   - salt/__init__.py: _load_windows_store_certs monkey-patch
+        #   - cicd/windows-ssl-104135-patch.py + the Patch-Lib/ssl.py steps
+        #     in .github/workflows/{build-deps-ci,test,test-packages}-
+        #     action.yml's Windows jobs.
+        if sys.platform == 'win32' and certifi is not None:
+            _client_ssl_defaults = ssl.create_default_context(
+                ssl.Purpose.SERVER_AUTH, cafile=certifi.where())
+            _server_ssl_defaults = ssl.create_default_context(
+                ssl.Purpose.CLIENT_AUTH, cafile=certifi.where())
+        else:
+            _client_ssl_defaults = ssl.create_default_context(
+                ssl.Purpose.SERVER_AUTH)
+            _server_ssl_defaults = ssl.create_default_context(
+                ssl.Purpose.CLIENT_AUTH)
     else:
         # Python 3.2-3.3
         _client_ssl_defaults = ssl.SSLContext(ssl.PROTOCOL_SSLv23)

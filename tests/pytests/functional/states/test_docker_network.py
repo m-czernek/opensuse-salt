@@ -1,6 +1,5 @@
 import functools
 import logging
-import os
 import random
 
 import pytest
@@ -16,13 +15,9 @@ pytest.importorskip("docker")
 
 log = logging.getLogger(__name__)
 
-INSIDE_CONTAINER = os.getenv("HOSTNAME", "") == "salt-test-container"
-
-
 pytestmark = [
     pytest.mark.slow_test,
     pytest.mark.skip_if_binaries_missing("docker", "dockerd", check_all=False),
-    pytest.mark.skipif(INSIDE_CONTAINER, reason="Cannot run in a container"),
 ]
 
 
@@ -38,7 +33,7 @@ class Network:
             self._rand_indexes = random.sample(
                 range(2, self.net.num_addresses - 1), self.net.num_addresses - 3
             )
-            self.ip_arg = "ipv{}_address".format(self.net.version)
+            self.ip_arg = f"ipv{self.net.version}_address"
         except KeyError:
             # No explicit subnet passed
             self.net = self.ip_arg = None
@@ -51,13 +46,16 @@ class Network:
                 "Indexing not supported for networks without a custom subnet"
             )
 
-    def arg_map(self, arg_name):
-        return {
-            "ipv4_address": "IPv4Address",
-            "ipv6_address": "IPv6Address",
-            "links": "Links",
-            "aliases": "Aliases",
-        }[arg_name]
+    @staticmethod
+    def arg_map(arg_name):
+        if arg_name == "ipv4_address":
+            return "IPv4Address"
+        if arg_name == "ipv6_address":
+            return "IPv6Address"
+        if arg_name == "links":
+            return "Links"
+        if arg_name == "aliases":
+            return "Aliases"
 
     @property
     def subnet(self):
@@ -170,7 +168,7 @@ def test_absent(docker_network, existing_network):
     assert ret.changes
     assert ret.changes == {"removed": True}
     assert ret.comment
-    assert ret.comment == "Removed network '{}'".format(existing_network.name)
+    assert ret.comment == f"Removed network '{existing_network.name}'"
 
 
 def test_absent_with_disconnected_container(
@@ -190,7 +188,7 @@ def test_absent_when_not_present(network, docker_network):
         ret = docker_network.absent(name=net.name)
         assert ret.result is True
         assert not ret.changes
-        assert ret.comment == "Network '{}' already absent".format(net.name)
+        assert ret.comment == f"Network '{net.name}' already absent"
 
 
 def test_present(docker, network, docker_network):
@@ -199,7 +197,7 @@ def test_present(docker, network, docker_network):
         assert ret.result is True
         assert ret.changes
         assert ret.changes == {"created": True}
-        assert ret.comment == "Network '{}' created".format(net.name)
+        assert ret.comment == f"Network '{net.name}' created"
 
         # Now check to see that the network actually exists. If it doesn't,
         # this next function call will raise an exception.
@@ -212,7 +210,7 @@ def test_present_with_containers(network, docker, docker_network, container):
         assert ret.result is True
         assert ret.changes
         assert ret.changes == {"created": True, "connected": [container.name]}
-        assert ret.comment == "Network '{}' created".format(net.name)
+        assert ret.comment == f"Network '{net.name}' created"
 
         # Now check to see that the network actually exists. If it doesn't,
         # this next function call will raise an exception.
@@ -220,21 +218,16 @@ def test_present_with_containers(network, docker, docker_network, container):
 
 
 @pytest.mark.parametrize("reconnect", [True, False])
-def test_present_with_reconnect(
-    network, docker, docker_network, container, reconnect, grains
-):
+def test_present_with_reconnect(network, docker, docker_network, container, reconnect):
     """
     Test reconnecting with containers not passed to state
     """
-    if grains["os_family"] == "Suse":
-        pytest.skip("This test is failing for SUSE family")
-
     with network() as net:
         ret = docker_network.present(name=net.name, driver="bridge")
         assert ret.result is True
         assert ret.changes
         assert ret.changes == {"created": True}
-        assert ret.comment == "Network '{}' created".format(net.name)
+        assert ret.comment == f"Network '{net.name}' created"
 
         # Connect the container
         docker.connect_container_to_network(container.name, net.name)

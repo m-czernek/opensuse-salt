@@ -34,7 +34,9 @@ Features
 - Expand variables ${} with possibility to escape them if needed \${} (see examples)
 - Ignores missing node/class and will simply return empty without breaking the pillar module completely - will be logged
 
-An example subset of datas is available here: http://git.mauras.ch/salt/saltclass/src/master/examples
+The original example subset hosted at ``git.mauras.ch`` is no longer
+reachable; see the ``salt/tops/saltclass`` test fixtures in the Salt
+source tree for working examples.
 
 ==========================  ===========
 Terms usable in yaml files  Description
@@ -206,7 +208,6 @@ Not using ``^`` as the first entry will simply merge the lists
     Currently you can't have both a variable and an escaped variable in the same string as the
     escaped one will not be correctly rendered - '\${xx}' will stay as is instead of being rendered as '${xx}'
 """
-
 
 import logging
 

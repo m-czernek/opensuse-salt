@@ -13,7 +13,7 @@ import salt.channel.server
 import salt.config
 import salt.crypt
 import salt.exceptions
-import tornado.gen
+import salt.ext.tornado.gen
 import salt.master
 import salt.utils.platform
 import salt.utils.process
@@ -64,7 +64,7 @@ class ReqServerChannelProcess(salt.utils.process.SignalHandlingProcess):
             ),
         }
 
-        self.io_loop = tornado.ioloop.IOLoop()
+        self.io_loop = salt.ext.tornado.ioloop.IOLoop()
         self.io_loop.make_current()
         self.req_server_channel.post_fork(self._handle_payload, io_loop=self.io_loop)
         self.io_loop.add_callback(self.running.set)
@@ -100,11 +100,11 @@ class ReqServerChannelProcess(salt.utils.process.SignalHandlingProcess):
                 terminate_process(pid=pid, kill_children=True, slow_stop=False)
             self.process_manager = None
 
-    @tornado.gen.coroutine
+    @salt.ext.tornado.gen.coroutine
     def _handle_payload(self, payload):
         if self.req_channel_crypt == "clear":
-            raise tornado.gen.Return((payload, {"fun": "send_clear"}))
-        raise tornado.gen.Return((payload, {"fun": "send"}))
+            raise salt.ext.tornado.gen.Return((payload, {"fun": "send_clear"}))
+        raise salt.ext.tornado.gen.Return((payload, {"fun": "send"}))
 
 
 @pytest.fixture
@@ -168,7 +168,7 @@ def minion1_key(minion1_id, tmp_path, req_server_opts):
     pki = pathlib.Path(req_server_opts["pki_dir"])
     (pki / "minions").mkdir(exist_ok=True)
     shutil.copy2(key1.with_suffix(".pub"), pki / "minions" / minion1_id)
-    yield salt.crypt.get_rsa_key(key1, None)
+    yield salt.crypt.PrivateKey(key1)
 
 
 @pytest.fixture
@@ -185,7 +185,7 @@ def minion2_key(minion2_id, tmp_path, req_server_opts):
     pki = pathlib.Path(req_server_opts["pki_dir"])
     (pki / "minions").mkdir(exist_ok=True)
     shutil.copy2(key2.with_suffix(".pub"), pki / "minions" / minion2_id)
-    yield salt.crypt.get_rsa_key(key2, None)
+    yield salt.crypt.PrivateKey(key2)
 
 
 def req_channel_crypt_ids(value):
@@ -285,7 +285,7 @@ async def test_req_channel_ttl_v2(req_server, io_loop):
 async def test_req_channel_ttl_valid(req_server, io_loop, minion1_id, minion1_key):
     req_server.opts["request_server_ttl"] = 60
     req_server.opts["publish_session"] = 600
-    tok = salt.crypt.private_encrypt(minion1_key, b"salt")
+    tok = minion1_key.encrypt(b"salt")
 
     async def handler(payload):
         return payload, {"fun": "send"}
@@ -316,7 +316,7 @@ async def test_req_channel_ttl_expired(
 ):
     req_server.opts["request_server_ttl"] = 60
     req_server.opts["publish_session"] = 600
-    tok = salt.crypt.private_encrypt(minion1_key, b"salt")
+    tok = minion1_key.encrypt(b"salt")
 
     async def handler(payload):
         return payload, {"fun": "send"}
@@ -347,7 +347,7 @@ async def test_req_channel_id_invalid_chars(
 ):
     req_server.opts["request_server_ttl"] = 60
     req_server.opts["publish_session"] = 600
-    tok = salt.crypt.private_encrypt(minion1_key, b"salt")
+    tok = minion1_key.encrypt(b"salt")
 
     async def handler(payload):
         return payload, {"fun": "send"}
@@ -419,7 +419,7 @@ async def test_req_channel_v2_invalid_token(
     minion2_id,
 ):
 
-    tok2 = salt.crypt.private_encrypt(minion2_key, b"salt")
+    tok2 = minion2_key.encrypt(b"salt")
 
     async def handler(payload):
         return payload, {"fun": "send"}
@@ -440,5 +440,5 @@ async def test_req_channel_v2_invalid_token(
     }
     with caplog.at_level(logging.WARNING):
         ret = await req_server.handle_message(payload)
-        assert "Minion token did not validate:" in caplog.text
+        assert "Unable to decrypt token:" in caplog.text
         assert ret == "bad load"
