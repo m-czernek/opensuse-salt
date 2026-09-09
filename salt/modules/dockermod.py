@@ -1281,7 +1281,7 @@ def compare_container_networks(first, second):
     return ret
 
 
-def compare_networks(first, second, ignore="Name,Id,Created,Containers"):
+def compare_networks(first, second, ignore="Name,Id,Created,Containers,Status"):
     """
     .. versionadded:: 2018.3.0
 
