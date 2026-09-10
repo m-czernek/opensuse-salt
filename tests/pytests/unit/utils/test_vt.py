@@ -40,7 +40,7 @@ def test_log_sanitize(test_cmd, caplog):
     """
     password = "123456"
     cmd = [test_cmd, password]
-    term = vt.Terminal(
+    with vt.Terminal(
         cmd,
         log_stdout=True,
         log_stderr=True,
@@ -49,8 +49,8 @@ def test_log_sanitize(test_cmd, caplog):
         log_sanitize=password,
         stream_stdout=False,
         stream_stderr=False,
-    )
-    with caplog.at_level(logging.DEBUG):
-        ret = term.recv()
+    ) as term, caplog.at_level(logging.DEBUG):
+        while term.has_unread_data:
+            term.recv()
     assert password not in caplog.text
     assert "******" in caplog.text
